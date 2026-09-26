@@ -1034,6 +1034,69 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	return out, rows.Err()
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
+func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error {
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE 1 = 1`
+	args := []any{}
+	if f.MonitorID != 0 {
+		q += ` AND monitor_id = ?`
+		args = append(args, f.MonitorID)
+	}
+	if f.RuleID != 0 {
+		q += ` AND rule_id = ?`
+		args = append(args, f.RuleID)
+	}
+	if f.ContractID != "" {
+		q += ` AND json_extract(payload, '$.contract_id') = ?`
+		args = append(args, f.ContractID)
+	}
+	if !f.From.IsZero() {
+		q += ` AND created_at >= ?`
+		args = append(args, sqliteTimeString(f.From))
+	}
+	if !f.To.IsZero() {
+		q += ` AND created_at < ?`
+		args = append(args, sqliteTimeString(f.To))
+	}
+	sort := alertSort(f.Sort)
+	if f.AfterID != 0 {
+		cursor := `(SELECT created_at, id FROM alerts WHERE id = ?)`
+		if sort == "created_at_asc" {
+			q += ` AND (created_at, id) > ` + cursor
+		} else {
+			q += ` AND (created_at, id) < ` + cursor
+		}
+		args = append(args, f.AfterID)
+	}
+	if sort == "created_at_asc" {
+		q += ` ORDER BY created_at ASC, id ASC`
+	} else {
+		q += ` ORDER BY created_at DESC, id DESC`
+	}
+	if f.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, pageLimit(f.Limit))
+	}
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		a, err := scanSQLiteAlert(rows)
+		if err != nil {
+			return err
+		}
+		if err := cb(a); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string

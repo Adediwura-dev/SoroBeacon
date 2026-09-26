@@ -898,6 +898,71 @@ func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	return a, err
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error {
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
+		 FROM alerts WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.MonitorID != 0 {
+		q += ` AND monitor_id = ` + arg(f.MonitorID)
+	}
+	if f.RuleID != 0 {
+		q += ` AND rule_id = ` + arg(f.RuleID)
+	}
+	if f.ContractID != "" {
+		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
+	}
+	if !f.From.IsZero() {
+		q += ` AND created_at >= ` + arg(f.From)
+	}
+	if !f.To.IsZero() {
+		q += ` AND created_at < ` + arg(f.To)
+	}
+	sort := alertSort(f.Sort)
+	if f.AfterID != 0 {
+		cursor := `(SELECT created_at, id FROM alerts WHERE id = ` + arg(f.AfterID) + `)`
+		if sort == "created_at_asc" {
+			q += ` AND (created_at, id) > ` + cursor
+		} else {
+			q += ` AND (created_at, id) < ` + cursor
+		}
+	}
+	if sort == "created_at_asc" {
+		q += ` ORDER BY created_at ASC, id ASC`
+	} else {
+		q += ` ORDER BY created_at DESC, id DESC`
+	}
+	if f.Limit > 0 {
+		q += ` LIMIT ` + arg(pageLimit(f.Limit))
+	}
+
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a Alert
+		var ledger int64
+		if err := rows.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID); err != nil {
+			return err
+		}
+		a.Ledger = uint32(ledger)
+		if err := cb(a); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
 // with the same ordering DeleteExpiredAlerts uses so the row an archiver reads
 // is the row the delete removes.

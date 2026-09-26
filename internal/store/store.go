@@ -490,6 +490,7 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	// ListDeliveryAttempts returns attempts for one alert, oldest first.
 	// status empty means no filter; otherwise it is applied in SQL.

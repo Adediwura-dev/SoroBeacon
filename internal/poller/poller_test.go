@@ -83,6 +83,7 @@ type fakeStore struct {
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
+	groupStates map[string]int64   // key -> group count for digest grouping
 	// ledgerHashes backs the reorg-detection half of the Store interface.
 	ledgerHashes map[uint32]string
 }
@@ -95,6 +96,7 @@ func newFakeStore() *fakeStore {
 		now:          time.Now,
 		lastFired:    map[int64]time.Time{},
 		suppressed:   map[int64]int64{},
+		groupStates:  map[string]int64{},
 		ledgerHashes: map[uint32]string{},
 	}
 }
@@ -207,6 +209,27 @@ func (f *fakeStore) GroupAlerts(_ context.Context, key string, _ time.Time) (boo
 	count := f.groupStates[key] + 1
 	f.groupStates[key] = count
 	return count == 1, count, nil
+}
+
+// ListInhibitionsForTarget returns the inhibition rules for a target rule.
+// Required by DispatchStore interface for tracing tests.
+func (f *fakeStore) ListInhibitionsForTarget(_ context.Context, target int64) ([]store.Inhibition, error) {
+	return nil, nil
+}
+
+// RuleFiredWithin checks if a rule fired within a time window.
+// Required by DispatchStore interface for tracing tests.
+func (f *fakeStore) RuleFiredWithin(_ context.Context, ruleID int64, window time.Duration) (bool, error) {
+	if last, ok := f.lastFired[ruleID]; ok {
+		return f.now().Before(last.Add(window)), nil
+	}
+	return false, nil
+}
+
+// MarkAlertInhibited marks an alert as inhibited by a source rule.
+// Required by DispatchStore interface for tracing tests.
+func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID int64) error {
+	return nil
 }
 
 // fakeDispatcher records dispatched alerts.

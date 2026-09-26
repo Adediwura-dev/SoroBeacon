@@ -41,6 +41,13 @@ type Alert struct {
 	// verbatim, so every text channel sends the same summary without
 	// needing a digest-specific method.
 	Digest string `json:"digest,omitempty"`
+	// GroupCount is the number of alerts in the current digest window.
+	// Used by the default digest template.
+	GroupCount int `json:"group_count,omitempty"`
+	// WindowStart is the start of the digest window.
+	WindowStart time.Time `json:"window_start,omitempty"`
+	// WindowEnd is the end of the digest window.
+	WindowEnd time.Time `json:"window_end,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -75,6 +82,10 @@ const (
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
 	TypeDingTalk  = "dingtalk"
+	TypeGoogleChat = "googlechat"
+	TypeOpsgenie  = "opsgenie"
+	TypeGotify    = "gotify"
+	TypeSNS       = "sns"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -92,6 +103,10 @@ func DefaultFactory() *Factory {
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
 	f.Register(TypeDingTalk, NewDingTalk)
+	f.Register(TypeGoogleChat, NewGoogleChat)
+	f.Register(TypeOpsgenie, NewOpsgenie)
+	f.Register(TypeGotify, NewGotify)
+	f.Register(TypeSNS, NewSNS)
 	return f
 }
 
