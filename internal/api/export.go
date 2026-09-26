@@ -52,23 +52,23 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	flushEvery := alertExportPageSize
 
-	err = s.store.ListAlertsStream(r.Context(), f, func(a store.Alert) error {
+	alerts, err := s.store.ListAlerts(r.Context(), f)
+	if err != nil {
+		s.log.Error("NDJSON export stream failed", "request_id", reqid.From(r), "err", err)
+		return
+	}
+	for _, a := range alerts {
 		line := exportAlertNDJSONRow(a, names[a.MonitorID])
 		b, err := json.Marshal(line)
 		if err != nil {
 			s.log.Error("NDJSON marshal failed", "request_id", reqid.From(r), "err", err)
-			return nil // skip, not fatal
+			continue // skip, not fatal
 		}
 		w.Write(append(b, '\n'))
 		count++
 		if count%flushEvery == 0 {
 			flusher.Flush()
 		}
-		return nil
-	})
-	if err != nil {
-		s.log.Error("NDJSON export stream failed", "request_id", reqid.From(r), "err", err)
-		return
 	}
 	flusher.Flush()
 
@@ -86,16 +86,16 @@ func exportAlertNDJSONRow(a store.Alert, monitorName string) map[string]any {
 	}
 	_ = json.Unmarshal(a.Payload, &p)
 	return map[string]any{
-		"id":          strconv.FormatInt(a.ID, 10),
-		"monitor_id":  strconv.FormatInt(a.MonitorID, 10),
+		"id":           strconv.FormatInt(a.ID, 10),
+		"monitor_id":   strconv.FormatInt(a.MonitorID, 10),
 		"monitor_name": monitorName,
-		"rule_id":     strconv.FormatInt(a.RuleID, 10),
-		"event_id":    a.EventID,
-		"event_name":  p.EventName,
-		"contract_id": p.ContractID,
-		"ledger":      p.Ledger,
-		"created_at":  a.CreatedAt.UTC().Format(time.RFC3339),
-		"payload":     string(a.Payload),
+		"rule_id":      strconv.FormatInt(a.RuleID, 10),
+		"event_id":     a.EventID,
+		"event_name":   p.EventName,
+		"contract_id":  p.ContractID,
+		"ledger":       p.Ledger,
+		"created_at":   a.CreatedAt.UTC().Format(time.RFC3339),
+		"payload":      string(a.Payload),
 	}
 }
 

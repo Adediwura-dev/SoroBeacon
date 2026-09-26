@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -156,6 +157,11 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 // dashboard.
 func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
 	p.live = b
+	return p
+}
+
+func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
+	p.ing.WithEnricher(e)
 	return p
 }
 
@@ -578,6 +584,11 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		})
 	}
 
+	// This legacy direct-ingest path does not apply alert grouping; the shared
+	// Ingestor owns that decision. Keep the notification fields explicit so
+	// the template remains safe for callers that do provide grouping metadata.
+	var groupCount int64
+	var windowStart, windowEnd time.Time
 	p.dispatch.Dispatch(ctx, notify.Alert{
 		ID:          alert.ID,
 		MonitorID:   m.ID,
@@ -595,7 +606,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		CreatedAt: alert.CreatedAt,
 		// GroupCount is 1 for the first alert in a window (the one
 		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount: groupCount,
+		GroupCount:  groupCount,
 		WindowStart: windowStart,
 		WindowEnd:   windowEnd,
 	})

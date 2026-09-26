@@ -32,7 +32,11 @@ type Alert struct {
 	Ledger      uint32          `json:"ledger"`
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
+	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	GroupCount  int64           `json:"group_count,omitempty"`
+	WindowStart time.Time       `json:"window_start,omitempty"`
+	WindowEnd   time.Time       `json:"window_end,omitempty"`
 	// Severity is the alert severity (info, warning, critical). Empty means
 	// warning for backwards compatibility.
 	Severity string `json:"severity,omitempty"`

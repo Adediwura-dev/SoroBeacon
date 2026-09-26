@@ -172,25 +172,26 @@ type Channel struct {
 	// DigestWindowSeconds is the accumulation window when DigestMode is
 	// "window". Zero leaves digesting off even when a mode is set, so a
 	// half-filled form cannot silently batch forever.
-	DigestWindowSeconds int64     `json:"digest_window_seconds"`
+	DigestWindowSeconds int64 `json:"digest_window_seconds"`
 	// MinSeverity is the minimum alert severity this channel will receive.
 	// Empty means no filter (receive all severities), so channels created
 	// before the field existed keep today's behaviour. It is validated at
 	// the API boundary.
-	MinSeverity Severity `json:"min_severity"`
-	CreatedAt           time.Time `json:"created_at"`
+	MinSeverity Severity  `json:"min_severity"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Alert records one rule match on one event. EventID is the source event's
 // TOID-based id; (RuleID, EventID) is unique so the same match can never
 // fire twice.
 type Alert struct {
-	ID        int64           `json:"id"`
-	MonitorID int64           `json:"monitor_id"`
-	RuleID    int64           `json:"rule_id"`
-	EventID   string          `json:"event_id"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID         int64           `json:"id"`
+	MonitorID  int64           `json:"monitor_id"`
+	RuleID     int64           `json:"rule_id"`
+	EventID    string          `json:"event_id"`
+	Payload    json.RawMessage `json:"payload"`
+	Enrichment json.RawMessage `json:"enrichment,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
 	// InhibitedByRuleID is set when an inhibition rule suppressed this
 	// alert's delivery. Nil means delivered (or never subjected to
 	// inhibition); the alert row itself is always stored.
