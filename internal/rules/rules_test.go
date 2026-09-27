@@ -259,8 +259,9 @@ func TestValueThresholdValidate(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	r := NewRegistry()
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeComposite}, r.Types())
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition}, r.Types())
+	// All registered types. TypeTopicPosition was dropped from this list when
+	// composite was added to it, so the assertion was one short.
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeComposite}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
