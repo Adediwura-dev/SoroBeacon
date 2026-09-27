@@ -37,6 +37,7 @@
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
 * [Mattermost](channels/mattermost.md)
+* [Rocket.Chat](channels/rocketchat.md)
 * [Message templates](channels/templates.md)
 * [External secrets](channels/secrets.md)
 * [Digest mode](channels/digest.md)

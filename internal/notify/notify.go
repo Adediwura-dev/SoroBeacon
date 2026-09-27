@@ -81,6 +81,7 @@ const (
 	TypeLark       = "lark"
 	TypeDingTalk   = "dingtalk"
 	TypeMattermost = "mattermost"
+	TypeRocketChat = "rocketchat"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -100,6 +101,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
 	f.Register(TypeMattermost, NewMattermost)
+	f.Register(TypeRocketChat, NewRocketChat)
 	return f
 }
 
