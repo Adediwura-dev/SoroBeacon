@@ -36,6 +36,7 @@
 * [Generic webhook](channels/webhook.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
+* [Mattermost](channels/mattermost.md)
 * [Message templates](channels/templates.md)
 * [External secrets](channels/secrets.md)
 * [Digest mode](channels/digest.md)
