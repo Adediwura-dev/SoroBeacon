@@ -42,6 +42,10 @@ type Metrics struct {
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
 	breakerStates  *prometheus.GaugeVec
+
+	storeReads     *prometheus.CounterVec
+	storeFallbacks prometheus.Counter
+	replicaEnabled prometheus.Gauge
 }
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
@@ -149,7 +153,8 @@ func New() *Metrics {
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
-		m.reorgsTotal, m.lastReorgLedger, m.breakerStates)
+		m.reorgsTotal, m.lastReorgLedger, m.breakerStates,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled)
 	return m
 }
 
@@ -272,6 +277,40 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 		outcome = "error"
 	}
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
+}
+
+// RecordStoreRead counts one read-only store query and which pool answered it.
+// pool is "primary" or "replica" — a static set chosen by the store, never
+// request-derived, so cardinality stays bounded.
+func (m *Metrics) RecordStoreRead(pool string) {
+	if m == nil {
+		return
+	}
+	m.storeReads.WithLabelValues(pool).Inc()
+}
+
+// RecordReplicaFallback counts one read that was routed to the replica but had
+// to be replayed on the primary. A steady rate here means the replica is
+// unreachable or lagging past its timeout and the routing is buying nothing.
+func (m *Metrics) RecordReplicaFallback() {
+	if m == nil {
+		return
+	}
+	m.storeFallbacks.Inc()
+}
+
+// SetReplicaEnabled records whether a read replica is configured. It is a
+// gauge, not a constant, because routing can be turned off at runtime without
+// a restart by the store itself.
+func (m *Metrics) SetReplicaEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	if enabled {
+		m.replicaEnabled.Set(1)
+		return
+	}
+	m.replicaEnabled.Set(0)
 }
 
 // RecordThrottle counts one throttled delivery per channel type.

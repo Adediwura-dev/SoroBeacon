@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
@@ -59,6 +60,8 @@ type Postgres struct {
 	cipher ConfigCipher
 	// telemetry is optional tracing; nil (the default) writes no spans.
 	telemetry *telemetry.Provider
+	// metrics is optional instrumentation for routed reads; nil-safe.
+	metrics *metrics.Metrics
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -890,6 +893,30 @@ func alertSort(s string) string {
 // replica exists to make. A caller that cannot tolerate it — the rules engine
 // rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	q, args := buildAlertQuery(f)
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// ListAlertsPrimary is ListAlerts served by the primary, whatever
+// REPLICA_DATABASE_URL says. It exists for readers that must see this
+// process's own writes — see PrimaryReader.
+func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	q, args := buildAlertQuery(f)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// buildAlertQuery builds the ListAlerts statement and its arguments. Both
+// readers call it so the routed and primary-bound forms cannot drift into
+// returning different pages.
+func buildAlertQuery(f AlertFilter) (string, []any) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
 		 FROM alerts WHERE TRUE`
 	args := []any{}
