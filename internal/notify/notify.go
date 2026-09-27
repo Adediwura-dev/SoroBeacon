@@ -36,6 +36,12 @@ type Alert struct {
 	// Severity is the alert severity (info, warning, critical). Empty means
 	// warning for backwards compatibility.
 	Severity string `json:"severity,omitempty"`
+	// GroupCount, WindowStart and WindowEnd carry alert-grouping context.
+	// A zero GroupCount means grouping is off, or this alert is not part of
+	// a group, and the notification template omits the group line.
+	GroupCount  int       `json:"group_count,omitempty"`
+	WindowStart time.Time `json:"window_start,omitempty"`
+	WindowEnd   time.Time `json:"window_end,omitempty"`
 	// Digest carries a pre-rendered summary when this Alert represents a
 	// channel digest rather than a single event. RenderText returns it
 	// verbatim, so every text channel sends the same summary without
@@ -74,6 +80,7 @@ const (
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
+	TypeLark      = "lark"
 	TypeDingTalk  = "dingtalk"
 )
 
@@ -91,6 +98,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
 	return f
 }
@@ -158,6 +166,9 @@ Ledger: {{.Ledger}}
 Tx: {{.TxHash}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
+{{- if gt .GroupCount 0}}
+Group: {{.GroupCount}} alert(s) in window {{.WindowStart.UTC.Format "2006-01-02T15:04:05Z"}} to {{.WindowEnd.UTC.Format "2006-01-02T15:04:05Z"}}
+{{- end}}
 `)))
 
 // RenderText renders the default plain-text message for an alert. A digest

@@ -172,13 +172,13 @@ type Channel struct {
 	// DigestWindowSeconds is the accumulation window when DigestMode is
 	// "window". Zero leaves digesting off even when a mode is set, so a
 	// half-filled form cannot silently batch forever.
-	DigestWindowSeconds int64     `json:"digest_window_seconds"`
+	DigestWindowSeconds int64 `json:"digest_window_seconds"`
 	// MinSeverity is the minimum alert severity this channel will receive.
 	// Empty means no filter (receive all severities), so channels created
 	// before the field existed keep today's behaviour. It is validated at
 	// the API boundary.
-	MinSeverity Severity `json:"min_severity"`
-	CreatedAt           time.Time `json:"created_at"`
+	MinSeverity Severity  `json:"min_severity"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Alert records one rule match on one event. EventID is the source event's
@@ -191,6 +191,10 @@ type Alert struct {
 	EventID   string          `json:"event_id"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"created_at"`
+	// InhibitedByRuleID is set when an inhibition rule suppressed this
+	// alert's delivery. Nil means delivered (or never subjected to
+	// inhibition); the alert row itself is always stored.
+	InhibitedByRuleID *int64 `json:"inhibited_by_rule_id,omitempty"`
 	// Severity is the alert severity copied from the rule at creation time.
 	// It is stored so changing a rule's severity later does not rewrite
 	// history.
@@ -486,6 +490,10 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
+	// row. f.Limit caps the total rows, not the page size, so an export
+	// streams with bounded memory. See streamAlerts for the guarantees.
+	ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	// ListDeliveryAttempts returns attempts for one alert, oldest first.
 	// status empty means no filter; otherwise it is applied in SQL.
@@ -673,6 +681,7 @@ type Store interface {
 	Rules
 	Channels
 	Alerts
+	Inhibitions
 	Ingest
 	Backfills
 	Ledgers
@@ -685,6 +694,15 @@ type Store interface {
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.
 	AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error)
+	// GroupAlerts creates or increments the alert group for key
+	// with windowStart and returns whether the alert should be
+	// delivered immediately (first alert in the window) and the
+	// current group count. Grouping is off when window duration is
+	// zero, which callers enforce before invoking this method.
+	GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error)
+	// CreateAlertGroup creates or increments the alert group row
+	// identified by key and windowStart. Returns the new count.
+	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close()
 }
