@@ -92,6 +92,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default               | Max idle time (`0` = driver default)         |
+| `REPLICA_DATABASE_URL` | _(unset — reads go to the primary)_ | Postgres URL of a read replica for the dashboard's list, search, stats and chart queries; must differ from `DATABASE_URL` and is rejected with a `sqlite` URL |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address (`host:port`) |
 | `HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB)                 | Max API write-body size; GET is unaffected   |
@@ -395,6 +396,9 @@ and never returned in responses. Each has a page under
 [Lark](docs/channels/lark.md) and the [generic webhook](docs/channels/webhook.md).
 [DingTalk](docs/channels/dingtalk.md) and the
 [generic webhook](docs/channels/webhook.md).
+For self-hosted chat and phone push there are also
+[Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
+[Zulip](docs/channels/zulip.md) and [Pushover](docs/channels/pushover.md).
 
 ```sh
 # Discord
