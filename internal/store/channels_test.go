@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,7 +41,10 @@ func channelIDs(cs []Channel) []int64 {
 // config survives byte-for-byte because it carries the credentials delivery
 // depends on.
 func TestChannelCreateReadRoundTrip(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres channel CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	created := &Channel{
@@ -69,7 +73,10 @@ func TestChannelCreateReadRoundTrip(t *testing.T) {
 // type and a rotated config, and toggling enabled must stick in both
 // directions instead of silently falling back to the stored value.
 func TestChannelUpdateTogglesEnabled(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres channel CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	c := &Channel{
@@ -109,7 +116,10 @@ func TestChannelUpdateTogglesEnabled(t *testing.T) {
 // without the filter every channel comes back in id order, with it the
 // disabled channel is filtered out while the enabled ones stay.
 func TestChannelListEnabledOnlyFilter(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres channel CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	on1 := &Channel{Name: "on-1", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
@@ -139,7 +149,10 @@ func TestChannelListEnabledOnlyFilter(t *testing.T) {
 // channel drops its attachment rows while the monitor itself survives — the
 // delete must succeed rather than be rejected by the attachment.
 func TestChannelDeleteAttachedToMonitor(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres channel CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
@@ -168,7 +181,10 @@ func TestChannelDeleteAttachedToMonitor(t *testing.T) {
 // update and delete — so the API can answer 404 instead of leaking a driver
 // error, and so a repeat delete is an error rather than a silent success.
 func TestChannelNotFound(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres channel CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	c := &Channel{Name: "gone", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
