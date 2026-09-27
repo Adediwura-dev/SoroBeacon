@@ -360,13 +360,14 @@ func writeRetryGate(w http.ResponseWriter, r *http.Request, err error) {
 
 func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) notify.Alert {
 	na := notify.Alert{
-		ID:        a.ID,
-		MonitorID: a.MonitorID,
-		RuleID:    a.RuleID,
-		EventID:   a.EventID,
-		Payload:   a.Payload,
-		CreatedAt: a.CreatedAt,
-		Severity:  string(a.Severity),
+		ID:         a.ID,
+		MonitorID:  a.MonitorID,
+		RuleID:     a.RuleID,
+		EventID:    a.EventID,
+		Payload:    a.Payload,
+		Enrichment: a.Enrichment,
+		CreatedAt:  a.CreatedAt,
+		Severity:   string(a.Severity),
 	}
 	var p struct {
 		ContractID string `json:"contract_id"`

@@ -372,6 +372,9 @@ and never returned in responses. Each has a page under
 [Lark](docs/channels/lark.md) and the [generic webhook](docs/channels/webhook.md).
 [DingTalk](docs/channels/dingtalk.md) and the
 [generic webhook](docs/channels/webhook.md).
+For self-hosted chat and phone push there are also
+[Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
+[Zulip](docs/channels/zulip.md) and [Pushover](docs/channels/pushover.md).
 
 ```sh
 # Discord
