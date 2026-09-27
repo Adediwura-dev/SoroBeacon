@@ -102,6 +102,8 @@ The built-ins, one file each:
 | `frequency_threshold` | `internal/rules/frequency_threshold.go` |
 | `composite` | `internal/rules/composite.go` |
 | `topic_regex` | `internal/rules/topic_regex.go` |
+| `topic_regex` | `internal/rules/topic_regex.go` |
+| `topic_position` | `internal/rules/topic_position.go` |
 | `address_watchlist` | `internal/rules/address_watchlist.go` |
 
 `frequency_threshold` is the interesting one: it is stateful, keeps a rolling

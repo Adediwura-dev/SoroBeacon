@@ -8,6 +8,8 @@ semantics and more examples — [event\_emitted](event-emitted.md),
 [frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
 [address\_watchlist](address-watchlist.md), [composite](composite.md), and the
 cross-cutting [cooldown](cooldown.md).
+[address\_watchlist](address-watchlist.md), [topic\_position](topic-position.md),
+and the cross-cutting [cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
@@ -194,6 +196,25 @@ capped at five levels.
 | --- | --- | --- | --- | --- |
 | `op` | string | yes | — | One of `and`, `or`, `not`. |
 | `rules` | array | yes | — | Child rules, each `{"type": ..., "params": {...}}`. `and`/`or` need at least one; `not` needs exactly one. |
+## topic\_position
+
+Matches when the decoded topic at a fixed position exactly equals a configured
+value — the question custom (non-SEP-41) contracts raise with their
+positioned topics (a pool ID, a market symbol, an account), which
+`event_emitted` (first topic only) and `token_event` (SEP-41 slots only)
+cannot ask.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `position` | number | yes | — | Topic index to compare; `0` is the event-name topic. |
+| `equals` | string | yes | — | Exact value the decoded topic must equal. |
+| `event` | string | no | — | Also require this event name (first topic). |
+
+The comparison is exact string equality against the topic's **decoded string
+form**: string topics compare as themselves, numeric topics by their decimal
+rendering (`{"i128": "1000000"}` and `42` both compare as `"1000000"`-style
+decimal strings), addresses by their strkey. Matching is case-sensitive; a
+position beyond the event's topic count is a non-match, never an error.
 
 Complete, valid params document:
 
@@ -210,6 +231,12 @@ Complete, valid params document:
 A child error is reported with the path to it, for example
 `rules[1].params.comparison`, so a malformed grandchild names its exact
 location.
+
+  "position": 2,
+  "equals": "POOL_USDC_XLM",
+  "event": "deposit"
+}
+```
 
 ## What validation failure looks like
 
@@ -250,6 +277,11 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
   "request_id": "…",
   "details": [
     {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite topic_regex address_watchlist])"}
+  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold topic_regex address_watchlist topic_position])",
+  "code": "Bad Request",
+  "request_id": "…",
+  "details": [
+    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold topic_regex address_watchlist topic_position])"}
   ]
 }
 ```

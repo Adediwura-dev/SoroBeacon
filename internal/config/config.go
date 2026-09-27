@@ -21,6 +21,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultOTLPSampleRate keeps every trace when tracing is enabled.
+	// Sampling is an operator lever for busy deployments, not a way to hide
+	// spans by default: the whole feature is off unless OTLP_ENDPOINT is set.
+	DefaultOTLPSampleRate = 1.0
 	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
@@ -119,6 +123,11 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
+	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
+	// no exporter goroutines, no measurable overhead — spans collapse to
+	// no-ops. When set it is the OTLP/HTTP base URL spans are shipped to.
+	OTLP OTLPConfig
 	// GRPCAddr is the listen address for the optional gRPC server
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
@@ -171,6 +180,25 @@ type Config struct {
 	NotifyRateLimitDefaultRPS float64
 }
 
+// OTLPConfig is the tracing slice of the configuration. It is a struct so a
+// stage that needs the endpoint does not pull the whole Config in.
+type OTLPConfig struct {
+	// Endpoint is the OTLP/HTTP base URL (OTLP_ENDPOINT, e.g.
+	// http://localhost:4318). Empty disables tracing.
+	Endpoint string
+	// ServiceName is the service.name resource attribute
+	// (OTLP_SERVICE_NAME). Empty falls back to "sorobeacon".
+	ServiceName string
+	// SampleRate is the fraction of traces kept, in [0,1]
+	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
+	SampleRate float64
+}
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
 func Load() (Config, error) {
@@ -180,19 +208,19 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:                    net,
-		RPCURL:                     net.RPCURL,
-		RPCURLs:                    net.RPCURLs,
-		DatabaseURL:                os.Getenv("DATABASE_URL"),
-		PollInterval:               DefaultPollInterval,
-		HTTPAddr:                   getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:           DefaultHTTPMaxBodyBytes,
-		LogLevel:                   slog.LevelInfo,
-		MonitorSilentAfter:         DefaultMonitorSilentAfter,
-		NotifyRateLimitSlackRPS:    1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
-		NotifyRateLimitTelegramRPS: 30.0, // Telegram Bot API limit ~30 rps
-		NotifyRateLimitPagerDutyRPS: 2.0, // PagerDuty Events API v2 rate limit ~2 rps
-		NotifyRateLimitDefaultRPS:  5.0,  // General default rps
+		Network:                     net,
+		RPCURL:                      net.RPCURL,
+		RPCURLs:                     net.RPCURLs,
+		DatabaseURL:                 os.Getenv("DATABASE_URL"),
+		PollInterval:                DefaultPollInterval,
+		HTTPAddr:                    getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes:            DefaultHTTPMaxBodyBytes,
+		LogLevel:                    slog.LevelInfo,
+		MonitorSilentAfter:          DefaultMonitorSilentAfter,
+		NotifyRateLimitSlackRPS:     1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
+		NotifyRateLimitTelegramRPS:  30.0, // Telegram Bot API limit ~30 rps
+		NotifyRateLimitPagerDutyRPS: 2.0,  // PagerDuty Events API v2 rate limit ~2 rps
+		NotifyRateLimitDefaultRPS:   5.0,  // General default rps
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -382,6 +410,27 @@ func Load() (Config, error) {
 	}
 	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
 
+	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
+	cfg.OTLP.Endpoint = os.Getenv("OTLP_ENDPOINT")
+	if cfg.OTLP.Endpoint != "" {
+		u, err := url.Parse(cfg.OTLP.Endpoint)
+		if err != nil || !u.IsAbs() || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return cfg, fmt.Errorf(
+				"invalid OTLP_ENDPOINT %q: must be an absolute http or https URL",
+				cfg.OTLP.Endpoint,
+			)
+		}
+	}
+	cfg.OTLP.ServiceName = os.Getenv("OTLP_SERVICE_NAME")
+	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
+	if v := os.Getenv("OTLP_SAMPLE_RATE"); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
+		}
+		cfg.OTLP.SampleRate = r
+	}
 	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
@@ -482,12 +531,12 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("poll_interval", c.PollInterval.String()),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
-		slog.String("rpc_url", c.RPCURL),
+		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),
 		// The count, not the list: it is how an operator confirms at a
 		// glance that the failover set was read, and the URLs themselves
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
-		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
@@ -499,6 +548,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
+		slog.String("otlp_service_name", c.OTLP.ServiceName),
+		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
 	}
 }
 
@@ -511,7 +563,17 @@ func redactDatabaseURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" {
+	if err != nil {
+		// A sqlite URL can carry a Windows drive path ("sqlite://C:\srv\x.db"),
+		// which url.Parse rejects because it reads "C:" as a host with a bad
+		// port. It holds no credentials, so the operator can still be shown
+		// which file the process opened.
+		if strings.HasPrefix(strings.ToLower(raw), "sqlite:") {
+			return raw
+		}
+		return redacted
+	}
+	if u.Scheme == "" {
 		return redacted
 	}
 	if strings.EqualFold(u.Scheme, "sqlite") {
@@ -521,6 +583,23 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// redactURLCredentials drops userinfo from a URL so an API key supplied as
+// basic auth cannot reach a log line, while keeping the rest readable. Like
+// redactDatabaseURL it fails closed, because a valid password is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// that is precisely the input worth protecting.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	u.User = nil
+	return u.String()
 }
 
 // ParseRetention accepts Go durations (24h, 90m) plus a day suffix
