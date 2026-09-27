@@ -41,6 +41,7 @@ type Metrics struct {
 	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
+	breakerStates  *prometheus.GaugeVec
 }
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
@@ -110,6 +111,11 @@ func New() *Metrics {
 			Help: "Throttled alert delivery attempts, by channel type.",
 		}, []string{"channel"}),
 
+		breakerStates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_breaker_state",
+			Help: "Circuit breaker state for each channel (0=closed, 1=half-open, 2=open).",
+		}, []string{"channel_id", "channel_type", "state"}),
+
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
 			Help:    "HTTP request duration by route pattern, method and status.",
@@ -124,13 +130,29 @@ func New() *Metrics {
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
-		m.reorgsTotal, m.lastReorgLedger)
+		m.reorgsTotal, m.lastReorgLedger, m.breakerStates)
 	return m
 }
 
 // Handler serves the metrics registry in Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// RegisterStreamDropped exposes the live-alerts broadcaster's dropped-event
+// counter on /metrics. The callback is read lazily on each scrape, so the
+// broadcaster keeps its own cheap atomic counter and this package does not
+// need to import it. A nil callback (or nil receiver) registers nothing.
+func (m *Metrics) RegisterStreamDropped(dropped func() uint64) {
+	if m == nil || dropped == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "sorobeacon_alerts_stream_dropped_total",
+		Help: "Alert events dropped from the live SSE stream because a subscriber could not keep up.",
+	}, func() float64 {
+		return float64(dropped())
+	}))
 }
 
 // RecordPoll observes one completed poll cycle.
@@ -239,6 +261,20 @@ func (m *Metrics) RecordThrottle(channelType string) {
 		return
 	}
 	m.throttles.WithLabelValues(channelType).Inc()
+}
+
+// SetBreakerState sets the gauge value for a channel's circuit breaker state.
+func (m *Metrics) SetBreakerState(channelID string, channelType string, state string) {
+	if m == nil {
+		return
+	}
+	for _, s := range []string{"closed", "open", "half-open"} {
+		val := float64(0)
+		if s == state {
+			val = 1
+		}
+		m.breakerStates.WithLabelValues(channelID, channelType, s).Set(val)
+	}
 }
 
 // statusRecorder captures the status code a handler wrote, for the HTTP
