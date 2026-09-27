@@ -80,6 +80,7 @@ const (
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
+	TypeLark      = "lark"
 	TypeDingTalk  = "dingtalk"
 )
 
@@ -97,6 +98,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
 	return f
 }
