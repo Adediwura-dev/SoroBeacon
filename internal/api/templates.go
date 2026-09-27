@@ -27,10 +27,6 @@ type instantiateInput struct {
 	Name        string            `json:"name"`
 	ContractIDs []string          `json:"contract_ids"`
 	Parameters  map[string]string `json:"parameters"`
-	// Network is optional: a template is chain-agnostic text, so an
-	// instance defaults to the primary network and names a chain only when
-	// the operator wants one of the other polled networks.
-	Network *string `json:"network,omitempty"`
 }
 
 type bulkInstantiateInput struct {

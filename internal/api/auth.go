@@ -9,44 +9,8 @@ import (
 )
 
 // AuthMiddleware requires a credential on every /api/v1 route once a token
-// is configured through API_TOKEN, and scopes the request to the workspace
-// that credential belongs to. Two credentials are accepted:
-//
-//   - Authorization: Bearer <token> — scripts, CI and other services.
-//   - the dashboard's session cookie — a browser that signed in at /login.
-//     The dashboard is same-origin with the API and links straight to
-//     endpoints like /api/v1/alerts.csv, and a plain link cannot attach a
-//     header, so the cookie has to count here too. It is HttpOnly and
-//     SameSite=Lax, so a cross-site page can neither read it nor get a
-//     forged POST to carry it.
-//
-// The workspace comes from the credential and from nothing else (auth.
-// Principal): there is deliberately no X-Workspace header, because a client
-// that could name its own workspace could read another team's monitors.
-// Handlers below this middleware therefore need no per-route tenancy check —
-// every store method they call is scoped by the context they hand it.
-//
-// A credential that carries a scope list (a token minted at POST /tokens) is
-// additionally checked against routeScopes before any handler runs: the route
-// it needs must be in the table, and the token must hold every scope that entry
-// lists. Anything else is a 403. A static token or a dashboard session has no
-// scope list and is exempt, because that is what it means to be the operator.
-//
-// With no token configured the middleware steps aside completely: an
-// unauthenticated deployment behaves exactly as it did before this existed
-// (the process logs one startup warning instead), and a request context with
-// no workspace resolves to the default one in the store.
-//
-// Probes (/health, /livez, /readyz) stay exempt so an authenticated
-// deployment cannot fail its own health checks, and so the docker-compose
-// healthcheck keeps working with no token in its environment. This is the
-// same exemption the rate limiter uses (isProbePath); the cost is that the
-// readiness detail — dependency names and error strings — is readable
-// without a token. Do not expose these paths to the public internet.
-func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) http.Handler {
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
-	}
+// is configured through API_TOKEN.
+func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
 	if !a.Enabled() {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -56,11 +20,7 @@ func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) 
 				next.ServeHTTP(w, r)
 				return
 			}
-			principal, ok := a.Principal(r)
-			if !ok {
-				// One message for a missing header, a malformed one and a
-				// wrong token: the response must not tell a caller which of
-				// those it got. The presented credential is never echoed.
+			if !a.Authenticated(r) {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="sorobeacon"`)
 				writeErr(w, r, http.StatusUnauthorized, "unauthorized")
 				return
@@ -94,4 +54,57 @@ func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// RoleMiddleware returns middleware that enforces role-based access control based on endpoint methods/paths.
+func RoleMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
+	if !a.Enabled() {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isProbePath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			required := auth.RoleViewer
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				required = auth.RoleEditor
+			}
+			role, _ := a.RoleForRequest(r)
+			if !role.HasPermission(required) {
+				writeErr(w, r, http.StatusForbidden, "forbidden")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequireRole returns middleware that enforces minimum role permissions (fail-closed).
+func RequireRole(required auth.Role) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authObj, ok := r.Context().Value(authContextKey).(*auth.Authenticator)
+			// If auth is not in context, fall back to checking if global auth permits or fail-closed if unauthenticated
+			var role auth.Role
+			if ok && authObj != nil {
+				role, _ = authObj.RoleForRequest(r)
+			} else {
+				role = auth.RoleUnknown
+			}
+			if !role.HasPermission(required) {
+				writeErr(w, r, http.StatusForbidden, "forbidden")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+var authContextKey = &contextKey{"auth"}
+
+type contextKey struct {
+	name string
 }

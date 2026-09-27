@@ -72,7 +72,7 @@ Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`v
 
 | Method & path | Description |
 | --- | --- |
-| `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`. |
+| `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`, optional `digest_mode` (`""` or `"window"`) and `digest_window_seconds` (must be > 0 when the mode is `window`). See [Digest mode](../channels/digest.md). |
 | `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** |
 | `PATCH /channels/{id}` | Partial update; config re-validated. |
 | `DELETE /channels/{id}` | Delete. |
@@ -142,3 +142,4 @@ Three behaviours worth knowing before you script against this:
 | `GET /health` | Checks Postgres and the RPC. `200` when both are ok, `503` with per-dependency detail when degraded. On a multi-network instance it gains a `networks` array (processed ledger, chain tip, lag, last poll, per-chain errors) and degrades when any polled chain degrades. |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. |
+| `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. |
