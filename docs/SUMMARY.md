@@ -39,6 +39,7 @@
 * [Mattermost](channels/mattermost.md)
 * [Rocket.Chat](channels/rocketchat.md)
 * [Zulip](channels/zulip.md)
+* [Pushover](channels/pushover.md)
 * [Message templates](channels/templates.md)
 * [External secrets](channels/secrets.md)
 * [Digest mode](channels/digest.md)

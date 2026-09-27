@@ -83,6 +83,7 @@ const (
 	TypeMattermost = "mattermost"
 	TypeRocketChat = "rocketchat"
 	TypeZulip      = "zulip"
+	TypePushover   = "pushover"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -104,6 +105,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeMattermost, NewMattermost)
 	f.Register(TypeRocketChat, NewRocketChat)
 	f.Register(TypeZulip, NewZulip)
+	f.Register(TypePushover, NewPushover)
 	return f
 }
 
