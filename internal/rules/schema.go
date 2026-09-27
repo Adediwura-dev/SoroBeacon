@@ -11,6 +11,7 @@ type FieldSchema struct {
 	Description string   `json:"description"`
 	Options     []string `json:"options,omitempty"`
 	Default     string   `json:"default"`
+	Default     string   `json:"default,omitempty"`
 }
 
 // SchemaProvider is implemented by evaluators that can describe their params
@@ -104,5 +105,20 @@ func (*FrequencyThreshold) ParamSchema() []FieldSchema {
 		{Name: "count", Type: "number", Required: true, Description: "Fire at this many matches"},
 		{Name: "window", Type: "string", Required: true, Description: "Rolling window duration (e.g. 5m, 1h)"},
 		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
+	}
+}
+
+func (*TopicRegex) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "pattern", Type: "string", Required: true, Description: "Regular expression matched against a topic (e.g. ^swap_)"},
+		{Name: "position", Type: "number", Description: "Topic position to match (0 is the event name); omitted matches any topic"},
+	}
+}
+
+func (*AddressWatchlist) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "addresses", Type: "object", Required: true, Description: "Watchlist of Stellar addresses (JSON array)"},
+		{Name: "match", Type: "select", Description: "Which address slot(s) to watch", Options: []string{"from", "to", "either"}, Default: "either"},
+		{Name: "event", Type: "select", Description: "Restrict to one SEP-41 event", Options: []string{"transfer", "mint", "burn", "clawback", "set_admin", "*"}},
 	}
 }
