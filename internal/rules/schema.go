@@ -88,6 +88,14 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 func (EventNameGlob) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "patterns", Type: "object", Required: true, Description: "Glob patterns matched against the whole event name (JSON array, e.g. [\"swap_*\"])"},
+func (NumericRange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min", Type: "string", Description: "Inclusive lower bound (decimal integer string); at least one of min/max required"},
+		{Name: "max", Type: "string", Description: "Inclusive upper bound (decimal integer string); at least one of min/max required"},
+		{Name: "inclusive", Type: "select", Description: "Boundary values match (default true)", Options: []string{"true", "false"}, Default: "true"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the range (default false)", Options: []string{"true", "false"}, Default: "false"},
+		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
+		{Name: "value_path", Type: "string", Description: "Dot path into the event value"},
 	}
 }
 
