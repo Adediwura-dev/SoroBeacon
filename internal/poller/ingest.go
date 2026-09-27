@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
@@ -36,7 +37,8 @@ type Ingestor struct {
 	// live is the optional SSE fan-out. When set, every alert this Ingestor
 	// creates for a live event is published to it; nil (the NewIngestor
 	// default) disables live alerts entirely.
-	live *broadcast.Broadcaster
+	live     *broadcast.Broadcaster
+	enricher *alerts.Enricher
 }
 
 // NewIngestor wires an Ingestor. d receives every alert unless the caller
@@ -56,6 +58,11 @@ func (in *Ingestor) WithMetrics(m *metrics.Metrics) *Ingestor {
 // is created, with no database round-trip; a backfill leaves it nil.
 func (in *Ingestor) WithPublisher(b *broadcast.Broadcaster) *Ingestor {
 	in.live = b
+	return in
+}
+
+func (in *Ingestor) WithEnricher(e *alerts.Enricher) *Ingestor {
+	in.enricher = e
 	return in
 }
 
@@ -158,6 +165,12 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		Backfilled:     opts.Backfilled,
 		Severity:       rule.Severity,
 	}
+	if in.enricher != nil {
+		alert.Enrichment, err = in.enricher.Fetch(ctx, ev.ContractID, ev.EventName())
+		if err != nil {
+			in.log.Warn("alert enrichment failed; continuing without enrichment", "event_id", eventID, "err", err)
+		}
+	}
 	outcome, err := in.store.CreateAlert(ctx, alert)
 	if err != nil {
 		in.log.Error("create alert", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
@@ -198,6 +211,7 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 			RuleID:      rule.ID,
 			EventID:     eventID,
 			Payload:     alert.Payload,
+			Enrichment:  alert.Enrichment,
 			CreatedAt:   alert.CreatedAt,
 		})
 	}
@@ -217,6 +231,7 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		Ledger:      ev.Ledger,
 		TxHash:      ev.TxHash,
 		Payload:     alert.Payload,
+		Enrichment:  alert.Enrichment,
 		CreatedAt:   alert.CreatedAt,
 		Severity:    string(alert.Severity),
 	})
