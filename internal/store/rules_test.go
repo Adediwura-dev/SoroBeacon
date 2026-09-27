@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,7 +44,10 @@ func ruleIDs(rs []Rule) []int64 {
 // params survive byte-for-byte — the rule registry validates them at
 // evaluation time, so the store must pass them through unchanged.
 func TestRuleCreateReadParamsRoundTrip(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres rule CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
@@ -72,7 +76,10 @@ func TestRuleCreateReadParamsRoundTrip(t *testing.T) {
 // dashboard call: a monitor's rules come back in id order and only its own,
 // while a monitor without rules gets an empty list rather than an error.
 func TestRuleListForMonitor(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres rule CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m1 := &Monitor{Name: "m1", ContractIDs: []string{"CAAA"}, Enabled: true}
@@ -105,7 +112,10 @@ func TestRuleListForMonitor(t *testing.T) {
 // must stick in both directions because the poller's enabled-only listing
 // reads it.
 func TestRuleUpdateParamsAndEnabled(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres rule CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
@@ -137,7 +147,10 @@ func TestRuleUpdateParamsAndEnabled(t *testing.T) {
 // one rule must remove exactly that row — the other rules on the monitor
 // keep their params and enabled flags.
 func TestRuleDeleteLeavesSiblings(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres rule CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
@@ -170,7 +183,10 @@ func TestRuleDeleteLeavesSiblings(t *testing.T) {
 // that into ErrNotFound, so callers answer 404 instead of surfacing a
 // driver error, and no id is handed back.
 func TestRuleCreateUnknownMonitor(t *testing.T) {
-	st := testStore(t)
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres rule CRUD tests")
+	}
+	st := newTestPostgres(t)
 	ctx := context.Background()
 
 	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
