@@ -120,6 +120,10 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
+	AlertEnrichmentURL      string
+	AlertEnrichmentTimeout  time.Duration
+	AlertEnrichmentCacheTTL time.Duration
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
@@ -393,6 +397,23 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
 		}
 		cfg.AlertRetention = d
+	}
+	cfg.AlertEnrichmentURL = strings.TrimSpace(os.Getenv("ALERT_ENRICHMENT_URL"))
+	cfg.AlertEnrichmentTimeout = 2 * time.Second
+	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
+	if v := os.Getenv("ALERT_ENRICHMENT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_TIMEOUT %q", v)
+		}
+		cfg.AlertEnrichmentTimeout = d
+	}
+	if v := os.Getenv("ALERT_ENRICHMENT_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_CACHE_TTL %q", v)
+		}
+		cfg.AlertEnrichmentCacheTTL = d
 	}
 	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
