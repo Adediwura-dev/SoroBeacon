@@ -491,6 +491,10 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
+	// row. f.Limit caps the total rows, not the page size, so an export
+	// streams with bounded memory. See streamAlerts for the guarantees.
+	ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	// ListDeliveryAttempts returns attempts for one alert, oldest first.
 	// status empty means no filter; otherwise it is applied in SQL.

@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,8 +13,9 @@ import (
 // exportAlertsNDJSON serves GET /alerts/export as NDJSON streaming.
 // It shares parseAlertFilter with GET /alerts, streams each alert as a
 // newline-delimited JSON object, flushes periodically, and caps the
-// total at maxAlertExportRows. A repeatable-read snapshot keeps the
-// export consistent; request cancellation stops the underlying query.
+// total at maxAlertExportRows. Rows are paged rather than read from a
+// snapshot, so an alert inserted mid-export may or may not appear;
+// request cancellation stops the walk at the next page.
 func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	f, ok := parseAlertFilter(w, r)
 	if !ok {
@@ -52,23 +52,27 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	flushEvery := alertExportPageSize
 
-	alerts, err := s.store.ListAlerts(r.Context(), f)
-	if err != nil {
-		s.log.Error("NDJSON export stream failed", "request_id", reqid.From(r), "err", err)
-		return
-	}
-	for _, a := range alerts {
+	err = s.store.ListAlertsStream(r.Context(), f, func(a store.Alert) error {
 		line := exportAlertNDJSONRow(a, names[a.MonitorID])
 		b, err := json.Marshal(line)
 		if err != nil {
 			s.log.Error("NDJSON marshal failed", "request_id", reqid.From(r), "err", err)
-			continue // skip, not fatal
+			return nil // skip, not fatal
 		}
-		w.Write(append(b, '\n'))
+		if _, err := w.Write(append(b, '\n')); err != nil {
+			// The client went away. Returning the error stops the store
+			// walk instead of paging on into a connection nobody reads.
+			return err
+		}
 		count++
 		if count%flushEvery == 0 {
 			flusher.Flush()
 		}
+		return nil
+	})
+	if err != nil {
+		s.log.Error("NDJSON export stream failed", "request_id", reqid.From(r), "err", err)
+		return
 	}
 	flusher.Flush()
 
@@ -97,20 +101,4 @@ func exportAlertNDJSONRow(a store.Alert, monitorName string) map[string]any {
 		"created_at":   a.CreatedAt.UTC().Format(time.RFC3339),
 		"payload":      string(a.Payload),
 	}
-}
-
-// ndjsonRowMap is used by tests to verify NDJSON output structure.
-func ndjsonRowMap(a store.Alert, monitorName string) map[string]any {
-	return exportAlertNDJSONRow(a, monitorName)
-}
-
-// writeNDJSON writes a single NDJSON line to the response writer.
-// Exported so tests can verify the format without a live server.
-func writeNDJSON(w io.Writer, v map[string]any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(b, '\n'))
-	return err
 }

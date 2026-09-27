@@ -34,7 +34,7 @@ type Alert struct {
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
-	GroupCount  int64           `json:"group_count,omitempty"`
+	GroupCount  int             `json:"group_count,omitempty"`
 	WindowStart time.Time       `json:"window_start,omitempty"`
 	WindowEnd   time.Time       `json:"window_end,omitempty"`
 	// Severity is the alert severity (info, warning, critical). Empty means
@@ -78,6 +78,7 @@ const (
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
+	TypeLark      = "lark"
 	TypeDingTalk  = "dingtalk"
 )
 
@@ -95,6 +96,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
 	return f
 }
