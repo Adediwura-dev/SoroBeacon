@@ -25,6 +25,7 @@
 * [frequency\_threshold](rules/frequency-threshold.md)
 * [topic\_regex](rules/topic-regex.md)
 * [address\_watchlist](rules/address-watchlist.md)
+* [topic\_position](rules/topic-position.md)
 * [Rule cooldown](rules/cooldown.md)
 
 ## 📣 Channel reference
@@ -39,6 +40,8 @@
 * [PagerDuty](channels/pagerduty.md)
 * [Federation](channels/federation.md)
 * [Message templates](channels/templates.md)
+* [External secrets](channels/secrets.md)
+* [Digest mode](channels/digest.md)
 
 ## 📏 Operations
 
