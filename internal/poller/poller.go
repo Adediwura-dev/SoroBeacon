@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -156,6 +157,11 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 // dashboard.
 func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
 	p.live = b
+	return p
+}
+
+func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
+	p.ing.WithEnricher(e)
 	return p
 }
 
@@ -593,10 +599,5 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		// notification reports it too.
 		Payload:   alert.Payload,
 		CreatedAt: alert.CreatedAt,
-		// GroupCount is 1 for the first alert in a window (the one
-		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount: groupCount,
-		WindowStart: windowStart,
-		WindowEnd:   windowEnd,
 	})
 }

@@ -32,7 +32,11 @@ type Alert struct {
 	Ledger      uint32          `json:"ledger"`
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
+	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	GroupCount  int             `json:"group_count,omitempty"`
+	WindowStart time.Time       `json:"window_start,omitempty"`
+	WindowEnd   time.Time       `json:"window_end,omitempty"`
 	// Severity is the alert severity (info, warning, critical). Empty means
 	// warning for backwards compatibility.
 	Severity string `json:"severity,omitempty"`
@@ -64,17 +68,22 @@ type Factory struct {
 
 // Channel type names understood by DefaultFactory.
 const (
-	TypeDiscord   = "discord"
-	TypeSlack     = "slack"
-	TypeTelegram  = "telegram"
-	TypeEmail     = "email"
-	TypeWebhook   = "webhook"
-	TypeMatrix    = "matrix"
-	TypePagerDuty = "pagerduty"
-	TypeTwilio    = "twilio"
-	TypeSignal    = "signal"
-	TypeWebex     = "webex"
-	TypeDingTalk  = "dingtalk"
+	TypeDiscord    = "discord"
+	TypeSlack      = "slack"
+	TypeTelegram   = "telegram"
+	TypeEmail      = "email"
+	TypeWebhook    = "webhook"
+	TypeMatrix     = "matrix"
+	TypePagerDuty  = "pagerduty"
+	TypeTwilio     = "twilio"
+	TypeSignal     = "signal"
+	TypeWebex      = "webex"
+	TypeLark       = "lark"
+	TypeDingTalk   = "dingtalk"
+	TypeMattermost = "mattermost"
+	TypeRocketChat = "rocketchat"
+	TypeZulip      = "zulip"
+	TypePushover   = "pushover"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -91,7 +100,12 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
+	f.Register(TypeMattermost, NewMattermost)
+	f.Register(TypeRocketChat, NewRocketChat)
+	f.Register(TypeZulip, NewZulip)
+	f.Register(TypePushover, NewPushover)
 	return f
 }
 

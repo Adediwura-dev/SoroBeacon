@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -42,6 +44,13 @@ type DispatchStore interface {
 	// ListChannels is how the digest flusher discovers channels with a
 	// window to close. Dispatch itself only needs ListChannelsForMonitor.
 	ListChannels(ctx context.Context, enabledOnly bool) ([]store.Channel, error)
+	// The inhibition trio backs the delivery-time suppression check
+	// (alerts.InhibitedBy in internal/alerts): the pairs targeting the
+	// alert's rule, whether a source is still firing, and the mark that
+	// records why delivery stopped.
+	ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]store.Inhibition, error)
+	RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error)
+	MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error
 }
 
 // Dispatcher fans an alert out to its monitor's channels, retrying each
@@ -51,7 +60,9 @@ type Dispatcher struct {
 	factory *Factory
 	log     *slog.Logger
 	// metrics is optional Prometheus instrumentation; nil-safe.
-	metrics *metrics.Metrics
+	metrics     *metrics.Metrics
+	registry    *BreakerRegistry
+	rateLimiter *ChannelRateLimiter
 	// telemetry is optional tracing; nil-safe. Delivery spans are started
 	// from the alert's context, so they are children of the alert's span —
 	// that parent chain, not any attribute, is what joins the delivery to
@@ -62,7 +73,6 @@ type Dispatcher struct {
 	// (default 1s, doubled each retry: 1s, 2s, 4s...).
 	MaxAttempts int
 	BaseBackoff time.Duration
-	rateLimiter *ChannelRateLimiter
 
 	// digest is optional. When attached, channels with digest mode
 	// "window" accumulate alerts here and a summary is flushed once the
@@ -84,6 +94,7 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		store:       s,
 		factory:     f,
 		log:         log,
+		registry:    NewBreakerRegistry(3, 30*time.Second),
 		MaxAttempts: 3,
 		BaseBackoff: time.Second,
 		rateLimiter: NewChannelRateLimiter(defaults),
@@ -118,7 +129,15 @@ func digestEnabled(ch store.Channel) bool {
 // Dispatch delivers one alert to every enabled channel attached to its
 // monitor. Channel failures are recorded and logged, never fatal: one bad
 // channel must not block the others or the poller.
+//
+// Before delivering, the dispatcher consults the inhibition rules targeting
+// the alert's rule. An inhibited alert is recorded (MarkAlertInhibited, so
+// the dashboard can show why nothing was sent) and not delivered — but the
+// alert row itself is always kept.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
+	if d.inhibited(ctx, a) {
+		return
+	}
 	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
 	if err != nil {
 		d.log.Error("list channels for alert", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
@@ -135,6 +154,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 		}
 		d.deliver(ctx, a, ch)
 	}
+}
+
+// inhibited answers the delivery-time suppression check for one alert.
+// Failures fail open: an inhibition-store error must not silence real
+// alerts, so anything that cannot be evaluated is delivered. When the
+// alert is suppressed the mark is best-effort — recording why delivery
+// stopped must not turn a suppression into a crash or a retry storm.
+func (d *Dispatcher) inhibited(ctx context.Context, a Alert) bool {
+	inhibitions, err := d.store.ListInhibitionsForTarget(ctx, a.RuleID)
+	if err != nil {
+		d.log.Error("list inhibitions for alert", "alert_id", a.ID, "rule_id", a.RuleID, "err", err)
+		return false
+	}
+	sourceID, suppressed, err := alerts.InhibitedBy(ctx, a.RuleID, inhibitions, d.store.RuleFiredWithin)
+	if err != nil {
+		d.log.Error("evaluate inhibition", "alert_id", a.ID, "rule_id", a.RuleID, "err", err)
+		return false
+	}
+	if !suppressed {
+		return false
+	}
+	if err := d.store.MarkAlertInhibited(ctx, a.ID, sourceID); err != nil {
+		d.log.Error("mark alert inhibited", "alert_id", a.ID, "source_rule_id", sourceID, "err", err)
+	}
+	d.log.Info("delivery inhibited", "alert_id", a.ID, "rule_id", a.RuleID, "source_rule_id", sourceID)
+	return true
 }
 
 // severityMeetsThreshold reports whether the alert severity meets or exceeds
@@ -238,6 +283,7 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 	}
 	if len(alerts) == 0 {
 		d.log.Debug("digest skipped: no alerts meet channel severity threshold", "channel_id", ch.ID, "channel_min_severity", ch.MinSeverity)
+		d.clearDigest(ctx, ch.ID, ids)
 		return
 	}
 
@@ -297,12 +343,27 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		}
 	}
 
+	cb := d.registry.Get(ch.ID)
+	state := cb.State()
+	if d.metrics != nil {
+		d.metrics.SetBreakerState(strconv.FormatInt(ch.ID, 10), ch.Type, string(state))
+	}
+
+	if !cb.Allow() {
+		d.log.Debug("channel circuit breaker open, skipping delivery attempt", "channel_id", ch.ID, "alert_id", a.ID)
+		return
+	}
+
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		// Bad config: record one failed attempt, no point retrying.
 		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		telemetry.RecordError(span, err)
+		cb.RecordFailure()
+		if d.metrics != nil {
+			d.metrics.SetBreakerState(strconv.FormatInt(ch.ID, 10), ch.Type, string(cb.State()))
+		}
 		return
 	}
 
@@ -310,12 +371,20 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	for attempt := 1; ; attempt++ {
 		err := notifier.Send(ctx, a)
 		if err == nil {
+			cb.RecordSuccess()
+			if d.metrics != nil {
+				d.metrics.SetBreakerState(strconv.FormatInt(ch.ID, 10), ch.Type, string(cb.State()))
+			}
 			if d.metrics != nil {
 				d.metrics.RecordDelivery(ch.Type, true)
 			}
 			d.record(ctx, a.ID, ch.ID, "success", "")
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
 			return
+		}
+		cb.RecordFailure()
+		if d.metrics != nil {
+			d.metrics.SetBreakerState(strconv.FormatInt(ch.ID, 10), ch.Type, string(cb.State()))
 		}
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, false)
@@ -332,7 +401,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			}
 		}
 
-		if attempt >= d.MaxAttempts || ctx.Err() != nil {
+		if attempt >= d.MaxAttempts || ctx.Err() != nil || cb.State() == StateOpen {
 			return
 		}
 		select {

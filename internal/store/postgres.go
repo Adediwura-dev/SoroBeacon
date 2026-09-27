@@ -790,9 +790,9 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	}
 
 	err = tx.QueryRow(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, backfilled, ledger) VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id, created_at`,
-		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), a.Backfilled, int64(a.Ledger),
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, backfilled, ledger) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 RETURNING id, created_at`,
+		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
 	).Scan(&a.ID, &a.CreatedAt)
 	if err != nil {
 		return "", err
@@ -865,9 +865,9 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	var ledger int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
 		   FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled)
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -890,32 +890,7 @@ func alertSort(s string) string {
 // replica exists to make. A caller that cannot tolerate it — the rules engine
 // rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q, args := buildAlertQuery(f)
-	rows, err := p.queryRows(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, scanAlert)
-}
-
-// ListAlertsPrimary is ListAlerts served by the primary, whatever
-// REPLICA_DATABASE_URL says. It exists for readers that must see this
-// process's own writes — see PrimaryReader.
-func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q, args := buildAlertQuery(f)
-	rows, err := p.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, scanAlert)
-}
-
-// buildAlertQuery builds the ListAlerts statement and its arguments. Both
-// readers call it so the routed and primary-bound forms cannot drift into
-// returning different pages.
-func buildAlertQuery(f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -966,7 +941,7 @@ func buildAlertQuery(f AlertFilter) (string, []any) {
 func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var a Alert
 	var ledger int64
-	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled)
+	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID)
 	a.Ledger = uint32(ledger)
 	return a, err
 }
@@ -979,7 +954,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
@@ -1075,6 +1050,77 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, stat
 		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.Status, &d.ResponseSnippet, &d.AttemptedAt)
 		return d, err
 	})
+}
+
+// --- inhibitions ---
+
+func (p *Postgres) CreateInhibition(ctx context.Context, in *Inhibition) error {
+	if in.FiringWindowSeconds <= 0 {
+		in.FiringWindowSeconds = DefaultInhibitionWindowSeconds
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO alert_inhibitions (source_rule_id, target_rule_id, firing_window_seconds)
+		 VALUES ($1, $2, $3) RETURNING created_at`,
+		in.SourceRuleID, in.TargetRuleID, in.FiringWindowSeconds,
+	).Scan(&in.CreatedAt)
+}
+
+func (p *Postgres) scanInhibition(row pgx.CollectableRow) (Inhibition, error) {
+	var in Inhibition
+	err := row.Scan(&in.SourceRuleID, &in.TargetRuleID, &in.FiringWindowSeconds, &in.CreatedAt)
+	return in, err
+}
+
+func (p *Postgres) ListInhibitions(ctx context.Context) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions ORDER BY source_rule_id, target_rule_id`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions WHERE target_rule_id = $1 ORDER BY source_rule_id`, targetRuleID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) DeleteInhibition(ctx context.Context, sourceRuleID, targetRuleID int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM alert_inhibitions WHERE source_rule_id = $1 AND target_rule_id = $2`,
+		sourceRuleID, targetRuleID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error) {
+	// The cutoff is computed in Go so both backends share the decision;
+	// Postgres compares timestamptz, SQLite compares the fixed-format TEXT.
+	cutoff := time.Now().UTC().Truncate(time.Millisecond).Add(-window)
+	var fired bool
+	err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM alerts WHERE rule_id = $1 AND created_at >= $2)`,
+		ruleID, cutoff).Scan(&fired)
+	return fired, err
+}
+
+func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
+	// No row check: the alert may have been pruned between dispatch and
+	// this write, and that must not fail the dispatch path.
+	_, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET inhibited_by_rule_id = $1 WHERE id = $2`, sourceRuleID, alertID)
+	return err
 }
 
 // --- ingest state ---
@@ -1468,6 +1514,13 @@ func jsonOrEmpty(raw json.RawMessage) []byte {
 	return raw
 }
 
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return raw
+}
+
 // WithSuppressed annotates an alert payload with the number of matches the
 // rule's cooldown swallowed, so an operator sees the scale of what happened
 // instead of a silent gap. A payload that is not a JSON object is returned
@@ -1499,4 +1552,10 @@ func mapErr(err error) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
 	}
 	return err
+}
+
+// ListAlertsStream implements Store by paging ListAlerts with the keyset
+// cursor, so peak memory is one page rather than the whole result set.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
+	return streamAlerts(ctx, f, p.ListAlerts, fn)
 }
