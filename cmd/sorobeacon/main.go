@@ -18,11 +18,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
-	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/backfill"
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	sorogrpc "github.com/sorotrail/sorobeacon/internal/grpc"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
@@ -217,6 +218,10 @@ func run() error {
 		factory.WithSecrets(resolver)
 	}
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m).WithDigestQueue(st)
+	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
+	if err != nil {
+		return err
+	}
 	// One in-process fan-out carries newly created alerts to the SSE endpoint.
 	// The poller publishes into exactly the instance the API serves from, so
 	// /alerts/stream needs no database round-trip to show a live alert.
@@ -225,6 +230,7 @@ func run() error {
 	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
 		WithMetrics(m).
 		WithPublisher(liveAlerts).
+		WithEnricher(enricher).
 		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
