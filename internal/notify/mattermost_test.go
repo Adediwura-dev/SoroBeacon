@@ -169,7 +169,7 @@ func TestMattermostSendNetworkFailureRedactsURL(t *testing.T) {
 
 func TestDefaultFactoryRegistersNewChannels(t *testing.T) {
 	types := DefaultFactory().Types()
-	for _, name := range []string{TypeMattermost, TypeRocketChat} {
+	for _, name := range []string{TypeMattermost, TypeRocketChat, TypeZulip} {
 		assert.Contains(t, types, name)
 	}
 }
