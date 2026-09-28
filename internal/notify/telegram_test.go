@@ -78,11 +78,21 @@ func TestTelegram_Send(t *testing.T) {
 		{
 			name: "dropped connection",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				// Simulating a dropped connection by sending incorrect Content-Length
-				// which causes the client to get an unexpected EOF.
-				w.Header().Set("Content-Length", "100")
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"ok":true}`))
+				// Hijack and close without writing a response, so the client
+				// sees the connection go away mid-request. An over-long
+				// Content-Length would not do it: on a 2xx the sender only
+				// inspects the status code and never reads the body, so a
+				// truncated body is silently fine.
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatal("test server does not support hijacking")
+				}
+				conn, _, err := hj.Hijack()
+				if err != nil {
+					t.Errorf("hijack: %v", err)
+					return
+				}
+				_ = conn.Close()
 			},
 			wantErr: true,
 		},
