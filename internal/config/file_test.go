@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -78,7 +79,11 @@ func TestLoadFileErrorsOnMalformedYAML(t *testing.T) {
 	_, err := Load()
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "CONFIG_FILE")
-	assert.ErrorContains(t, err, path)
+	// The path is quoted with %q in the error, which escapes the separators
+	// on Windows ("C:\\dir\\broken.yaml"), so the raw path is not a substring
+	// there. Quote the expected value the same way and the assertion holds on
+	// every platform.
+	assert.ErrorContains(t, err, strconv.Quote(path))
 	assert.NotContains(t, err.Error(), "postgres://example/db")
 }
 

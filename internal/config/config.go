@@ -69,6 +69,11 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
+	// ReplicaDatabaseURL is a second Postgres connection string serving the
+	// read-only queries the store routes (REPLICA_DATABASE_URL). Empty means
+	// no replica: every read stays on DatabaseURL, which is how every
+	// deployment behaved before replica routing existed.
+	ReplicaDatabaseURL string
 	// ConfigEncryptionKey is the decoded AES-GCM key used to encrypt
 	// channels.config at rest (CONFIG_ENCRYPTION_KEY, base64). Nil means
 	// encryption is disabled and configs stay plaintext, preserving the
@@ -120,6 +125,10 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
+	AlertEnrichmentURL      string
+	AlertEnrichmentTimeout  time.Duration
+	AlertEnrichmentCacheTTL time.Duration
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
@@ -193,6 +202,11 @@ type OTLPConfig struct {
 	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
 	SampleRate float64
 }
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
 
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
@@ -375,6 +389,22 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
+
+	// Read-replica routing is Postgres-only and off unless asked for. Both
+	// failures below are startup errors rather than warnings: an operator who
+	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
+	// deployment that silently serves everything from the primary while
+	// claiming otherwise is worse than one that refuses to boot.
+	replicaURL := strings.TrimSpace(lookupConfigValue("REPLICA_DATABASE_URL", fileValues))
+	if sqliteBackend && replicaURL != "" {
+		return cfg, fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres")
+	}
+	if replicaURL != "" {
+		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+			return cfg, err
+		}
+	}
+	cfg.ReplicaDatabaseURL = replicaURL
 	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
 	if err != nil {
 		return cfg, err
@@ -394,6 +424,23 @@ func Load() (Config, error) {
 		}
 		cfg.AlertRetention = d
 	}
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
+	cfg.AlertEnrichmentTimeout = 2 * time.Second
+	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
+	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_TIMEOUT %q", v)
+		}
+		cfg.AlertEnrichmentTimeout = d
+	}
+	if v := lookupConfigValue("ALERT_ENRICHMENT_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_CACHE_TTL %q", v)
+		}
+		cfg.AlertEnrichmentCacheTTL = d
+	}
 	if v := lookupConfigValue("REORG_TRACKING_WINDOW", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
@@ -411,7 +458,7 @@ func Load() (Config, error) {
 	cfg.ArchiveURL = strings.TrimSpace(lookupConfigValue("ARCHIVE_URL", fileValues))
 
 	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
-	cfg.OTLP.Endpoint = os.Getenv("OTLP_ENDPOINT")
+	cfg.OTLP.Endpoint = lookupConfigValue("OTLP_ENDPOINT", fileValues)
 	if cfg.OTLP.Endpoint != "" {
 		u, err := url.Parse(cfg.OTLP.Endpoint)
 		if err != nil || !u.IsAbs() || u.Host == "" ||
@@ -422,37 +469,37 @@ func Load() (Config, error) {
 			)
 		}
 	}
-	cfg.OTLP.ServiceName = os.Getenv("OTLP_SERVICE_NAME")
+	cfg.OTLP.ServiceName = lookupConfigValue("OTLP_SERVICE_NAME", fileValues)
 	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
-	if v := os.Getenv("OTLP_SAMPLE_RATE"); v != "" {
+	if v := lookupConfigValue("OTLP_SAMPLE_RATE", fileValues); v != "" {
 		r, err := strconv.ParseFloat(v, 64)
 		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
 			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
 		}
 		cfg.OTLP.SampleRate = r
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitSlackRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitTelegramRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitPagerDutyRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_DEFAULT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
@@ -460,11 +507,46 @@ func Load() (Config, error) {
 		cfg.NotifyRateLimitDefaultRPS = rps
 	}
 
-	if err := loadSecrets(&cfg); err != nil {
+	if err := loadSecrets(&cfg, fileValues); err != nil {
 		return cfg, err
 	}
 
 	return cfg, nil
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+//
+// It takes fileValues so these settings resolve the same way as every other
+// one: environment first, config file as the fallback.
+func loadSecrets(cfg *Config, fileValues map[string]string) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
+	switch cfg.SecretsProvider {
+	case "", "env", "vault":
+	default:
+		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := lookupConfigValue("SECRETS_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
+	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
+	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
+	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	}
+	return nil
 }
 
 func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
@@ -531,6 +613,9 @@ const redacted = "[redacted]"
 func (c Config) LogAttrs() []slog.Attr {
 	return []slog.Attr{
 		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		// Redacted the same way: the replica URL carries its own credentials,
+		// and the redaction keeps only scheme, host and database name.
+		slog.String("replica_database_url", redactDatabaseURL(c.ReplicaDatabaseURL)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
@@ -696,6 +781,30 @@ func validateDatabaseURL(raw string) error {
 	default:
 		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
 	}
+}
+
+// validateReplicaDatabaseURL checks REPLICA_DATABASE_URL. The replica must be
+// a Postgres URL — there is no replica concept for SQLite, which
+// Load rejects before calling this — and it must not be the primary itself.
+// Pointing both at the same string is almost always a half-finished edit, and
+// it is worth failing on: it looks like routing is on in every log line and
+// every metric label, while every "replica" read lands on the primary. An
+// operator who genuinely wants one database behind two pools should say so
+// with two URLs.
+func validateReplicaDatabaseURL(replicaURL, primaryURL string) error {
+	u, err := url.Parse(replicaURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("REPLICA_DATABASE_URL is not a parseable URL (want a postgres connection string, e.g. postgres://user:pass@replica-host:5432/sorobeacon)")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fmt.Errorf("REPLICA_DATABASE_URL scheme %q is not supported: reads can only be routed to a Postgres replica", u.Scheme)
+	}
+	if replicaURL == primaryURL {
+		return fmt.Errorf("REPLICA_DATABASE_URL is identical to DATABASE_URL; unset it to read from the primary, or point it at the replica")
+	}
+	return nil
 }
 
 // isSQLiteURL reports whether raw selects the SQLite backend. It is a

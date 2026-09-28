@@ -41,6 +41,11 @@ type Metrics struct {
 	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
+	breakerStates  *prometheus.GaugeVec
+
+	storeReads     *prometheus.CounterVec
+	storeFallbacks prometheus.Counter
+	replicaEnabled prometheus.Gauge
 }
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
@@ -110,6 +115,11 @@ func New() *Metrics {
 			Help: "Throttled alert delivery attempts, by channel type.",
 		}, []string{"channel"}),
 
+		breakerStates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_breaker_state",
+			Help: "Circuit breaker state for each channel (0=closed, 1=half-open, 2=open).",
+		}, []string{"channel_id", "channel_type", "state"}),
+
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
 			Help:    "HTTP request duration by route pattern, method and status.",
@@ -120,11 +130,31 @@ func New() *Metrics {
 			Name: "sorobeacon_seconds_since_last_poll",
 			Help: "Seconds since the poller last completed a cycle. Grows without bound when polling has stopped.",
 		}),
+
+		// Where read-only queries actually went. The pool label is the closed
+		// set {primary, replica}, so cardinality is bounded; watching the ratio
+		// is how an operator confirms replica routing is doing anything, and
+		// the fallback counter is how they see it stop.
+		storeReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_store_reads_total",
+			Help: "Read-only store queries by the pool that served them.",
+		}, []string{"pool"}),
+
+		storeFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_store_replica_fallbacks_total",
+			Help: "Read-only queries that were served by the primary because the replica was unavailable.",
+		}),
+
+		replicaEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_enabled",
+			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
-		m.reorgsTotal, m.lastReorgLedger)
+		m.reorgsTotal, m.lastReorgLedger, m.breakerStates,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled)
 	return m
 }
 
@@ -249,12 +279,60 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
 }
 
+// RecordStoreRead counts one read-only store query and which pool answered it.
+// pool is "primary" or "replica" — a static set chosen by the store, never
+// request-derived, so cardinality stays bounded.
+func (m *Metrics) RecordStoreRead(pool string) {
+	if m == nil {
+		return
+	}
+	m.storeReads.WithLabelValues(pool).Inc()
+}
+
+// RecordReplicaFallback counts one read that was routed to the replica but had
+// to be replayed on the primary. A steady rate here means the replica is
+// unreachable or lagging past its timeout and the routing is buying nothing.
+func (m *Metrics) RecordReplicaFallback() {
+	if m == nil {
+		return
+	}
+	m.storeFallbacks.Inc()
+}
+
+// SetReplicaEnabled records whether a read replica is configured. It is a
+// gauge, not a constant, because routing can be turned off at runtime without
+// a restart by the store itself.
+func (m *Metrics) SetReplicaEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	if enabled {
+		m.replicaEnabled.Set(1)
+		return
+	}
+	m.replicaEnabled.Set(0)
+}
+
 // RecordThrottle counts one throttled delivery per channel type.
 func (m *Metrics) RecordThrottle(channelType string) {
 	if m == nil {
 		return
 	}
 	m.throttles.WithLabelValues(channelType).Inc()
+}
+
+// SetBreakerState sets the gauge value for a channel's circuit breaker state.
+func (m *Metrics) SetBreakerState(channelID string, channelType string, state string) {
+	if m == nil {
+		return
+	}
+	for _, s := range []string{"closed", "open", "half-open"} {
+		val := float64(0)
+		if s == state {
+			val = 1
+		}
+		m.breakerStates.WithLabelValues(channelID, channelType, s).Set(val)
+	}
 }
 
 // statusRecorder captures the status code a handler wrote, for the HTTP
