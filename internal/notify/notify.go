@@ -32,6 +32,7 @@ type Alert struct {
 	Ledger      uint32          `json:"ledger"`
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
+	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 	// Severity is the alert severity (info, warning, critical). Empty means
 	// warning for backwards compatibility.
@@ -41,16 +42,13 @@ type Alert struct {
 	// verbatim, so every text channel sends the same summary without
 	// needing a digest-specific method.
 	Digest string `json:"digest,omitempty"`
-	// GroupCount is the number of alerts in the current grouping
-	// window. It is > 1 for suppressed alerts that are part of a
-	// group and not delivered individually. Zero means grouping is
-	// disabled or not applicable.
-	GroupCount int64 `json:"group_count,omitempty"`
-	// WindowStart and WindowEnd bound the grouping window. They are
-	// set when grouping is enabled so the delivered message can show
-	// the window bounds and total count.
+	// GroupCount is the number of alerts in the current digest window.
+	// Used by the default digest template.
+	GroupCount int `json:"group_count,omitempty"`
+	// WindowStart is the start of the digest window.
 	WindowStart time.Time `json:"window_start,omitempty"`
-	WindowEnd   time.Time `json:"window_end,omitempty"`
+	// WindowEnd is the end of the digest window.
+	WindowEnd time.Time `json:"window_end,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -74,17 +72,26 @@ type Factory struct {
 
 // Channel type names understood by DefaultFactory.
 const (
-	TypeDiscord   = "discord"
-	TypeSlack     = "slack"
-	TypeTelegram  = "telegram"
-	TypeEmail     = "email"
-	TypeWebhook   = "webhook"
-	TypeMatrix    = "matrix"
-	TypePagerDuty = "pagerduty"
-	TypeTwilio    = "twilio"
-	TypeSignal    = "signal"
-	TypeWebex     = "webex"
-	TypeDingTalk  = "dingtalk"
+	TypeDiscord    = "discord"
+	TypeSlack      = "slack"
+	TypeTelegram   = "telegram"
+	TypeEmail      = "email"
+	TypeWebhook    = "webhook"
+	TypeMatrix     = "matrix"
+	TypePagerDuty  = "pagerduty"
+	TypeTwilio     = "twilio"
+	TypeSignal     = "signal"
+	TypeWebex      = "webex"
+	TypeLark       = "lark"
+	TypeDingTalk   = "dingtalk"
+	TypeMattermost = "mattermost"
+	TypeRocketChat = "rocketchat"
+	TypeZulip      = "zulip"
+	TypePushover   = "pushover"
+	TypeGoogleChat = "googlechat"
+	TypeOpsgenie   = "opsgenie"
+	TypeGotify     = "gotify"
+	TypeSNS        = "sns"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -101,7 +108,16 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	f.Register(TypeDingTalk, NewDingTalk)
+	f.Register(TypeMattermost, NewMattermost)
+	f.Register(TypeRocketChat, NewRocketChat)
+	f.Register(TypeZulip, NewZulip)
+	f.Register(TypePushover, NewPushover)
+	f.Register(TypeGoogleChat, NewGoogleChat)
+	f.Register(TypeOpsgenie, NewOpsgenie)
+	f.Register(TypeGotify, NewGotify)
+	f.Register(TypeSNS, NewSNS)
 	return f
 }
 

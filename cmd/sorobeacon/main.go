@@ -18,12 +18,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/api/graphql"
 	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
-	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/backfill"
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	sorogrpc "github.com/sorotrail/sorobeacon/internal/grpc"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
@@ -153,11 +154,18 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
+	// Metrics are built before the store now, because the store labels every
+	// routed read with the pool that served it. Nothing else about the order
+	// changes: m is still the same instance the poller, the dispatcher and the
+	// HTTP middleware use below.
+	m := metrics.New()
 	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
+		ReplicaURL:      cfg.ReplicaDatabaseURL,
+		Metrics:         m,
 	}, configCipher)
 	if err != nil {
 		return err
@@ -173,6 +181,12 @@ func run() error {
 	}
 	defer st.Close()
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
+	if cfg.ReplicaDatabaseURL != "" {
+		// The URL itself stays out of the line: it carries credentials. The
+		// host is the part an operator checks, and LogAttrs already printed it
+		// redacted at startup.
+		log.Info("read replica enabled", "routed_reads", "monitors list, alert search, stats, alert counts by day")
+	}
 
 	// Postgres partitions alerts by month. Make sure the months just ahead
 	// exist before the poller can write into them, so a row never has to fall
@@ -193,14 +207,24 @@ func run() error {
 	}
 	logStartupHealth(ctx, log, health)
 
-	m := metrics.New()
 	registry := rules.NewRegistry()
 	// The frequency rule keeps a rolling window per rule in memory. Rebuild it
 	// from the alerts already stored so a restart does not forget that the rule
 	// fired and alert again for the same episode.
+	//
+	// This read has to see alerts this process wrote moments ago, so it
+	// bypasses replica routing when the store offers a primary-bound reader:
+	// a window rebuilt from a replica that is even slightly behind is missing
+	// its most recent matches, and the rule would re-fire for an episode it
+	// has already alerted on. SQLite does not route reads, so it does not
+	// implement PrimaryReader and its ListAlerts is already the primary.
+	rebuildAlerts := st.ListAlerts
+	if pr, ok := st.(store.PrimaryReader); ok {
+		rebuildAlerts = pr.ListAlertsPrimary
+	}
 	registry.Register(rules.TypeFrequencyThreshold, rules.NewFrequencyThreshold().WithMatchLog(
 		rules.MatchLogFunc(func(ctx context.Context, ruleID int64, since time.Time) ([]rules.MatchRecord, error) {
-			alerts, err := st.ListAlerts(ctx, store.AlertFilter{RuleID: ruleID, From: since, Sort: "created_at_asc", Limit: 1000})
+			alerts, err := rebuildAlerts(ctx, store.AlertFilter{RuleID: ruleID, From: since, Sort: "created_at_asc", Limit: 1000})
 			if err != nil {
 				return nil, err
 			}
@@ -218,6 +242,10 @@ func run() error {
 		factory.WithSecrets(resolver)
 	}
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m).WithDigestQueue(st)
+	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
+	if err != nil {
+		return err
+	}
 	// One in-process fan-out carries newly created alerts to the SSE endpoint.
 	// The poller publishes into exactly the instance the API serves from, so
 	// /alerts/stream needs no database round-trip to show a live alert.
@@ -226,6 +254,7 @@ func run() error {
 	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
 		WithMetrics(m).
 		WithPublisher(liveAlerts).
+		WithEnricher(enricher).
 		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.

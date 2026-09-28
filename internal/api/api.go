@@ -209,6 +209,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/readyz", s.readyz)
 	r.Get("/poller", s.pollerStatus)
 	r.Get("/version", s.version)
+	r.Get("/rule-types", s.listRuleTypes)
 	r.Get("/stats", s.stats)
 	r.Get("/stats/alerts-daily", s.alertsDaily)
 	r.Get("/audit", s.listAudit)
