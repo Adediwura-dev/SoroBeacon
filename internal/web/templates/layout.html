@@ -84,6 +84,10 @@
     button { cursor: pointer; padding: .3rem .8rem; background: var(--bg); color: var(--fg);
              border: 1px solid var(--line); }
     .muted { opacity: .65; font-size: .9rem; }
+    /* A filter the page could not apply, said loudly enough that an empty
+       table underneath it is not read as an empty database. */
+    .note { border: 1px solid var(--line); border-left: 3px solid #854d0e;
+            border-radius: .3rem; padding: .6rem .9rem; margin: 1rem 0; max-width: 48rem; }
     .empty { border: 1px dashed color-mix(in srgb, currentColor 30%, transparent);
              border-radius: .5rem; padding: 1.25rem 1.5rem; margin: 1rem 0; max-width: 40rem; }
     .empty h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
