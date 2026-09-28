@@ -25,6 +25,7 @@ const (
 	TypeContractAllowlist  = "contract_allowlist"
 	TypeEventNameGlob      = "event_name_glob"
 	TypeNumericRange       = "numeric_range"
+	TypeTokenSupplyChange  = "token_supply_change"
 	TypeFrequencyThreshold = "frequency_threshold"
 	TypeTopicRegex         = "topic_regex"
 	TypeAddressWatchlist   = "address_watchlist"
@@ -108,6 +109,7 @@ func NewRegistry() *Registry {
 	r.Register(TypeContractAllowlist, &ContractAllowlist{})
 	r.Register(TypeEventNameGlob, EventNameGlob{})
 	r.Register(TypeNumericRange, NumericRange{})
+	r.Register(TypeTokenSupplyChange, TokenSupplyChange{})
 	r.Register(TypeTokenEvent, TokenEvent{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
 	r.Register(TypeTopicRegex, &TopicRegex{})
