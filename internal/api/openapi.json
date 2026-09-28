@@ -1437,7 +1437,11 @@
             "enum": ["discord", "slack", "telegram", "email", "webhook"]
           },
           "config": { "type": "object" },
-          "enabled": { "type": "boolean" }
+          "enabled": { "type": "boolean" },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
+          }
         }
       },
       "ChannelInput": {
@@ -1465,6 +1469,10 @@
             "format": "int64",
             "minimum": 0,
             "description": "Accumulation window when digest_mode is window; must be > 0 then"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
           }
         }
       },

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -153,6 +155,18 @@ type Rule struct {
 	Severity Severity `json:"severity"`
 }
 
+// DefaultChannelTimeout is the timeout applied to channels when unset (15s),
+// matching the previous package-level HTTP client timeout.
+const DefaultChannelTimeout = 15 * time.Second
+
+// MinChannelTimeout bounds how short a channel timeout can be: anything less
+// is practically guaranteed to fail spuriously over real networks.
+const MinChannelTimeout = 1 * time.Second
+
+// MaxChannelTimeout is the ceiling on a channel's HTTP timeout: an operator
+// setting a ten-minute timeout will wedge delivery workers.
+const MaxChannelTimeout = 60 * time.Second
+
 // Channel is a configured notification destination. Config holds
 // channel-specific settings including secrets (webhook URLs, bot tokens,
 // SMTP credentials) — never log it and never return it from the API.
@@ -177,8 +191,98 @@ type Channel struct {
 	// Empty means no filter (receive all severities), so channels created
 	// before the field existed keep today's behaviour. It is validated at
 	// the API boundary.
-	MinSeverity Severity  `json:"min_severity"`
-	CreatedAt   time.Time `json:"created_at"`
+	MinSeverity Severity      `json:"min_severity"`
+	CreatedAt   time.Time     `json:"created_at"`
+	Timeout     time.Duration `json:"timeout"`
+}
+
+// TimeoutDuration returns the channel's timeout, falling back to
+// DefaultChannelTimeout when zero or negative.
+func (c Channel) TimeoutDuration() time.Duration {
+	if c.Timeout <= 0 {
+		return DefaultChannelTimeout
+	}
+	return c.Timeout
+}
+
+// TimeoutSeconds returns the channel's timeout as an integer number of seconds.
+func (c Channel) TimeoutSeconds() int {
+	return int(c.TimeoutDuration() / time.Second)
+}
+
+// MarshalJSON serializes the channel, outputting Timeout as integer seconds
+// rather than time.Duration's default nanosecond integer.
+func (c Channel) MarshalJSON() ([]byte, error) {
+	type Alias Channel
+	return json.Marshal(&struct {
+		Alias
+		Timeout int `json:"timeout"`
+	}{
+		Alias:   Alias(c),
+		Timeout: c.TimeoutSeconds(),
+	})
+}
+
+// UnmarshalJSON deserializes a channel, parsing Timeout from integer seconds
+// or a Go duration string.
+func (c *Channel) UnmarshalJSON(data []byte) error {
+	type Alias Channel
+	var aux struct {
+		Alias
+		Timeout *json.RawMessage `json:"timeout"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*c = Channel(aux.Alias)
+	if aux.Timeout != nil && len(*aux.Timeout) > 0 && string(*aux.Timeout) != "null" {
+		d, err := ParseTimeout(*aux.Timeout)
+		if err != nil {
+			return err
+		}
+		c.Timeout = d
+	}
+	return nil
+}
+
+// ParseTimeout parses and bounds a channel timeout value. It accepts integer
+// seconds (e.g. 15) or a Go duration string (e.g. "15s"). Values outside
+// [MinChannelTimeout, MaxChannelTimeout] are rejected.
+func ParseTimeout(raw []byte) (time.Duration, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return DefaultChannelTimeout, nil
+	}
+	// Try parsing as integer number of seconds first (e.g. 15).
+	var sec int
+	if err := json.Unmarshal(raw, &sec); err == nil {
+		d := time.Duration(sec) * time.Second
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	// Try parsing as a string (e.g. "15s", "30s", "1m", or "15").
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return DefaultChannelTimeout, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			if sec, errAtoi := strconv.Atoi(s); errAtoi == nil {
+				d = time.Duration(sec) * time.Second
+			} else {
+				return 0, fmt.Errorf("invalid duration %q (want a Go duration such as \"15s\" or integer seconds)", s)
+			}
+		}
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	return 0, fmt.Errorf("must be integer seconds or duration string such as \"15s\"")
 }
 
 // Alert records one rule match on one event. EventID is the source event's
