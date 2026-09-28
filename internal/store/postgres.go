@@ -935,6 +935,16 @@ func buildAlertQuery(f AlertFilter) (string, []any) {
 	if f.ContractID != "" {
 		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
 	}
+	if pattern := AlertSearchPattern(f.Query); pattern != "" {
+		// One bound pattern, both columns. The payload is cast to text so the
+		// search reaches contract_id, event_name and every other field a rule
+		// type stores without the store knowing each type's shape — the cost
+		// of that generality is that it cannot use an index, which is why the
+		// term is capped (MaxAlertSearchLen) rather than long by default.
+		// ESCAPE makes the pattern's own wildcards literal.
+		p := arg(pattern)
+		q += ` AND (event_id ILIKE ` + p + ` ESCAPE '\' OR payload::text ILIKE ` + p + ` ESCAPE '\')`
+	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ` + arg(f.From)
 	}
@@ -1374,6 +1384,64 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 		out = append(out, AlertDayCount{Day: day.UTC().Format("2006-01-02"), Count: count})
 	}
 	return out, rows.Err()
+}
+
+// GetMonitorStats reports one monitor's alert, delivery and per-rule counts.
+// Two statements, whatever the monitor's rule count: the aggregate row and one
+// grouped per-rule count. Routable reads for the same reason as GetStats —
+// every number here is a count over history that only ever grows, and nothing
+// is written back from them.
+//
+// The existence probe rides along in the aggregate rather than being a third
+// query, so a monitor deleted a moment ago reports ErrNotFound instead of a
+// page of zeroes that looks like a healthy but quiet monitor.
+func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
+	var (
+		ms     MonitorStats
+		exists bool
+	)
+	ms.MonitorID = monitorID
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
+			&ms.LastAlertAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
+	}, `
+		SELECT
+			(SELECT count(*) FROM monitors WHERE id = $1) > 0,
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '7 days'),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $2),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $3)`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed)
+	if err != nil {
+		return ms, err
+	}
+	if !exists {
+		return ms, ErrNotFound
+	}
+
+	rows, err := p.queryRows(ctx, `
+		SELECT r.id, r.type, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id
+		WHERE r.monitor_id = $1
+		GROUP BY r.id, r.type
+		ORDER BY r.id`, monitorID)
+	if err != nil {
+		return ms, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Type, &rc.Alerts); err != nil {
+			return ms, err
+		}
+		ms.Rules = append(ms.Rules, rc)
+	}
+	return ms, rows.Err()
 }
 
 // --- helpers ---
