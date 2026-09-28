@@ -22,6 +22,7 @@ import (
 const (
 	TypeEventEmitted       = "event_emitted"
 	TypeValueThreshold     = "value_threshold"
+	TypeEventNameGlob      = "event_name_glob"
 	TypeNumericRange       = "numeric_range"
 	TypeFrequencyThreshold = "frequency_threshold"
 	TypeTopicRegex         = "topic_regex"
@@ -103,6 +104,7 @@ func NewRegistry() *Registry {
 	r := &Registry{evaluators: map[string]RuleEvaluator{}}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
+	r.Register(TypeEventNameGlob, EventNameGlob{})
 	r.Register(TypeNumericRange, NumericRange{})
 	r.Register(TypeTokenEvent, TokenEvent{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
