@@ -88,6 +88,9 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 func (EventNameGlob) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "patterns", Type: "object", Required: true, Description: "Glob patterns matched against the whole event name (JSON array, e.g. [\"swap_*\"])"},
+	}
+}
+
 func (NumericRange) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "min", Type: "string", Description: "Inclusive lower bound (decimal integer string); at least one of min/max required"},
