@@ -216,6 +216,66 @@
         "alertRetention": {
           "type": "string",
           "description": "How long to keep alerts, e.g. 90d or 24h. Empty keeps history forever."
+        },
+        "rpcUrls": {
+          "type": "string",
+          "description": "Comma-separated RPC endpoints to fail over between. Empty uses rpcUrl alone."
+        },
+        "grpcAddr": {
+          "type": "string",
+          "description": "gRPC listen address, e.g. :9090. Empty disables the gRPC server."
+        },
+        "reorgTrackingWindow": {
+          "type": "string",
+          "description": "Recent ledgers tracked for reorg detection. Empty uses the application default."
+        },
+        "reorgConfirmationDepth": {
+          "type": "string",
+          "description": "Ledgers of burial before a ledger is final. Empty uses the application default."
+        },
+        "alertEnrichmentUrl": {
+          "type": "string",
+          "description": "HTTP endpoint called to enrich an alert before delivery. Empty disables enrichment."
+        },
+        "alertEnrichmentTimeout": {
+          "type": "string",
+          "description": "Per-call timeout for enrichment (Go duration). Empty uses the application default."
+        },
+        "alertEnrichmentCacheTtl": {
+          "type": "string",
+          "description": "How long an enrichment response is cached. Empty uses the application default."
+        },
+        "archiveUrl": {
+          "type": "string",
+          "description": "Where pruned alerts are archived: a path, file://, dir:// or s3://. Empty disables archiving."
+        },
+        "notifyRateLimitDefaultRps": {
+          "type": "string",
+          "description": "Default per-channel delivery rate, requests per second. Empty uses the application default."
+        },
+        "notifyRateLimitSlackRps": {
+          "type": "string",
+          "description": "Slack delivery rate override. Empty uses the default."
+        },
+        "notifyRateLimitTelegramRps": {
+          "type": "string",
+          "description": "Telegram delivery rate override. Empty uses the default."
+        },
+        "notifyRateLimitPagerdutyRps": {
+          "type": "string",
+          "description": "PagerDuty delivery rate override. Empty uses the default."
+        },
+        "otlpEndpoint": {
+          "type": "string",
+          "description": "OpenTelemetry collector endpoint. Empty disables tracing."
+        },
+        "otlpServiceName": {
+          "type": "string",
+          "description": "service.name reported to the collector."
+        },
+        "otlpSampleRate": {
+          "type": "string",
+          "description": "Trace sample rate, 0..1. Empty uses the application default."
         }
       },
       "additionalProperties": false
@@ -264,6 +324,10 @@
         "maxConnIdleTime": {
           "type": "string",
           "description": "pgx pool MaxConnIdleTime (Go duration). Empty uses the driver default."
+        },
+        "replicaUrl": {
+          "type": "string",
+          "description": "Read-only replica connection string. Empty sends every read to the primary."
         }
       },
       "additionalProperties": false
@@ -292,6 +356,34 @@
           "type": "string",
           "minLength": 1,
           "description": "Key within the existing Secret that holds CONFIG_ENCRYPTION_KEY."
+        }
+      },
+      "additionalProperties": false
+    },
+    "secrets": {
+      "type": "object",
+      "description": "Where channel credentials are resolved from at delivery time.",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["", "env", "vault"],
+          "description": "env (default) reads the encrypted database column; vault fetches from HashiCorp Vault."
+        },
+        "cacheTtl": {
+          "type": "string",
+          "description": "How long a resolved secret is cached. Empty uses the application default."
+        },
+        "vaultAddr": {
+          "type": "string",
+          "description": "Vault address. Only used when provider is vault."
+        },
+        "vaultNamespace": {
+          "type": "string",
+          "description": "Vault namespace. Only used when provider is vault."
+        },
+        "vaultToken": {
+          "type": "string",
+          "description": "VAULT_TOKEN. A credential, so it is stored in the auth Secret, never the ConfigMap."
         }
       },
       "additionalProperties": false

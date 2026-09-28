@@ -70,6 +70,20 @@ spec:
                   name: {{ include "sorobeacon.authSecretName" . }}
                   key: {{ include "sorobeacon.authConfigEncryptionKeyKey" . }}
             {{- end }}
+            {{- if .Values.database.replicaUrl }}
+            - name: REPLICA_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.databaseSecretName" . }}
+                  key: REPLICA_DATABASE_URL
+            {{- end }}
+            {{- if .Values.secrets.vaultToken }}
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: VAULT_TOKEN
+            {{- end }}
           # Startup probe: /api/v1/livez only answers once the process has
           # applied its migrations and bound the listener, so this both proves
           # the schema is current and stops the liveness probe from restarting

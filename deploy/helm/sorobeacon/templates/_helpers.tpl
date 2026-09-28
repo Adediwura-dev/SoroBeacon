@@ -119,4 +119,23 @@ DATABASE_MAX_CONNS: {{ .Values.database.maxConns | int64 | quote }}
 DATABASE_MIN_CONNS: {{ .Values.database.minConns | int64 | quote }}
 DATABASE_MAX_CONN_LIFETIME: {{ .Values.database.maxConnLifetime | quote }}
 DATABASE_MAX_CONN_IDLE_TIME: {{ .Values.database.maxConnIdleTime | quote }}
+RPC_URLS: {{ .Values.config.rpcUrls | quote }}
+GRPC_ADDR: {{ .Values.config.grpcAddr | quote }}
+REORG_TRACKING_WINDOW: {{ .Values.config.reorgTrackingWindow | quote }}
+REORG_CONFIRMATION_DEPTH: {{ .Values.config.reorgConfirmationDepth | quote }}
+ALERT_ENRICHMENT_URL: {{ .Values.config.alertEnrichmentUrl | quote }}
+ALERT_ENRICHMENT_TIMEOUT: {{ .Values.config.alertEnrichmentTimeout | quote }}
+ALERT_ENRICHMENT_CACHE_TTL: {{ .Values.config.alertEnrichmentCacheTtl | quote }}
+ARCHIVE_URL: {{ .Values.config.archiveUrl | quote }}
+NOTIFY_RATE_LIMIT_DEFAULT_RPS: {{ .Values.config.notifyRateLimitDefaultRps | quote }}
+NOTIFY_RATE_LIMIT_SLACK_RPS: {{ .Values.config.notifyRateLimitSlackRps | quote }}
+NOTIFY_RATE_LIMIT_TELEGRAM_RPS: {{ .Values.config.notifyRateLimitTelegramRps | quote }}
+NOTIFY_RATE_LIMIT_PAGERDUTY_RPS: {{ .Values.config.notifyRateLimitPagerdutyRps | quote }}
+OTLP_ENDPOINT: {{ .Values.config.otlpEndpoint | quote }}
+OTLP_SERVICE_NAME: {{ .Values.config.otlpServiceName | quote }}
+OTLP_SAMPLE_RATE: {{ .Values.config.otlpSampleRate | quote }}
+SECRETS_PROVIDER: {{ .Values.secrets.provider | quote }}
+SECRETS_CACHE_TTL: {{ .Values.secrets.cacheTtl | quote }}
+VAULT_ADDR: {{ .Values.secrets.vaultAddr | quote }}
+VAULT_NAMESPACE: {{ .Values.secrets.vaultNamespace | quote }}
 {{- end }}
