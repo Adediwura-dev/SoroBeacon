@@ -973,6 +973,8 @@ func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	return a, err
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
 // ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
 // with the same ordering DeleteExpiredAlerts uses so the row an archiver reads
 // is the row the delete removes.
