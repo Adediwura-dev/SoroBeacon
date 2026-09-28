@@ -92,6 +92,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default               | Max idle time (`0` = driver default)         |
+| `REPLICA_DATABASE_URL` | _(unset — reads go to the primary)_ | Postgres URL of a read replica for the dashboard's list, search, stats and chart queries; must differ from `DATABASE_URL` and is rejected with a `sqlite` URL |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address (`host:port`) |
 | `HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB)                 | Max API write-body size; GET is unaffected   |
@@ -362,16 +363,22 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Nine channel types ship with the MVP. `config` is validated on create/update
+Thirteen channel types ship with the MVP. `config` is validated on create/update
 and never returned in responses. Each has a page under
 [docs/channels/](docs/channels/):
 [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md),
 [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md),
 [PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md),
 [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md),
+[DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md),
+[Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md),
+[AWS SNS](docs/channels/sns.md) and the
 [Lark](docs/channels/lark.md) and the [generic webhook](docs/channels/webhook.md).
 [DingTalk](docs/channels/dingtalk.md) and the
 [generic webhook](docs/channels/webhook.md).
+For self-hosted chat and phone push there are also
+[Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
+[Zulip](docs/channels/zulip.md) and [Pushover](docs/channels/pushover.md).
 
 ```sh
 # Discord
@@ -392,6 +399,10 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # Signal:   {"api_url": "http://signal-cli:8080", "number": "+15551234567", "recipients": ["+15559876543"]}
 # Lark:     {"webhook_url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxx", "secret": "optional"}
 # DingTalk: {"webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=...", "secret": "SEC..."}
+# Google Chat: {"webhook_url": "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=...&token=..."}
+# Opsgenie: {"api_key": "geniekey-...", "region": "us", "priority": "P3"}
+# Gotify:   {"server_url": "https://gotify.example.com", "token": "app-token", "priority": 5}
+# AWS SNS:  {"topic_arn": "arn:aws:sns:us-east-1:123456789012:sorobeacon", "region": "us-east-1"}
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -575,5 +586,6 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 ## License
 ### Notification Channels
 
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), and generic [Webhooks](docs/channels/webhook.md).
 Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [Lark](docs/channels/lark.md), and generic [Webhooks](docs/channels/webhook.md).
 Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), and generic [Webhooks](docs/channels/webhook.md).
