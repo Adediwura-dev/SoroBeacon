@@ -99,6 +99,7 @@ Whole numbers go through int64: Helm parses YAML integers as floats, so a plain
 `quote` would render 1048576 as "1.048576e+06" and the app would reject it.
 */}}
 {{- define "sorobeacon.configData" -}}
+CONFIG_FILE: {{ .Values.config.configFile | quote }}
 NETWORK: {{ .Values.config.network | quote }}
 RPC_URL: {{ .Values.config.rpcUrl | quote }}
 NETWORK_PASSPHRASE: {{ .Values.config.networkPassphrase | quote }}
