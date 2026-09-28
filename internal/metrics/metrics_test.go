@@ -1,7 +1,10 @@
 package metrics
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -16,10 +19,170 @@ const (
 	poolNamePrimary = "primary"
 	poolNameReplica = "replica"
 
-	storeReadsName     = "sorobeacon_store_reads_total"
-	storeFallbacksName = "sorobeacon_store_replica_fallbacks_total"
-	replicaEnabledName = "sorobeacon_store_replica_enabled"
+	storeReadsName        = "sorobeacon_store_reads_total"
+	storeFallbacksName    = "sorobeacon_store_replica_fallbacks_total"
+	replicaEnabledName    = "sorobeacon_store_replica_enabled"
+	pollsName             = "sorobeacon_polls_total"
+	pollDurationName      = "sorobeacon_poll_duration_seconds"
+	pollLagName           = "sorobeacon_poll_lag_ledgers"
+	pollAgeName           = "sorobeacon_seconds_since_last_poll"
+	eventsScannedName     = "sorobeacon_events_scanned_total"
+	eventsMatchedName     = "sorobeacon_events_matched_total"
+	alertsFiredName       = "sorobeacon_alerts_fired_total"
+	deliveriesName        = "sorobeacon_alert_deliveries_total"
+	priorityContractsName = "sorobeacon_poll_priority_contracts"
+	priorityLagName       = "sorobeacon_poll_lag_ledgers_by_priority"
+	reorgsName            = "sorobeacon_reorgs_total"
+	lastReorgLedgerName   = "sorobeacon_last_reorg_ledger"
+	throttlesName         = "sorobeacon_alert_throttles_total"
+	breakerStateName      = "sorobeacon_channel_breaker_state"
+	httpDurationName      = "sorobeacon_http_request_duration_seconds"
+	streamDroppedName     = "sorobeacon_alerts_stream_dropped_total"
 )
+
+func TestRecordPollTracksOutcomesAndDuration(t *testing.T) {
+	m := New()
+	m.TickPollAge(10)
+
+	m.RecordPoll(true, 1250*time.Millisecond)
+	m.RecordPoll(false, 2*time.Second)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, pollsName, map[string]string{"outcome": "ok"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, pollsName, map[string]string{"outcome": "error"}))
+	histogram := m.sampleHistogram(t, pollDurationName, nil)
+	assert.Equal(t, uint64(2), histogram.GetSampleCount())
+	assert.InDelta(t, 3.25, histogram.GetSampleSum(), 0.000001)
+	assert.Equal(t, float64(0), m.sampleValue(t, pollAgeName, nil))
+}
+
+func TestSetPollLagRecordsGauge(t *testing.T) {
+	m := New()
+
+	m.SetPollLag(17)
+
+	assert.Equal(t, float64(17), m.sampleValue(t, pollLagName, nil))
+}
+
+func TestTickPollAgeRecordsGauge(t *testing.T) {
+	m := New()
+
+	m.TickPollAge(4.5)
+
+	assert.Equal(t, float64(4.5), m.sampleValue(t, pollAgeName, nil))
+}
+
+func TestRecordEventsCountsScannedAndMatched(t *testing.T) {
+	m := New()
+
+	m.RecordEvents(9, 3)
+
+	assert.Equal(t, float64(9), m.sampleValue(t, eventsScannedName, nil))
+	assert.Equal(t, float64(3), m.sampleValue(t, eventsMatchedName, nil))
+}
+
+func TestRecordAlertCountsAlerts(t *testing.T) {
+	m := New()
+
+	m.RecordAlert()
+	m.RecordAlert()
+
+	assert.Equal(t, float64(2), m.sampleValue(t, alertsFiredName, nil))
+}
+
+func TestRecordDeliveryLabelsByChannelType(t *testing.T) {
+	m := New()
+
+	m.RecordDelivery("slack", true)
+	m.RecordDelivery("slack", true)
+	m.RecordDelivery("email", false)
+
+	assert.Equal(t, float64(2), m.sampleValue(t, deliveriesName, map[string]string{"channel": "slack", "outcome": "ok"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, deliveriesName, map[string]string{"channel": "email", "outcome": "error"}))
+}
+
+func TestHandlerServesMetrics(t *testing.T) {
+	m := New()
+	m.RecordAlert()
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+
+	m.Handler().ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), alertsFiredName)
+}
+
+func TestPriorityRecorders(t *testing.T) {
+	m := New()
+
+	m.SetPriorityContracts("high", 7)
+	m.SetPollLagByPriority("normal", -5)
+	m.SetPollLagByPriority("normal", 3)
+
+	assert.Equal(t, float64(7), m.sampleValue(t, priorityContractsName, map[string]string{"priority": "high"}))
+	assert.Equal(t, float64(3), m.sampleValue(t, priorityLagName, map[string]string{"priority": "normal"}))
+}
+
+func TestRecordReorg(t *testing.T) {
+	m := New()
+
+	m.RecordReorg(321)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, reorgsName, nil))
+	assert.Equal(t, float64(321), m.sampleValue(t, lastReorgLedgerName, nil))
+}
+
+func TestRecordThrottleLabelsByChannelType(t *testing.T) {
+	m := New()
+
+	m.RecordThrottle("slack")
+	m.RecordThrottle("slack")
+	m.RecordThrottle("email")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, throttlesName, map[string]string{"channel": "slack"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, throttlesName, map[string]string{"channel": "email"}))
+}
+
+func TestSetBreakerState(t *testing.T) {
+	m := New()
+
+	m.SetBreakerState("channel-1", "slack", "open")
+
+	labels := map[string]string{"channel_id": "channel-1", "channel_type": "slack", "state": "open"}
+	assert.Equal(t, float64(1), m.sampleValue(t, breakerStateName, labels))
+	labels["state"] = "closed"
+	assert.Equal(t, float64(0), m.sampleValue(t, breakerStateName, labels))
+	labels["state"] = "half-open"
+	assert.Equal(t, float64(0), m.sampleValue(t, breakerStateName, labels))
+}
+
+func TestRegisterStreamDropped(t *testing.T) {
+	m := New()
+	m.RegisterStreamDropped(func() uint64 { return 4 })
+	m.RegisterStreamDropped(nil)
+
+	assert.Equal(t, float64(4), m.sampleValue(t, streamDroppedName, nil))
+}
+
+func TestMiddlewareRecordsHTTPDuration(t *testing.T) {
+	m := New()
+	previousRoutePattern := RoutePattern
+	RoutePattern = func(*http.Request) string { return "/health" }
+	t.Cleanup(func() { RoutePattern = previousRoutePattern })
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+
+	handler.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusCreated, response.Code)
+	histogram := m.sampleHistogram(t, httpDurationName, map[string]string{
+		"route": "/health", "method": http.MethodGet, "status": "201",
+	})
+	assert.Equal(t, uint64(1), histogram.GetSampleCount())
+}
 
 // TestRecordStoreReadLabelsByPool checks that a routed read is attributable:
 // the pool label is what tells an operator whether routing is actually sending
@@ -106,6 +269,27 @@ func (m *Metrics) sampleValue(t *testing.T, name string, labels map[string]strin
 	}
 	t.Fatalf("no sample for %s with labels %v", name, labels)
 	return 0
+}
+
+func (m *Metrics) sampleHistogram(t *testing.T, name string, labels map[string]string) *dto.Histogram {
+	t.Helper()
+	families, err := m.registry.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() == name {
+			for _, sample := range family.GetMetric() {
+				if !hasLabels(sample, labels) {
+					continue
+				}
+				histogram := sample.GetHistogram()
+				require.NotNil(t, histogram)
+				return histogram
+			}
+		}
+	}
+	t.Fatalf("no histogram for %s with labels %v", name, labels)
+	return nil
 }
 
 // hasLabels reports whether sample carries exactly the wanted label pairs.
