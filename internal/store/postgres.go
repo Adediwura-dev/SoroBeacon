@@ -14,27 +14,54 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
-// PoolSettings tunes the pgx connection pool. A zero value in any field
-// leaves the corresponding pgx default in place so deployments that do
-// not set the env vars keep the same behaviour as before.
+// PoolSettings tunes the pgx connection pool, and the read routing the
+// Postgres backend layers on top of it. A zero value in any field leaves the
+// corresponding pgx default in place so deployments that do not set the env
+// vars keep the same behaviour as before.
+//
+// The SQLite backend ignores this struct entirely: it has no pool, and it
+// serves reads and writes from the same file handle, so there is no replica to
+// route to.
 type PoolSettings struct {
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
+	// ReplicaURL is a second Postgres connection string used for the
+	// read-only queries replica.go routes (REPLICA_DATABASE_URL). Empty — the
+	// default, and every deployment that does not set it — keeps all reads on
+	// the primary.
+	//
+	// It rides in this struct rather than a constructor argument because
+	// store.New already threads PoolSettings from config to the Postgres
+	// backend, and a replica URL is pool selection in exactly the same sense
+	// the primary's own URL is.
+	ReplicaURL string
+	// Metrics receives the per-pool read counters that make routing visible.
+	// Nil records nothing, which is what tests pass and what an embedder with
+	// no instrumentation wants; every method is nil-safe, see internal/metrics.
+	Metrics *metrics.Metrics
 }
 
 // Postgres implements Store on top of a pgx connection pool.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// replica serves the read-only queries listed in replica.go. Nil (the
+	// default) means REPLICA_DATABASE_URL was unset and every query — read or
+	// write — runs on pool, which is the behaviour of every deployment that
+	// predates replica routing.
+	replica *pgxpool.Pool
 	// cipher encrypts and decrypts channels.config at rest. Nil (the
 	// default) keeps the pre-encryption plaintext behaviour.
 	cipher ConfigCipher
 	// telemetry is optional tracing; nil (the default) writes no spans.
 	telemetry *telemetry.Provider
+	// metrics is optional instrumentation for routed reads; nil-safe.
+	metrics *metrics.Metrics
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -58,6 +85,10 @@ func (p *Postgres) WithConfigCipher(c ConfigCipher) *Postgres {
 // NewPostgres connects to databaseURL and verifies the connection.
 // Call Migrate before using the store on a fresh database. Pass a zero
 // PoolSettings to keep pgx's own pool defaults.
+//
+// With settings.ReplicaURL set it also opens the replica pool and routes the
+// reads replica.go lists to it; a replica that cannot be opened or pinged is a
+// startup error, see connectReplica.
 func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
 	cfg, err := buildPoolConfig(databaseURL, settings)
 	if err != nil {
@@ -71,7 +102,12 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Postgres{pool: pool}, nil
+	p := &Postgres{pool: pool, metrics: settings.Metrics}
+	if err := p.connectReplica(ctx, settings); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return p, nil
 }
 
 // buildPoolConfig parses databaseURL and overlays any non-zero pool
@@ -97,8 +133,23 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	return cfg, nil
 }
 
+// Ping checks the primary only. It is the readiness probe's dependency, and
+// the question readiness asks is "can this process serve traffic?" — which it
+// can while the primary is up, because a replica that is down is covered by
+// the fallback in replica.go. Pinging the replica here would take the instance
+// out of rotation over a read replica, turning a degradable condition into an
+// outage. A replica that is failing shows up as
+// sorobeacon_store_replica_fallbacks_total instead.
 func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
-func (p *Postgres) Close()                         { p.pool.Close() }
+
+// Close releases both pools. The replica goes first so a query cannot be
+// issued against a pool that is being torn down mid-shutdown.
+func (p *Postgres) Close() {
+	if p.replica != nil {
+		p.replica.Close()
+	}
+	p.pool.Close()
+}
 
 // pageLimit matches ListAlerts: a missing or out-of-range limit becomes
 // 50 rather than being rejected, so omitting pagination params still
@@ -239,7 +290,7 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 		q += ` ORDER BY id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
-	rows, err := p.pool.Query(ctx, q, args...)
+	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -969,7 +1020,36 @@ func alertSort(s string) string {
 	return "created_at_desc"
 }
 
+// ListAlerts searches alerts. It is a routable read: the alert list is a
+// search over history, so a replica a few milliseconds behind shows the caller
+// the same page minus rows written in that window, which is the trade the
+// replica exists to make. A caller that cannot tolerate it — the rules engine
+// rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	q, args := buildAlertQuery(f)
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// ListAlertsPrimary is ListAlerts served by the primary, whatever
+// REPLICA_DATABASE_URL says. It exists for readers that must see this
+// process's own writes — see PrimaryReader.
+func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	q, args := buildAlertQuery(f)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// buildAlertQuery builds the ListAlerts statement and its arguments. Both
+// readers call it so the routed and primary-bound forms cannot drift into
+// returning different pages.
+func buildAlertQuery(f AlertFilter) (string, []any) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id
 		 FROM alerts WHERE TRUE`
 	args := []any{}
@@ -994,8 +1074,15 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	if f.ContractID != "" {
 		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
 	}
-	if f.Network != "" {
-		q += ` AND network = ` + arg(f.Network)
+	if pattern := AlertSearchPattern(f.Query); pattern != "" {
+		// One bound pattern, both columns. The payload is cast to text so the
+		// search reaches contract_id, event_name and every other field a rule
+		// type stores without the store knowing each type's shape — the cost
+		// of that generality is that it cannot use an index, which is why the
+		// term is capped (MaxAlertSearchLen) rather than long by default.
+		// ESCAPE makes the pattern's own wildcards literal.
+		p := arg(pattern)
+		q += ` AND (event_id ILIKE ` + p + ` ESCAPE '\' OR payload::text ILIKE ` + p + ` ESCAPE '\')`
 	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ` + arg(f.From)
@@ -1022,12 +1109,7 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 		q += ` ORDER BY created_at DESC, id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
-
-	rows, err := p.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, scanAlert)
+	return q, args
 }
 
 // scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
@@ -1040,6 +1122,8 @@ func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	return a, err
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
 // ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
 // with the same ordering DeleteExpiredAlerts uses so the row an archiver reads
 // is the row the delete removes.
@@ -1476,93 +1560,37 @@ func (p *Postgres) UpsertBackfill(ctx context.Context, b *Backfill) error {
 
 // --- stats ---
 
-// GetStats reports the counts for one workspace. Every figure is scoped,
-// including the rules count (rules reach a workspace through their monitor) and
-// the alert totals. The ingest checkpoints are instance-wide and deliberately
-// not scoped: they are the pollers' cursors, not a tenant's data.
+// GetStats returns the dashboard's headline counters. It is a routable read:
+// the numbers are aggregate counts over a table that only ever grows, so a
+// replica a moment behind reports a total that is a moment stale rather than
+// wrong. Nothing is written back from these values, so a stale read cannot
+// turn into a stale write.
 func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	var s Stats
-	ws := workspaceID(ctx)
-	err := p.pool.QueryRow(ctx, `
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
+	}, `
 		SELECT
-			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
-			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
-			(SELECT count(*) FROM channels WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours')`,
-		ws,
-	).Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24)
-	if err != nil {
-		return s, err
-	}
-	cps, err := p.ingestCheckpoints(ctx)
-	if err != nil {
-		return s, err
-	}
-	summarizeCheckpoints(&s, cps)
-	return s, nil
+			(SELECT count(*) FROM monitors),
+			(SELECT count(*) FROM rules),
+			(SELECT count(*) FROM channels),
+			(SELECT count(*) FROM alerts),
+			(SELECT count(*) FROM alerts WHERE created_at > now() - interval '24 hours'),
+			(SELECT last_ledger FROM ingest_state WHERE id = 1),
+			(SELECT updated_at FROM ingest_state WHERE id = 1)`)
+	return s, err
 }
 
-// ingestCheckpoints reads every network's cursor, newest poll first. The legacy
-// row participates in the same ordering because a named network claims it once
-// and then moves on: whichever checkpoint polled most recently is the one that
-// describes where this instance actually is.
-func (p *Postgres) ingestCheckpoints(ctx context.Context) ([]NetworkStats, error) {
-	rows, err := p.pool.Query(ctx, `
-		SELECT network, last_ledger, updated_at FROM network_ingest_state
-		UNION ALL
-		SELECT '', last_ledger, updated_at FROM ingest_state WHERE id = 1
-		ORDER BY updated_at DESC`)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (NetworkStats, error) {
-		var c NetworkStats
-		var lastLedger int64
-		err := row.Scan(&c.Network, &lastLedger, &c.LastPollAt)
-		c.LastLedger = uint32(lastLedger)
-		return c, err
-	})
-}
-
-// AssignLegacyNetwork labels the rows written before the network column
-// existed. Startup runs it once with the primary network, in the instance's own
-// cross-tenant scope: an operator upgrading a single-network deployment must
-// not watch every monitor vanish from the network-filtered listing, and no
-// tenant can label rows the migration left unlabelled.
-//
-// It is idempotent by construction — the predicate only matches the empty
-// value, so the second startup finds nothing and reports 0.
-func (p *Postgres) AssignLegacyNetwork(ctx context.Context, network string) (int64, error) {
-	if network == "" {
-		return 0, nil // nothing to label: no network configured
-	}
-	var total int64
-	for _, q := range []string{
-		`UPDATE monitors SET network = $1 WHERE network = ''`,
-		`UPDATE alerts SET network = $1 WHERE network = ''`,
-	} {
-		tag, err := p.pool.Exec(ctx, q, network)
-		if err != nil {
-			return total, mapErr(err)
-		}
-		total += tag.RowsAffected()
-	}
-	return total, nil
-}
-
+// AlertCountsByDay returns the daily alert totals behind the dashboard chart.
+// Routable for the same reason as GetStats: a day's bar can lag a moment
+// behind real time, and no decision is taken from the value.
 func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
 	// generate_series fills every UTC calendar day in the window, including
 	// zeroes, so a quiet day is an explicit 0 rather than a missing bar.
 	// date_trunc / ::date run on (timestamptz AT TIME ZONE 'UTC') so the
 	// session TimeZone cannot shift a late-UTC event into the next local day.
-	//
-	// The workspace filter belongs in the LEFT JOIN's ON clause, not the WHERE
-	// clause: filtering the joined table after the fact would drop the days
-	// with no alerts in this workspace and reintroduce the chart gaps the
-	// generate_series exists to prevent.
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.queryRows(ctx, `
 		WITH days AS (
 			SELECT generate_series(
 				((now() AT TIME ZONE 'UTC')::date - ($1::int - 1)),
@@ -1590,6 +1618,64 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 		out = append(out, AlertDayCount{Day: day.UTC().Format("2006-01-02"), Count: count})
 	}
 	return out, rows.Err()
+}
+
+// GetMonitorStats reports one monitor's alert, delivery and per-rule counts.
+// Two statements, whatever the monitor's rule count: the aggregate row and one
+// grouped per-rule count. Routable reads for the same reason as GetStats —
+// every number here is a count over history that only ever grows, and nothing
+// is written back from them.
+//
+// The existence probe rides along in the aggregate rather than being a third
+// query, so a monitor deleted a moment ago reports ErrNotFound instead of a
+// page of zeroes that looks like a healthy but quiet monitor.
+func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
+	var (
+		ms     MonitorStats
+		exists bool
+	)
+	ms.MonitorID = monitorID
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
+			&ms.LastAlertAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
+	}, `
+		SELECT
+			(SELECT count(*) FROM monitors WHERE id = $1) > 0,
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '7 days'),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $2),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $3)`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed)
+	if err != nil {
+		return ms, err
+	}
+	if !exists {
+		return ms, ErrNotFound
+	}
+
+	rows, err := p.queryRows(ctx, `
+		SELECT r.id, r.type, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id
+		WHERE r.monitor_id = $1
+		GROUP BY r.id, r.type
+		ORDER BY r.id`, monitorID)
+	if err != nil {
+		return ms, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Type, &rc.Alerts); err != nil {
+			return ms, err
+		}
+		ms.Rules = append(ms.Rules, rc)
+	}
+	return ms, rows.Err()
 }
 
 // --- helpers ---

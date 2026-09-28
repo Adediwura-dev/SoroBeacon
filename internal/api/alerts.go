@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -17,8 +18,7 @@ import (
 )
 
 // parseAlertFilter reads the shared alert listing query params
-// (monitor_id, rule_id, contract_id, network, from, to as RFC 3339, sort,
-// limit,
+// (monitor_id, rule_id, contract_id, q, from, to as RFC 3339, sort, limit,
 // cursor). GET /alerts and GET /alerts.csv both call it so the two
 // endpoints cannot drift on which params exist or how bad values are
 // reported. On failure it has already written the error envelope.
@@ -43,11 +43,17 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		f.RuleID = id
 	}
 	f.ContractID = q.Get("contract_id")
-	// Network narrows the feed to one chain. Alerts carry the network their
-	// monitor was on, so this is a plain equality filter rather than a
-	// join back to monitors — and an alert from before networks existed
-	// matches no name, which is what "?network=" should mean: this chain's.
-	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// The term is trimmed here rather than left for the store because the cap
+	// is about the text actually searched: a term padded with spaces to one
+	// character over the limit is a short search whose padding is not part of
+	// it, so measuring the raw value would reject on the spaces.
+	if term := store.NormalizeAlertSearch(q.Get("q")); term != "" {
+		if utf8.RuneCountInString(term) > store.MaxAlertSearchLen {
+			writeErr(w, r, http.StatusBadRequest, fmt.Sprintf("invalid q (max %d characters)", store.MaxAlertSearchLen))
+			return f, false
+		}
+		f.Query = term
+	}
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "created_at_desc", "created_at_asc":
@@ -95,7 +101,8 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 }
 
 // listAlerts serves GET /alerts with query filters:
-// monitor_id, rule_id, contract_id, from, to (RFC 3339), sort
+// monitor_id, rule_id, contract_id, q (case-insensitive substring of the
+// source event id or the payload text), from, to (RFC 3339), sort
 // (created_at_desc default, created_at_asc), limit, cursor (last seen
 // alert id; comparison follows sort).
 func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {

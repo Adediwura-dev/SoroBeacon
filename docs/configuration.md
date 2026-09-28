@@ -1,8 +1,11 @@
 # Environment variable reference
 
-All runtime configuration is environment variables. There is no config
-file. Copy [`.env.example`](../.env.example) and edit it, or set the
-variables in the process environment / systemd `EnvironmentFile=`.
+All runtime configuration is loaded from the environment and an optional
+YAML config file. Copy [`.env.example`](../.env.example) and edit it, or
+set the variables in the process environment / systemd `EnvironmentFile=`.
+If `CONFIG_FILE` is set, its values are used as defaults and environment
+variables override them; the built-in defaults are used only when neither
+layer sets a value.
 
 This page is the operator reference for **every variable
 `internal/config` actually reads**. Channel secrets (webhook URLs, bot
@@ -59,6 +62,10 @@ The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
 `DATABASE_MAX_CONN_LIFETIME` and `DATABASE_MAX_CONN_IDLE_TIME` variables tune
 the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
 error rather than a setting that silently does nothing.
+
+`REPLICA_DATABASE_URL` points the read-only dashboard queries at a Postgres
+read replica and is likewise rejected with a `sqlite` URL. It is off by
+default; see [Read replicas](operations/scaling.md#read-replicas).
 
 ## API authentication
 

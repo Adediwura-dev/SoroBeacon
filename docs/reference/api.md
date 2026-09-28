@@ -45,7 +45,8 @@ reach the port. Set `API_TOKEN` on anything beyond a trusted network.
 | `POST /monitors` | Create. Body: `name`, `contract_ids` (validated strkeys), optional `enabled`, `channel_ids`, `network`. On a multi-network instance `network` must be a chain this instance polls; omitting it selects the primary. |
 | `GET /monitors` | List. `?enabled=true` filters to enabled, `?network=testnet` to one chain. |
 | `GET /monitors/{id}` | Get one (includes `channel_ids`). |
-| `PATCH /monitors/{id}` | Partial update; any subset of the create fields. `channel_ids` replaces attachments. A `network` that differs from the stored one is rejected — a contract id means a different contract on another chain. |
+| `GET /monitors/{id}/stats` | Per-monitor counts: `alerts`, `alerts_last_24h`, `alerts_last_7d`, `last_alert_at` (omitted when the monitor has never alerted), `deliveries_succeeded`, `deliveries_failed`, and `rules` — one `{rule_id, type, alerts}` entry per rule, always an array. A monitor with no history returns explicit zeroes, not nulls; an unknown id is a 404, because "this monitor has not fired" and "there is no such monitor" are different answers. |
+| `PATCH /monitors/{id}` | Partial update; any subset of the create fields. `channel_ids` replaces attachments. |
 | `DELETE /monitors/{id}` | Delete (cascades to rules and alerts). |
 
 ```sh
@@ -84,8 +85,8 @@ Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels
 
 | Method & path | Description |
 | --- | --- |
-| `GET /alerts` | History. Query: `monitor_id`, `rule_id`, `contract_id` (matches `payload.contract_id`), `network`, `from`/`to` (RFC 3339), `sort` (`created_at_desc` default, `created_at_asc`; anything else is 400), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`; comparison follows `sort`). |
-| `GET /alerts.csv` | CSV export of the same filtered alerts (same query params as `GET /alerts`, including `network`; `cursor` is ignored). Responds `text/csv` with an attachment filename carrying the requested date range. Columns, in order: `id`, `monitor_name`, `rule_id`, `contract_id`, `event_name`, `event_id`, `ledger`, `created_at` (RFC 3339), `payload` (the raw JSON), `network`. Column position is part of the contract, so a new column is appended rather than inserted. Values beginning with `=`, `+`, `-` or `@` are prefixed with an apostrophe so spreadsheet software treats them as text, not formulas. With no `limit` the export is capped at 10000 rows; an explicit `limit` is honoured up to that cap. |
+| `GET /alerts` | History. Query: `monitor_id`, `rule_id`, `contract_id` (matches `payload.contract_id`), `q` (case-insensitive substring, matched against the alert's `event_id` and the full text of its JSON payload — which is where `contract_id`, `event_name` and every other rule-specific field live, so no per-rule-type field list is needed. `%`, `_` and `\` in the term are literal, not wildcards. Blank or whitespace-only means no search filter; over 256 characters is 400. Composes with every other filter and with `cursor`, so a searched page keeps its search while paging), `from`/`to` (RFC 3339), `sort` (`created_at_desc` default, `created_at_asc`; anything else is 400), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`; comparison follows `sort`). |
+| `GET /alerts.csv` | CSV export of the same filtered alerts (same query params as `GET /alerts`; `cursor` is ignored). Responds `text/csv` with an attachment filename carrying the requested date range. Columns, in order: `id`, `monitor_name`, `rule_id`, `contract_id`, `event_name`, `event_id`, `ledger`, `created_at` (RFC 3339), `payload` (the raw JSON). Values beginning with `=`, `+`, `-` or `@` are prefixed with an apostrophe so spreadsheet software treats them as text, not formulas. With no `limit` the export is capped at 10000 rows; an explicit `limit` is honoured up to that cap. |
 | `GET /alerts/{id}/deliveries` | Delivery attempts for one alert. `?status=success` or `?status=failed` filters in SQL; omit for all. Unknown values are `400`. |
 
 ```sh

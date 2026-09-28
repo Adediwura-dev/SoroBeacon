@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
@@ -350,9 +351,14 @@ type AlertFilter struct {
 	RuleID    int64
 	// ContractID matches payload->>'contract_id'. Empty means no contract filter.
 	ContractID string
-	From       time.Time
-	To         time.Time
-	Limit      int
+	// Query is the free-text alert search: a case-insensitive substring of
+	// either the source event id or the payload's full text, which carries
+	// contract_id, event_name and every other field the API returns. Empty
+	// (or whitespace-only, see NormalizeAlertSearch) means no search filter.
+	Query string
+	From  time.Time
+	To    time.Time
+	Limit int
 	// AfterID is the keyset cursor (the last id of the previous page). The
 	// comparison flips with Sort: created_at_desc uses (created_at, id) <
 	// the cursor row; created_at_asc uses >. Comparing only on id would
@@ -370,6 +376,71 @@ type AlertFilter struct {
 	// Network filters alerts by the Stellar network their event came from.
 	// Empty means every network.
 	Network string
+}
+
+// MaxAlertSearchLen caps a ?q= search term. The term is always bound as a
+// parameter so a longer one could not corrupt the statement, but an
+// unbounded term turns the search into a full table scan of a text match
+// against every payload — the cap keeps one keystroke-worth of query from
+// becoming the most expensive read the instance performs.
+const MaxAlertSearchLen = 256
+
+// NormalizeAlertSearch maps a caller-supplied search term onto the term the
+// store matches. A blank or whitespace-only term is "no filter", not "match
+// nothing": an emptied search box that clears itself is what the operator
+// expects, and the alternative would render an empty list for a filter that
+// is no longer there.
+func NormalizeAlertSearch(q string) string { return strings.TrimSpace(q) }
+
+// AlertSearchPattern builds the LIKE pattern for AlertFilter.Query. Escaping
+// the term's own wildcards is what makes the search literal: an operator
+// looking for a contract id containing "_" must not get every row, and a
+// term taken from a URL is not in on the joke. The ESCAPE character is
+// declared by every backend that uses this, so the pattern and the clause
+// cannot disagree about whether a backslash is special.
+func AlertSearchPattern(q string) string {
+	q = NormalizeAlertSearch(q)
+	if q == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("%")
+	for _, r := range q {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString("%")
+	return b.String()
+}
+
+// MonitorStats answers "is this monitor actually doing anything" for one
+// monitor: the counts a caller checks before deleting it or debugging why it
+// never fires. Every field is an explicit zero rather than a null when the
+// monitor has no history, because "no alerts yet" is the common case and a
+// client should not have to special-case it.
+type MonitorStats struct {
+	MonitorID      int64            `json:"monitor_id"`
+	Alerts         int64            `json:"alerts"`
+	AlertsLast24h  int64            `json:"alerts_last_24h"`
+	AlertsLast7d   int64            `json:"alerts_last_7d"`
+	LastAlertAt    *time.Time       `json:"last_alert_at,omitempty"`
+	DeliveriesOK   int64            `json:"deliveries_succeeded"`
+	DeliveriesFail int64            `json:"deliveries_failed"`
+	Rules          []RuleMatchCount `json:"rules"`
+}
+
+// RuleMatchCount is one rule's share of a monitor's alerts. Rules are listed
+// whether or not they have matched, so a rule that never fires is visible as
+// a zero instead of being absent — the absence of a row and a rule that does
+// not match are the same thing to a client only if the client can tell them
+// apart, and this lets it.
+type RuleMatchCount struct {
+	RuleID int64  `json:"rule_id"`
+	Type   string `json:"type"`
+	Alerts int64  `json:"alerts"`
 }
 
 // ListFilter pages monitors or channels. Zero values mean "no constraint"
@@ -774,6 +845,11 @@ type Store interface {
 	Audits
 	DigestQueue
 	GetStats(ctx context.Context) (Stats, error)
+	// GetMonitorStats returns one monitor's alert, delivery and per-rule
+	// counts, or ErrNotFound when the monitor does not exist. It exists
+	// because GetStats answers "how big is this instance" and says nothing
+	// about whether a particular monitor is doing any work.
+	GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.

@@ -1,6 +1,18 @@
 # Configuration
 
-All configuration comes from environment variables. `.env.example` in the repo is a ready-to-copy template. The complete operator table (types, required vs optional, secrets, `SOURCE_MODE`-only variables) is [Environment variable reference](../configuration.md).
+All configuration is loaded in layers: `CONFIG_FILE` is read first, then the process environment overrides it, and both sit above the built-in defaults. This keeps a checked-in YAML file convenient for a long-lived deployment while preserving emergency overrides via `systemd Environment=`, `docker -e`, or a shell export. `.env.example` in the repo is still a ready-to-copy template for environment-only deployments.
+
+SoroBeacon reads YAML from `CONFIG_FILE` and accepts the same keys as the environment variables documented in [Environment variable reference](../configuration.md). The file format is intentionally simple: top-level keys map to the same variable names, for example `DATABASE_URL`, `HTTP_ADDR`, `POLL_INTERVAL`, and `API_TOKEN`.
+
+Precedence is explicit:
+
+1. environment variables
+2. `CONFIG_FILE`
+3. built-in defaults
+
+This order means a file can be committed with sane defaults, while one-off emergency overrides in the environment still win.
+
+The file is a convenience for operators; do not put secrets in it unless you have to. Settings that are credentials or tokens — especially `DATABASE_URL`, `API_TOKEN`, `CONFIG_ENCRYPTION_KEY`, and any webhook, SMTP, or Slack credentials that end up inside a channel `config` — should remain in a secret manager or a strict-mode `0600` file, not in a committed YAML document. Parse errors must not echo a secret value to logs.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -16,6 +28,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default | How long an idle connection is kept. Go duration. `0` or unset leaves the driver default. |
+| `REPLICA_DATABASE_URL` | unset (reads go to the primary) | Postgres connection string of a read replica serving the read-only dashboard queries (monitor list, alert search, stats, alert counts by day). Must be a `postgres`/`postgresql` URL other than `DATABASE_URL`; both are validated at startup, and a `sqlite` `DATABASE_URL` with this set is rejected. A replica that cannot be reached at boot fails startup; one that goes away later degrades to the primary. |
 | `API_TOKEN` | unset (authentication off) | Comma-separated static bearer token(s) for `/api/v1`, and the credential the dashboard's sign-in page accepts. Unset leaves both open and logs one warning at startup. `GET /health`, `/livez` and `/readyz` are exempt. See [API authentication](../configuration.md#api-authentication). |
 | `WORKSPACE_TOKENS` | unset (single workspace) | Comma-separated `workspace=token` pairs. Each token authenticates like `API_TOKEN`'s and scopes the request to that workspace's rows; ids are 1–40 chars of `[a-z0-9_-]`, split on the first `=`. `API_TOKEN` values and pre-existing rows belong to `default`. See [Workspaces](../configuration.md#workspaces). |
 | `OIDC_ISSUER` | unset (single sign-on off) | The provider's base URL. Set it and `/login` also offers an authorization-code-with-PKCE sign-in against that provider, read from its `/.well-known/openid-configuration` **at startup** — so a wrong issuer fails the deploy, not someone's first login. Local token login keeps working beside it. See [Single sign-on](../configuration.md#single-sign-on-oidc). |
