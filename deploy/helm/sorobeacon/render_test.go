@@ -254,6 +254,15 @@ func configEnvVars(t *testing.T) []string {
 		regexp.MustCompile(`getenv\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseInt32Env\("([A-Z0-9_]+)"\)`),
 		regexp.MustCompile(`parseDurationEnv\("([A-Z0-9_]+)"\)`),
+		// Values that may also come from the config file are read through
+		// lookupConfigValue rather than os.Getenv. They are still environment
+		// variables as far as the chart is concerned, so they belong in this
+		// scan — without this pattern the loop below would find nothing and
+		// pass vacuously, which is what the guard on the caller catches.
+		regexp.MustCompile(`lookupConfigValue\("([A-Z0-9_]+)"`),
+		regexp.MustCompile(`valueOrFallback\("([A-Z0-9_]+)"`),
+		regexp.MustCompile(`parseInt32EnvWithFile\("([A-Z0-9_]+)"`),
+		regexp.MustCompile(`parseDurationEnvWithFile\("([A-Z0-9_]+)"`),
 	}
 	// The chart lives at deploy/helm/sorobeacon, so the config package is
 	// three levels up.
