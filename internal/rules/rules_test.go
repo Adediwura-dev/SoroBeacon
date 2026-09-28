@@ -259,10 +259,11 @@ func TestValueThresholdValidate(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	r := NewRegistry()
-	// All registered types. TypeTopicPosition was dropped from this list when
-	// contract_allowlist was added to it, so the assertion was one short.
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeContractAllowlist}, r.Types())
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeContractAllowlist}, r.Types())
+	// Every registered type belongs here. The list is deliberately explicit
+	// rather than derived from the registry, so adding a rule type without
+	// noticing cannot pass unremarked — which does mean a PR that adds one
+	// has to extend this line.
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeNumericRange, TypeEventNameGlob, TypeContractAllowlist}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
