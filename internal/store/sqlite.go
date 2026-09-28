@@ -1003,7 +1003,7 @@ func (s *SQLite) GroupAlerts(ctx context.Context, key string, windowStart time.T
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE id = ?`, id))
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason FROM alerts WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -1011,7 +1011,7 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason FROM alerts WHERE 1 = 1`
 	args := []any{}
 	if f.MonitorID != 0 {
 		q += ` AND monitor_id = ?`
@@ -1088,13 +1088,17 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var ledger int64
 	var retracted sql.NullString
 	var inhibited sql.NullInt64
-	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited); err != nil {
+	var suppressed int64
+	var suppressionReason string
+	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	if inhibited.Valid {
 		v := inhibited.Int64
 		a.InhibitedByRuleID = &v
 	}
+	a.Suppressed = suppressed != 0
+	a.SuppressionReason = suppressionReason
 	a.Payload = json.RawMessage(payload)
 	if enrichment.Valid {
 		a.Enrichment = json.RawMessage(enrichment.String)
@@ -1190,7 +1194,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {
@@ -1206,6 +1210,161 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// --- maintenance windows ---
+//
+// The maintenance-window methods mirror the Postgres backend statement for
+// statement so the two backends cannot drift: SQLite holds the timestamps as
+// TEXT in the fixed format and binds ? placeholders, but the scope resolution
+// order, the ErrNotFound on a missing row and the bounded-window CHECK are
+// identical.
+
+func (s *SQLite) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	var created string
+	if err := s.db.QueryRowContext(ctx,
+		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt),
+	).Scan(&w.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	var err error
+	w.CreatedAt, err = parseSQLiteTime(created)
+	return err
+}
+
+func scanSQLiteMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
+	var w MaintenanceWindow
+	var monitorID sql.NullInt64
+	var contractID sql.NullString
+	var start, end, created string
+	if err := r.Scan(&w.ID, &w.Reason, &w.Scope, &monitorID, &contractID, &start, &end, &created); err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	if monitorID.Valid {
+		v := monitorID.Int64
+		w.MonitorID = &v
+	}
+	if contractID.Valid {
+		v := contractID.String
+		w.ContractID = &v
+	}
+	var err error
+	if w.StartAt, err = parseSQLiteTime(start); err != nil {
+		return nil, err
+	}
+	if w.EndAt, err = parseSQLiteTime(end); err != nil {
+		return nil, err
+	}
+	if w.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+func (s *SQLite) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
+	return scanSQLiteMaintenanceWindow(s.db.QueryRowContext(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = ?`, id))
+}
+
+func (s *SQLite) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
+	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE 1 = 1`
+	args := []any{}
+	if f.Active || f.Upcoming {
+		at := f.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if f.Active {
+			q += ` AND start_at <= ? AND end_at > ?`
+			args = append(args, sqliteTimeString(at), sqliteTimeString(at))
+		} else {
+			q += ` AND start_at > ?`
+			args = append(args, sqliteTimeString(at))
+		}
+	}
+	q += ` ORDER BY start_at DESC, id DESC LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []MaintenanceWindow
+	for rows.Next() {
+		w, err := scanSQLiteMaintenanceWindow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *w)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE maintenance_windows
+		 SET reason = ?, scope = ?, monitor_id = ?, contract_id = ?, start_at = ?, end_at = ?
+		 WHERE id = ?`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt), w.ID)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
+	return s.deleteByID(ctx, "maintenance_windows", id)
+}
+
+// ActiveMaintenanceWindow is the delivery path's single indexed lookup: a
+// window is active when [start_at, end_at) covers at and its scope covers
+// the alert. The most specific scope wins (contract, then monitor, then
+// global) so a contract's reason is preferred over a broader one's.
+func (s *SQLite) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
+	w, err := scanSQLiteMaintenanceWindow(s.db.QueryRowContext(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows
+		 WHERE start_at <= ? AND end_at > ?
+		   AND (scope = 'global'
+		        OR (scope = 'monitor' AND monitor_id = ?)
+		        OR (scope = 'contract' AND contract_id = ?))
+		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
+		 LIMIT 1`,
+		sqliteTimeString(at), sqliteTimeString(at), monitorID, contractID))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (s *SQLite) SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE alerts SET suppressed = 1, suppression_reason = ? WHERE id = ?`, reason, alertID)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- inhibitions ---

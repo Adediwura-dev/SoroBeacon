@@ -145,6 +145,21 @@ func (*TopicRegex) ParamSchema() []FieldSchema {
 	}
 }
 
+func (SelfTransfer) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min_amount", Type: "string", Description: "Only match self-transfers of at least this amount (decimal integer string)"},
+	}
+}
+
+func (TimeWindow) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "start", Type: "string", Required: true, Description: "Window start in UTC (HH:MM, e.g. 09:00)"},
+		{Name: "end", Type: "string", Required: true, Description: "Window end in UTC (HH:MM); earlier than start crosses midnight"},
+		{Name: "days", Type: "object", Description: "Days to match (JSON array of mon|tue|wed|thu|fri|sat|sun); omit to match every day"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the window (default false)", Options: []string{"true", "false"}, Default: "false"},
+	}
+}
+
 func (*AddressWatchlist) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "addresses", Type: "object", Required: true, Description: "Watchlist of Stellar addresses (JSON array)"},

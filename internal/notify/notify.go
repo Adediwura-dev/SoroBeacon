@@ -88,6 +88,7 @@ const (
 	TypeTelegram   = "telegram"
 	TypeEmail      = "email"
 	TypeWebhook    = "webhook"
+	TypeNtfy       = "ntfy"
 	TypeMatrix     = "matrix"
 	TypePagerDuty  = "pagerduty"
 	TypeTwilio     = "twilio"
@@ -113,6 +114,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTelegram, NewTelegram)
 	f.Register(TypeEmail, NewEmail)
 	f.Register(TypeWebhook, NewWebhook)
+	f.Register(TypeNtfy, NewNtfy)
 	f.Register(TypeMatrix, NewMatrix)
 	f.Register(TypePagerDuty, NewPagerDuty)
 	f.Register(TypeFederation, NewFederation)
