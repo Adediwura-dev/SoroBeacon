@@ -73,6 +73,7 @@ func (EventEmitted) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event_name", Type: "string", Description: "Event name to match (first topic)"},
 		{Name: "topic_equals", Type: "object", Description: "Topic index to expected value map (JSON)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
 	}
 }
 
@@ -82,6 +83,13 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 		{Name: "value_path", Type: "string", Description: "Dot path into the event value"},
 		{Name: "comparison", Type: "select", Required: true, Description: "Comparison operator", Options: []string{"gt", "gte", "lt", "lte", "eq", "neq"}},
 		{Name: "threshold", Type: "number", Required: true, Description: "Threshold value (number or numeric string for >53-bit)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
+	}
+}
+
+func (EventNameGlob) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "patterns", Type: "object", Required: true, Description: "Glob patterns matched against the whole event name (JSON array, e.g. [\"swap_*\"])"},
 	}
 }
 
@@ -103,6 +111,7 @@ func (TokenEvent) ParamSchema() []FieldSchema {
 		{Name: "to", Type: "string", Description: "Exact address in the to slot"},
 		{Name: "min_amount", Type: "string", Description: "Minimum amount (decimal integer string)"},
 		{Name: "max_amount", Type: "string", Description: "Maximum amount (decimal integer string)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
 	}
 }
 
@@ -111,6 +120,7 @@ func (*FrequencyThreshold) ParamSchema() []FieldSchema {
 		{Name: "event_name", Type: "string", Description: "Only count events with this name"},
 		{Name: "count", Type: "number", Required: true, Description: "Fire at this many matches"},
 		{Name: "window", Type: "string", Required: true, Description: "Rolling window duration (e.g. 5m, 1h)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
 	}
 }
 
