@@ -1184,7 +1184,9 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	notifier, err := s.factory.New(ch.Type, ch.Config)
 	if err == nil {
-		err = notifier.Send(r.Context(), notify.Alert{
+		testCtx, cancel := context.WithTimeout(r.Context(), ch.TimeoutDuration())
+		defer cancel()
+		err = notifier.Send(testCtx, notify.Alert{
 			MonitorName: "Test monitor",
 			RuleType:    "test",
 			EventName:   "sorobeacon_test",

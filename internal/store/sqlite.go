@@ -870,10 +870,10 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id, created_at`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds,
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(),
 	).Scan(&c.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -883,7 +883,7 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	channels, err := s.queryChannels(ctx,
-		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds FROM channels WHERE id = ?`, id)
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -896,7 +896,7 @@ func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 // ListChannels serves the dashboard listing and the notifier's startup
 // validation, so it honours the cross-tenant system scope like ListMonitors.
 func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels`
 	if enabledOnly {
 		q += ` AND enabled = 1`
 	}
@@ -905,7 +905,7 @@ func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel,
 }
 
 func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds FROM channels WHERE 1 = 1`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE 1 = 1`
 	args := []any{}
 	if f.EnabledOnly {
 		q += ` AND enabled = 1`
@@ -931,7 +931,7 @@ func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel,
 // conditional here as it is in ListMonitors.
 func (s *SQLite) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
 	return s.queryChannels(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = ? AND c.enabled = 1
@@ -962,7 +962,8 @@ func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	var config string
 	var enabled int64
 	var created string
-	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created, &c.DigestMode, &c.DigestWindowSeconds); err != nil {
+	var timeoutSec int
+	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec); err != nil {
 		return c, mapSQLiteErr(err)
 	}
 	var err error
@@ -971,6 +972,7 @@ func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	}
 	c.Enabled = enabled != 0
 	c.Config = json.RawMessage(config)
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if err := decryptChannel(s.cipher, &c); err != nil {
 		return c, err
 	}
@@ -983,8 +985,8 @@ func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ?, digest_mode = ?, digest_window_seconds = ? WHERE id = ?`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.ID)
+		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ?, digest_mode = ?, digest_window_seconds = ?, timeout = ? WHERE id = ?`,
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), c.ID)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
