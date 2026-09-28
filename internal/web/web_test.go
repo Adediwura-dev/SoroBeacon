@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -31,6 +32,9 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
+	return store.MonitorStats{}, nil
+}
 func (emptyStore) AlertCountsByDay(context.Context, int) ([]store.AlertDayCount, error) {
 	return nil, nil
 }
@@ -48,6 +52,27 @@ func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.M
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
+func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
+func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error    { return nil }
+func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {
+	return nil, store.ErrNotFound
+}
+func (emptyStore) DeleteSavedSearch(context.Context, int64) error                      { return nil }
+func (emptyStore) SetDefaultSearch(context.Context, int64) error                       { return nil }
+func (emptyStore) ClearDefaultSearch(context.Context, int64) error                     { return nil }
+func (emptyStore) CreateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
+func (emptyStore) GetMonitorTemplate(context.Context, int64) (*store.MonitorTemplate, error) {
+	return nil, store.ErrNotFound
+}
+func (emptyStore) ListMonitorTemplates(context.Context) ([]store.MonitorTemplate, error) {
+	return nil, nil
+}
+func (emptyStore) UpdateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
+func (emptyStore) DeleteMonitorTemplate(context.Context, int64) error                  { return nil }
+func (emptyStore) CreateAuditEntry(context.Context, *store.AuditEntry) error           { return nil }
+func (emptyStore) ListAuditEntries(context.Context, store.AuditFilter) ([]store.AuditEntry, error) {
+	return nil, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -56,6 +81,104 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+type channelDeleteStore struct {
+	emptyStore
+	channel  store.Channel
+	monitors []store.Monitor
+	deleted  bool
+}
+
+func (s *channelDeleteStore) GetChannel(context.Context, int64) (*store.Channel, error) {
+	return &s.channel, nil
+}
+
+func (s *channelDeleteStore) ListMonitorsForChannel(context.Context, int64) ([]store.Monitor, error) {
+	return s.monitors, nil
+}
+
+func (s *channelDeleteStore) DeleteChannel(context.Context, int64) error {
+	s.deleted = true
+	return nil
+}
+
+func newChannelDeleteServer(t *testing.T, st *channelDeleteStore) (*Server, *httptest.Server) {
+	t.Helper()
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s, httptest.NewServer(s.Routes())
+}
+
+func TestDeleteChannelConfirmationAllowsZeroAttachments(t *testing.T) {
+	st := &channelDeleteStore{channel: store.Channel{ID: 7, Name: "unused"}}
+	_, srv := newChannelDeleteServer(t, st)
+	defer srv.Close()
+
+	res, err := http.PostForm(srv.URL+"/channels/7/delete", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), "No monitors currently depend") {
+		t.Fatalf("initial confirmation = %d, %s", res.StatusCode, body)
+	}
+	if st.deleted {
+		t.Fatal("channel deleted before confirmation")
+	}
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err = client.PostForm(srv.URL+"/channels/7/delete", url.Values{"confirm": {"1"}, "confirmed_signature": {""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther || !st.deleted {
+		t.Fatalf("confirmed delete = %d, deleted=%v", res.StatusCode, st.deleted)
+	}
+}
+
+func TestDeleteChannelConfirmationRejectsStaleAttachmentCount(t *testing.T) {
+	st := &channelDeleteStore{
+		channel:  store.Channel{ID: 7, Name: "shared"},
+		monitors: []store.Monitor{{ID: 1, Name: "old", ChannelIDs: []int64{7}}},
+	}
+	_, srv := newChannelDeleteServer(t, st)
+	defer srv.Close()
+
+	res, err := http.PostForm(srv.URL+"/channels/7/delete", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	st.monitors = []store.Monitor{
+		{ID: 1, Name: "old", ChannelIDs: []int64{7}},
+		{ID: 2, Name: "new", ChannelIDs: []int64{7}},
+	}
+
+	bodyForm := url.Values{"confirm": {"1"}, "confirmed_signature": {"1:7,;"}}
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err = client.PostForm(srv.URL+"/channels/7/delete", bodyForm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), "attachments changed") || !strings.Contains(string(body), "new") {
+		t.Fatalf("stale confirmation = %d, %s", res.StatusCode, body)
+	}
+	if st.deleted {
+		t.Fatal("channel deleted using stale attachment count")
+	}
 }
 
 type pagingStore struct {
@@ -273,13 +396,15 @@ func TestAlertsPageFilterControlsAndPreservedPaging(t *testing.T) {
 }
 
 func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
-	if got := alertFilterQuery(0, 0, "", ""); got != "" {
+	if got := alertFilterQuery(store.AlertFilter{}); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := alertFilterQuery(0, 0, "", "created_at_desc"); got != "" {
+	if got := alertFilterQuery(store.AlertFilter{Sort: "created_at_desc"}); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := alertFilterQuery(7, 9, "CAAA", "created_at_asc")
+	got := alertFilterQuery(store.AlertFilter{
+		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc",
+	})
 	if !strings.Contains(got, "monitor_id=7") || !strings.Contains(got, "rule_id=9") ||
 		!strings.Contains(got, "contract_id=CAAA") || !strings.Contains(got, "sort=created_at_asc") ||
 		!strings.HasSuffix(got, "&") {
@@ -287,14 +412,38 @@ func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
 	}
 }
 
+// TestAlertFilterQueryCarriesSearchAndRange is the paging half of #98 and #321:
+// a search term or a date window that is dropped by the Older link turns the
+// second page into a different query than the one the operator ran.
+func TestAlertFilterQueryCarriesSearchAndRange(t *testing.T) {
+	from := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 3, 8, 0, 0, 0, 0, time.UTC)
+	got := alertFilterQuery(store.AlertFilter{
+		Query: "transfer", From: from, To: to,
+	})
+	for _, want := range []string{"q=transfer", "from=2026-03-01T00%3A00%3A00Z", "to=2026-03-08T00%3A00%3A00Z"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("filter query %q missing %q", got, want)
+		}
+	}
+	// The bounds leave as instants, never as the calendar dates the form
+	// collected: re-deriving the exclusive end from a date would add a day to
+	// the range on every page.
+	if strings.Contains(got, "from=2026-03-01&") {
+		t.Fatalf("range must not round-trip as a bare date: %q", got)
+	}
+}
+
 // TestAlertExportHref covers the dashboard CSV link: it must target the
 // JSON API's export endpoint, drop the (meaningless) cursor, and preserve
 // the filters applied to the list on screen.
 func TestAlertExportHref(t *testing.T) {
-	if got := alertExportHref(0, 0, "", ""); got != "/api/v1/alerts.csv" {
+	if got := alertExportHref(store.AlertFilter{}); got != "/api/v1/alerts.csv" {
 		t.Fatalf("defaults = %q, want the bare export URL", got)
 	}
-	got := string(alertExportHref(7, 9, "CAAA", "created_at_asc"))
+	got := string(alertExportHref(store.AlertFilter{
+		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc",
+	}))
 	for _, want := range []string{"/api/v1/alerts.csv?", "monitor_id=7", "rule_id=9", "contract_id=CAAA", "sort=created_at_asc"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("export href %q missing %q", got, want)
@@ -302,6 +451,59 @@ func TestAlertExportHref(t *testing.T) {
 	}
 	if strings.Contains(got, "cursor=") {
 		t.Fatalf("export href must not carry the list cursor: %q", got)
+	}
+}
+
+// TestAlertExportHrefSendsTheAPIFormat checks the other half of #321's
+// "accepted formats match what the API already accepts": the picker sends a
+// calendar date, but the export link is an API URL, so it must go out as the
+// RFC 3339 instant the API parses.
+func TestAlertExportHrefSendsTheAPIFormat(t *testing.T) {
+	from, fromValue, ok := parseAlertDate("2026-03-01", false)
+	if !ok || fromValue != "2026-03-01" {
+		t.Fatalf("parseAlertDate(from) = %v, %q, %v", from, fromValue, ok)
+	}
+	to, toValue, ok := parseAlertDate("2026-03-01", true)
+	if !ok || toValue != "2026-03-01" {
+		t.Fatalf("parseAlertDate(to) = %v, %q, %v", to, toValue, ok)
+	}
+	// One picked day is the whole day: from is that midnight, to the next.
+	if to.Sub(from) != 24*time.Hour {
+		t.Fatalf("one-day range = %v..%v (%s), want 24h", from, to, to.Sub(from))
+	}
+	href := string(alertExportHref(store.AlertFilter{Query: "mint", From: from, To: to}))
+	for _, want := range []string{"from=2026-03-01T00%3A00%3A00Z", "to=2026-03-02T00%3A00%3A00Z", "q=mint"} {
+		if !strings.Contains(href, want) {
+			t.Fatalf("export href %q missing %q", href, want)
+		}
+	}
+
+	// The instant form is what the Older link round-trips, so it has to come
+	// back as the same window and the same day in the picker.
+	roundTrip, display, ok := parseAlertDate(to.Format(time.RFC3339), true)
+	if !ok || !roundTrip.Equal(to) {
+		t.Fatalf("round-tripped end bound = %v (%v), want %v", roundTrip, ok, to)
+	}
+	if display != "2026-03-01" {
+		t.Fatalf("round-tripped picker value = %q, want the day it closes", display)
+	}
+}
+
+// TestParseAlertDateRejectsGarbage keeps a typo'd or hand-edited bound visible
+// as a message instead of silently widening the list back to everything.
+func TestParseAlertDateRejectsGarbage(t *testing.T) {
+	if _, display, ok := parseAlertDate("yesterday", true); ok || display != "yesterday" {
+		t.Fatalf("bad date = %q, %v; want unreadable and echoed back", display, ok)
+	}
+	// Blank is "no bound", not an error, and still round-trips as blank.
+	bound, display, ok := parseAlertDate("", false)
+	if !ok || !bound.IsZero() || display != "" {
+		t.Fatalf("blank = %v, %q, %v", bound, display, ok)
+	}
+	// A date the API would reject as a bare calendar day is not a date the
+	// dashboard sends to the API; alertExportHref is what converts it.
+	if _, _, ok := parseAlertDate("2026-13-45", false); ok {
+		t.Fatal("month 45 accepted as a date")
 	}
 }
 
@@ -387,6 +589,37 @@ func TestNavHighlightsActivePage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDashboardRendersKeyboardShortcuts(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	for _, want := range []string{
+		`id="shortcuts-dialog"`,
+		`role="dialog"`,
+		`aria-modal="true"`,
+		`data-shortcuts-close`,
+		`data-shortcut-filter`,
+		`event.key === '?'`,
+		`event.key === '/'`,
+		`event.key === 'Escape'`,
+		`target.matches('input, textarea, select')`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("shortcuts markup missing %q", want)
+		}
 	}
 }
 

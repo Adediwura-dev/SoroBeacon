@@ -5,29 +5,70 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/sorotrail/sorobeacon/internal/metrics"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
-// PoolSettings tunes the pgx connection pool. A zero value in any field
-// leaves the corresponding pgx default in place so deployments that do
-// not set the env vars keep the same behaviour as before.
+// PoolSettings tunes the pgx connection pool, and the read routing the
+// Postgres backend layers on top of it. A zero value in any field leaves the
+// corresponding pgx default in place so deployments that do not set the env
+// vars keep the same behaviour as before.
+//
+// The SQLite backend ignores this struct entirely: it has no pool, and it
+// serves reads and writes from the same file handle, so there is no replica to
+// route to.
 type PoolSettings struct {
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
+	// ReplicaURL is a second Postgres connection string used for the
+	// read-only queries replica.go routes (REPLICA_DATABASE_URL). Empty — the
+	// default, and every deployment that does not set it — keeps all reads on
+	// the primary.
+	//
+	// It rides in this struct rather than a constructor argument because
+	// store.New already threads PoolSettings from config to the Postgres
+	// backend, and a replica URL is pool selection in exactly the same sense
+	// the primary's own URL is.
+	ReplicaURL string
+	// Metrics receives the per-pool read counters that make routing visible.
+	// Nil records nothing, which is what tests pass and what an embedder with
+	// no instrumentation wants; every method is nil-safe, see internal/metrics.
+	Metrics *metrics.Metrics
 }
 
 // Postgres implements Store on top of a pgx connection pool.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// replica serves the read-only queries listed in replica.go. Nil (the
+	// default) means REPLICA_DATABASE_URL was unset and every query — read or
+	// write — runs on pool, which is the behaviour of every deployment that
+	// predates replica routing.
+	replica *pgxpool.Pool
 	// cipher encrypts and decrypts channels.config at rest. Nil (the
 	// default) keeps the pre-encryption plaintext behaviour.
 	cipher ConfigCipher
+	// telemetry is optional tracing; nil (the default) writes no spans.
+	telemetry *telemetry.Provider
+	// metrics is optional instrumentation for routed reads; nil-safe.
+	metrics *metrics.Metrics
+}
+
+// WithTelemetry attaches tracing to the store's write paths. Only ids go
+// into span attributes; the alert payload and channel config never do.
+func (p *Postgres) WithTelemetry(t *telemetry.Provider) *Postgres {
+	p.telemetry = t
+	return p
 }
 
 var _ Store = (*Postgres)(nil)
@@ -44,6 +85,10 @@ func (p *Postgres) WithConfigCipher(c ConfigCipher) *Postgres {
 // NewPostgres connects to databaseURL and verifies the connection.
 // Call Migrate before using the store on a fresh database. Pass a zero
 // PoolSettings to keep pgx's own pool defaults.
+//
+// With settings.ReplicaURL set it also opens the replica pool and routes the
+// reads replica.go lists to it; a replica that cannot be opened or pinged is a
+// startup error, see connectReplica.
 func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
 	cfg, err := buildPoolConfig(databaseURL, settings)
 	if err != nil {
@@ -57,7 +102,12 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Postgres{pool: pool}, nil
+	p := &Postgres{pool: pool, metrics: settings.Metrics}
+	if err := p.connectReplica(ctx, settings); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return p, nil
 }
 
 // buildPoolConfig parses databaseURL and overlays any non-zero pool
@@ -83,8 +133,23 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	return cfg, nil
 }
 
+// Ping checks the primary only. It is the readiness probe's dependency, and
+// the question readiness asks is "can this process serve traffic?" — which it
+// can while the primary is up, because a replica that is down is covered by
+// the fallback in replica.go. Pinging the replica here would take the instance
+// out of rotation over a read replica, turning a degradable condition into an
+// outage. A replica that is failing shows up as
+// sorobeacon_store_replica_fallbacks_total instead.
 func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
-func (p *Postgres) Close()                         { p.pool.Close() }
+
+// Close releases both pools. The replica goes first so a query cannot be
+// issued against a pool that is being torn down mid-shutdown.
+func (p *Postgres) Close() {
+	if p.replica != nil {
+		p.replica.Close()
+	}
+	p.pool.Close()
+}
 
 // pageLimit matches ListAlerts: a missing or out-of-range limit becomes
 // 50 rather than being rejected, so omitting pagination params still
@@ -104,32 +169,36 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled) VALUES ($1, $2, $3)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES ($1, $2, $3, $4)
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled,
+		m.Name, ids, m.Enabled, m.Priority.Normalized(),
 	).Scan(&m.ID, &m.CreatedAt)
 }
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.pool.Query(ctx,
-		`SELECT channel_id FROM monitor_channels WHERE monitor_id = $1 ORDER BY channel_id`, id)
-	if err != nil {
-		return nil, err
-	}
-	m.ChannelIDs, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+	m.ChannelIDs, err = p.monitorChannelIDs(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
+func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]int64, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT channel_id FROM monitor_channels WHERE monitor_id = $1 ORDER BY channel_id`, monitorID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
+}
+
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors`
 	if enabledOnly {
 		q += ` WHERE enabled`
 	}
@@ -151,7 +220,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE TRUE`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -192,7 +261,7 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 		q += ` ORDER BY id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
-	rows, err := p.pool.Query(ctx, q, args...)
+	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -225,8 +294,8 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE monitors SET name = $2, contract_ids = $3, enabled = $4 WHERE id = $1`,
-		m.ID, m.Name, ids, m.Enabled)
+		`UPDATE monitors SET name = $2, contract_ids = $3, enabled = $4, priority = $5 WHERE id = $1`,
+		m.ID, m.Name, ids, m.Enabled, m.Priority.Normalized())
 	if err != nil {
 		return err
 	}
@@ -295,7 +364,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -337,12 +406,13 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	copy := Monitor{
 		Name:        CopyMonitorName(src.Name, names),
 		ContractIDs: src.ContractIDs,
-		Enabled:     false, // never inherit enabled: a duplicate must be reviewed first
+		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
+		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled) VALUES ($1, $2, $3)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES ($1, $2, $3, $4)
 		 RETURNING id, created_at`,
-		copy.Name, ids, copy.Enabled,
+		copy.Name, ids, copy.Enabled, copy.Priority,
 	).Scan(&copy.ID, &copy.CreatedAt); err != nil {
 		return nil, err
 	}
@@ -392,9 +462,11 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt); err != nil {
+	var priority string
+	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority); err != nil {
 		return nil, mapErr(err)
 	}
+	m.Priority = Priority(priority).Normalized()
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
 	}
@@ -484,20 +556,23 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO channels (name, type, config, enabled) VALUES ($1, $2, $3, $4)
+		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at`,
-		c.Name, c.Type, config, c.Enabled,
+		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(),
 	).Scan(&c.ID, &c.CreatedAt)
 }
 
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	var c Channel
+	var timeoutSec int
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = $1`, id,
-	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt)
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE id = $1`, id,
+	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec)
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if err := decryptChannel(p.cipher, &c); err != nil {
 		return nil, err
 	}
@@ -505,7 +580,7 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 }
 
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels`
 	if enabledOnly {
 		q += ` WHERE enabled`
 	}
@@ -518,7 +593,7 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 }
 
 func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE TRUE`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -549,8 +624,8 @@ func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE channels SET name = $2, type = $3, config = $4, enabled = $5 WHERE id = $1`,
-		c.ID, c.Name, c.Type, config, c.Enabled)
+		`UPDATE channels SET name = $2, type = $3, config = $4, enabled = $5, digest_mode = $6, digest_window_seconds = $7, timeout = $8 WHERE id = $1`,
+		c.ID, c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds())
 	if err != nil {
 		return err
 	}
@@ -564,9 +639,35 @@ func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 	return p.deleteByID(ctx, "channels", id)
 }
 
+func (p *Postgres) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT m.id, m.name, m.contract_ids, m.enabled, m.created_at, m.last_matched_at, m.priority
+		 FROM monitors m
+		 JOIN monitor_channels mc ON mc.monitor_id = m.id
+		 WHERE mc.channel_id = $1
+		 ORDER BY m.id`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Monitor
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		m.ChannelIDs, err = p.monitorChannelIDs(ctx, m.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = $1 AND c.enabled
@@ -581,9 +682,11 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 // caller up the stack (API, dashboard, dispatcher) sees plaintext.
 func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	var c Channel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt); err != nil {
+	var timeoutSec int
+	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec); err != nil {
 		return c, err
 	}
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if err := decryptChannel(p.cipher, &c); err != nil {
 		return c, err
 	}
@@ -592,7 +695,35 @@ func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 
 // --- alerts ---
 
-func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error) {
+// CreateAlert wraps the transaction with the store.create_alert span, so
+// the "was it the database write?" half of the slow-alert question has a
+// timeline. The outcome (created | duplicate | suppressed) is an attribute,
+// turning the dedup and cooldown gates into something visible per trace.
+// Only row ids land in attributes; the payload can embed operator data and
+// stays out.
+func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (outcome AlertOutcome, err error) {
+	if p.telemetry == nil {
+		return p.createAlert(ctx, a)
+	}
+	ctx, span := p.telemetry.WithRequestID(ctx, "store.create_alert",
+		trace.WithAttributes(
+			attribute.Int64(telemetry.AttrMonitorID, a.MonitorID),
+			attribute.Int64(telemetry.AttrRuleID, a.RuleID),
+			attribute.String(telemetry.AttrEventID, a.EventID),
+		),
+	)
+	defer func() {
+		if err != nil {
+			telemetry.RecordError(span, err)
+		} else {
+			telemetry.SetAttrs(span, telemetry.AttrOutcome, string(outcome))
+		}
+		span.End()
+	}()
+	return p.createAlert(ctx, a)
+}
+
+func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -616,11 +747,11 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		}
 
 		// A replayed event is a duplicate, not a fresh match, so it must not
-		// inflate the suppressed count. Under the rule lock this check and the
-		// insert below cannot interleave with another writer for the rule.
+		// inflate the suppressed count. The dedup guard lives in alert_dedup
+		// (the partitioned alerts table cannot carry its unique index).
 		var duplicate bool
 		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM alerts WHERE rule_id = $1 AND event_id = $2)`,
+			`SELECT EXISTS (SELECT 1 FROM alert_dedup WHERE rule_id = $1 AND event_id = $2)`,
 			a.RuleID, a.EventID).Scan(&duplicate); err != nil {
 			return "", err
 		}
@@ -648,16 +779,37 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		a.Payload = WithSuppressed(a.Payload, suppressed)
 	}
 
+	// Reserve the dedup key before inserting. This is the race-safe guard that
+	// the unique index on alerts used to provide: a conflicting reservation
+	// means another writer already took this event, and the transaction is
+	// rolled back, so a failed alert insert cannot leave a stranded key.
+	var reserved int
 	err = tx.QueryRow(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload) VALUES ($1, $2, $3, $4)
+		`INSERT INTO alert_dedup (rule_id, event_id, alert_created_at) VALUES ($1, $2, now())
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
-		 RETURNING id, created_at`,
-		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload),
-	).Scan(&a.ID, &a.CreatedAt)
+		 RETURNING 1`,
+		a.RuleID, a.EventID).Scan(&reserved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
 	}
 	if err != nil {
+		return "", err
+	}
+
+	err = tx.QueryRow(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, backfilled, ledger) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 RETURNING id, created_at`,
+		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
+	).Scan(&a.ID, &a.CreatedAt)
+	if err != nil {
+		return "", err
+	}
+
+	// Link the reserved key to the row it produced, and carry the alert's
+	// created_at so retention can drop dedup rows by time.
+	if _, err := tx.Exec(ctx,
+		`UPDATE alert_dedup SET alert_id = $1, alert_created_at = $2 WHERE rule_id = $3 AND event_id = $4`,
+		a.ID, a.CreatedAt, a.RuleID, a.EventID); err != nil {
 		return "", err
 	}
 
@@ -686,14 +838,47 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	return AlertCreated, nil
 }
 
+// CreateAlertGroup creates or increments the alert group identified
+// by key and windowStart. On conflict it increments the count; on
+// first insertion it initializes count to 1. Returns the new count.
+func (p *Postgres) CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error) {
+	var count int64
+	err := p.pool.QueryRow(ctx,
+		`INSERT INTO alert_groups (group_key, window_start, count, first_alert_id)
+		 VALUES ($1, $2, 1, NULL)
+		 ON CONFLICT (group_key, window_start) DO UPDATE
+		 SET count = alert_groups.count + 1
+		 RETURNING count`,
+		key, windowStart,
+	).Scan(&count)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return count, nil
+}
+
+// GroupAlerts creates or increments the alert group for key with
+// windowStart and returns whether the alert should be delivered
+// immediately (first alert in the window) and the current count.
+func (p *Postgres) GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error) {
+	count, err := p.CreateAlertGroup(ctx, key, windowStart)
+	if err != nil {
+		return false, 0, err
+	}
+	return count == 1, count, nil
+}
+
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
+	var ledger int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+		   FROM alerts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason)
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	a.Ledger = uint32(ledger)
 	return &a, nil
 }
 
@@ -706,8 +891,38 @@ func alertSort(s string) string {
 	return "created_at_desc"
 }
 
+// ListAlerts searches alerts. It is a routable read: the alert list is a
+// search over history, so a replica a few milliseconds behind shows the caller
+// the same page minus rows written in that window, which is the trade the
+// replica exists to make. A caller that cannot tolerate it — the rules engine
+// rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE TRUE`
+	q, args := buildAlertQuery(f)
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// ListAlertsPrimary is ListAlerts served by the primary, whatever
+// REPLICA_DATABASE_URL says. It exists for readers that must see this
+// process's own writes — see PrimaryReader.
+func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	q, args := buildAlertQuery(f)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// buildAlertQuery builds the ListAlerts statement and its arguments. Both
+// readers call it so the routed and primary-bound forms cannot drift into
+// returning different pages.
+func buildAlertQuery(f AlertFilter) (string, []any) {
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -723,6 +938,16 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	}
 	if f.ContractID != "" {
 		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
+	}
+	if pattern := AlertSearchPattern(f.Query); pattern != "" {
+		// One bound pattern, both columns. The payload is cast to text so the
+		// search reaches contract_id, event_name and every other field a rule
+		// type stores without the store knowing each type's shape — the cost
+		// of that generality is that it cannot use an index, which is why the
+		// term is capped (MaxAlertSearchLen) rather than long by default.
+		// ESCAPE makes the pattern's own wildcards literal.
+		p := arg(pattern)
+		q += ` AND (event_id ILIKE ` + p + ` ESCAPE '\' OR payload::text ILIKE ` + p + ` ESCAPE '\')`
 	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ` + arg(f.From)
@@ -749,24 +974,103 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 		q += ` ORDER BY created_at DESC, id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
+	return q, args
+}
 
-	rows, err := p.pool.Query(ctx, q, args...)
+// scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
+// so the column order and the ledger/retracted_at mapping cannot drift.
+func scanAlert(row pgx.CollectableRow) (Alert, error) {
+	var a Alert
+	var ledger int64
+	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason)
+	a.Ledger = uint32(ledger)
+	return a, err
+}
+
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
+// ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
+// with the same ordering DeleteExpiredAlerts uses so the row an archiver reads
+// is the row the delete removes.
+func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
+		cutoff, limit)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Alert, error) {
-		var a Alert
-		err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
-		return a, err
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// --- ledger hashes and reorg retraction ---
+
+func (p *Postgres) RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, h := range hashes {
+		batch.Queue(`
+			INSERT INTO ledger_hashes (ledger, hash) VALUES ($1, $2)
+			ON CONFLICT (ledger) DO UPDATE SET hash = EXCLUDED.hash, observed_at = now()
+			WHERE ledger_hashes.hash IS DISTINCT FROM EXCLUDED.hash`, int64(h.Ledger), h.Hash)
+	}
+	br := p.pool.SendBatch(ctx, batch)
+	defer br.Close() //nolint:errcheck // errors surface on the per-command Exec below
+	for range hashes {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Postgres) LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT ledger, hash FROM ledger_hashes WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger`,
+		int64(from), int64(to))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (LedgerHash, error) {
+		var h LedgerHash
+		var ledger int64
+		err := row.Scan(&ledger, &h.Hash)
+		h.Ledger = uint32(ledger)
+		return h, err
 	})
 }
 
+func (p *Postgres) PruneLedgerHashes(ctx context.Context, before uint32) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM ledger_hashes WHERE ledger < $1`, int64(before))
+	return err
+}
+
+func (p *Postgres) RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error) {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET retracted_at = $1 WHERE ledger >= $2 AND retracted_at IS NULL`,
+		at.UTC(), int64(ledger))
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error {
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO delivery_attempts (alert_id, channel_id, status, response_snippet)
-		 VALUES ($1, $2, $3, $4) RETURNING id, attempted_at`,
+	// The FK to the partitioned alerts table is (alert_id, alert_created_at),
+	// so the parent's created_at is read in the same statement. A missing
+	// alert yields no row, which mapErr turns into ErrNotFound just as the
+	// old single-column FK violation did.
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO delivery_attempts (alert_id, alert_created_at, channel_id, status, response_snippet)
+		 SELECT a.id, a.created_at, $2, $3, $4 FROM alerts a WHERE a.id = $1
+		 RETURNING id, attempted_at`,
 		d.AlertID, d.ChannelID, d.Status, d.ResponseSnippet,
-	).Scan(&d.ID, &d.AttemptedAt)
+	).Scan(&d.ID, &d.AttemptedAt))
 }
 
 func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error) {
@@ -791,6 +1095,192 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, stat
 	})
 }
 
+// --- maintenance windows ---
+
+func (p *Postgres) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(),
+	).Scan(&w.ID, &w.CreatedAt))
+}
+
+func (p *Postgres) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
+	return scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = $1`, id))
+}
+
+func (p *Postgres) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
+	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.Active || f.Upcoming {
+		at := f.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if f.Active {
+			q += ` AND start_at <= ` + arg(at.UTC()) + ` AND end_at > ` + arg(at.UTC())
+		} else {
+			q += ` AND start_at > ` + arg(at.UTC())
+		}
+	}
+	q += ` ORDER BY start_at DESC, id DESC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (MaintenanceWindow, error) {
+		w, err := scanMaintenanceWindow(row)
+		if err != nil {
+			return MaintenanceWindow{}, err
+		}
+		return *w, nil
+	})
+}
+
+func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE maintenance_windows
+		 SET reason = $2, scope = $3, monitor_id = $4, contract_id = $5, start_at = $6, end_at = $7
+		 WHERE id = $1`,
+		w.ID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC())
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "maintenance_windows", id)
+}
+
+// ActiveMaintenanceWindow is the delivery path's single indexed lookup: a
+// window is active when [start_at, end_at) covers at and its scope covers
+// the alert. The most specific scope wins (contract, then monitor, then
+// global) so a contract's reason is preferred over a broader one's.
+func (p *Postgres) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
+	w, err := scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows
+		 WHERE start_at <= $1 AND end_at > $1
+		   AND (scope = 'global'
+		        OR (scope = 'monitor' AND monitor_id = $2)
+		        OR (scope = 'contract' AND contract_id = $3))
+		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
+		 LIMIT 1`, at.UTC(), monitorID, contractID))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (p *Postgres) SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET suppressed = TRUE, suppression_reason = $2 WHERE id = $1`,
+		alertID, reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- inhibitions ---
+
+func (p *Postgres) CreateInhibition(ctx context.Context, in *Inhibition) error {
+	if in.FiringWindowSeconds <= 0 {
+		in.FiringWindowSeconds = DefaultInhibitionWindowSeconds
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO alert_inhibitions (source_rule_id, target_rule_id, firing_window_seconds)
+		 VALUES ($1, $2, $3) RETURNING created_at`,
+		in.SourceRuleID, in.TargetRuleID, in.FiringWindowSeconds,
+	).Scan(&in.CreatedAt)
+}
+
+func (p *Postgres) scanInhibition(row pgx.CollectableRow) (Inhibition, error) {
+	var in Inhibition
+	err := row.Scan(&in.SourceRuleID, &in.TargetRuleID, &in.FiringWindowSeconds, &in.CreatedAt)
+	return in, err
+}
+
+func (p *Postgres) ListInhibitions(ctx context.Context) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions ORDER BY source_rule_id, target_rule_id`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions WHERE target_rule_id = $1 ORDER BY source_rule_id`, targetRuleID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) DeleteInhibition(ctx context.Context, sourceRuleID, targetRuleID int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM alert_inhibitions WHERE source_rule_id = $1 AND target_rule_id = $2`,
+		sourceRuleID, targetRuleID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func scanMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
+	var w MaintenanceWindow
+	err := r.Scan(&w.ID, &w.Reason, &w.Scope, &w.MonitorID, &w.ContractID, &w.StartAt, &w.EndAt, &w.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &w, nil
+}
+
+func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error) {
+	// The cutoff is computed in Go so both backends share the decision;
+	// Postgres compares timestamptz, SQLite compares the fixed-format TEXT.
+	cutoff := time.Now().UTC().Truncate(time.Millisecond).Add(-window)
+	var fired bool
+	err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM alerts WHERE rule_id = $1 AND created_at >= $2)`,
+		ruleID, cutoff).Scan(&fired)
+	return fired, err
+}
+
+func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
+	// No row check: the alert may have been pruned between dispatch and
+	// this write, and that must not fail the dispatch path.
+	_, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET inhibited_by_rule_id = $1 WHERE id = $2`, sourceRuleID, alertID)
+	return err
+}
+
 // --- ingest state ---
 
 func (p *Postgres) GetIngestState(ctx context.Context) (IngestState, error) {
@@ -813,11 +1303,159 @@ func (p *Postgres) SetIngestState(ctx context.Context, s IngestState) error {
 	return err
 }
 
+// --- digest queue ---
+
+func (p *Postgres) PushDigestAlert(ctx context.Context, channelID int64, payload json.RawMessage) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO pending_digests (channel_id, payload) VALUES ($1, $2)`, channelID, payload)
+	return err
+}
+
+func (p *Postgres) ListDigestAlerts(ctx context.Context, channelID int64) ([]DigestAlert, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, channel_id, payload, created_at FROM pending_digests WHERE channel_id = $1 ORDER BY id`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DigestAlert
+	for rows.Next() {
+		var d DigestAlert
+		var payload []byte
+		if err := rows.Scan(&d.ID, &d.ChannelID, &payload, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		d.Payload = json.RawMessage(payload)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) DeleteDigestAlerts(ctx context.Context, channelID int64, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM pending_digests WHERE channel_id = $1 AND id = ANY($2)`, channelID, ids)
+	return err
+}
+
+// --- audit log ---
+
+func (p *Postgres) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
+	diff := e.Diff
+	if len(diff) == 0 {
+		diff = json.RawMessage(`{}`)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+		e.Actor, e.Action, e.TargetType, e.TargetID, diff).Scan(&e.ID, &e.CreatedAt)
+}
+
+func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
+	where := []string{"TRUE"}
+	args := []any{}
+	if f.TargetType != "" {
+		args = append(args, f.TargetType)
+		where = append(where, fmt.Sprintf("target_type = $%d", len(args)))
+	}
+	if f.TargetID != 0 {
+		args = append(args, f.TargetID)
+		where = append(where, fmt.Sprintf("target_id = $%d", len(args)))
+	}
+	if !f.From.IsZero() {
+		args = append(args, f.From)
+		where = append(where, fmt.Sprintf("created_at >= $%d", len(args)))
+	}
+	if !f.To.IsZero() {
+		args = append(args, f.To)
+		where = append(where, fmt.Sprintf("created_at <= $%d", len(args)))
+	}
+	limit := clampAuditLimit(f.Limit)
+	args = append(args, limit)
+	q := `SELECT id, actor, action, target_type, target_id, diff, created_at FROM audit_log WHERE ` +
+		strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var diff []byte
+		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &diff, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Diff = json.RawMessage(diff)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// clampAuditLimit bounds a caller-supplied page size, defaulting to 50 and
+// capping at 500 so a typo cannot scan the whole log in one request.
+func clampAuditLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 500 {
+		return 500
+	}
+	return limit
+}
+
+// --- backfills ---
+
+func (p *Postgres) GetBackfill(ctx context.Context, monitorID int64) (Backfill, error) {
+	var b Backfill
+	var fromLedger, toLedger, nextLedger int64
+	err := p.pool.QueryRow(ctx,
+		`SELECT monitor_id, from_ledger, to_ledger, next_ledger, cursor, deliver, complete, updated_at
+		   FROM backfills WHERE monitor_id = $1`, monitorID,
+	).Scan(&b.MonitorID, &fromLedger, &toLedger, &nextLedger, &b.Cursor, &b.Deliver, &b.Complete, &b.UpdatedAt)
+	if err != nil {
+		return b, mapErr(err)
+	}
+	b.FromLedger = uint32(fromLedger)
+	b.ToLedger = uint32(toLedger)
+	b.NextLedger = uint32(nextLedger)
+	return b, nil
+}
+
+// UpsertBackfill writes the run's resume point, replacing any previous row for
+// the monitor. One row per monitor is what makes "resume where it stopped"
+// unambiguous.
+func (p *Postgres) UpsertBackfill(ctx context.Context, b *Backfill) error {
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO backfills (monitor_id, from_ledger, to_ledger, next_ledger, cursor, deliver, complete)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (monitor_id) DO UPDATE SET
+		     from_ledger = EXCLUDED.from_ledger,
+		     to_ledger   = EXCLUDED.to_ledger,
+		     next_ledger = EXCLUDED.next_ledger,
+		     cursor      = EXCLUDED.cursor,
+		     deliver     = EXCLUDED.deliver,
+		     complete    = EXCLUDED.complete,
+		     updated_at  = now()
+		 RETURNING updated_at`,
+		b.MonitorID, int64(b.FromLedger), int64(b.ToLedger), int64(b.NextLedger),
+		b.Cursor, b.Deliver, b.Complete,
+	).Scan(&b.UpdatedAt)
+}
+
 // --- stats ---
 
+// GetStats returns the dashboard's headline counters. It is a routable read:
+// the numbers are aggregate counts over a table that only ever grows, so a
+// replica a moment behind reports a total that is a moment stale rather than
+// wrong. Nothing is written back from these values, so a stale read cannot
+// turn into a stale write.
 func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	var s Stats
-	err := p.pool.QueryRow(ctx, `
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
+	}, `
 		SELECT
 			(SELECT count(*) FROM monitors),
 			(SELECT count(*) FROM rules),
@@ -825,18 +1463,20 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM alerts),
 			(SELECT count(*) FROM alerts WHERE created_at > now() - interval '24 hours'),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
-			(SELECT updated_at FROM ingest_state WHERE id = 1)`,
-	).Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
+			(SELECT updated_at FROM ingest_state WHERE id = 1)`)
 	return s, err
 }
 
+// AlertCountsByDay returns the daily alert totals behind the dashboard chart.
+// Routable for the same reason as GetStats: a day's bar can lag a moment
+// behind real time, and no decision is taken from the value.
 func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
 	// generate_series fills every UTC calendar day in the window, including
 	// zeroes, so a quiet day is an explicit 0 rather than a missing bar.
 	// date_trunc / ::date run on (timestamptz AT TIME ZONE 'UTC') so the
 	// session TimeZone cannot shift a late-UTC event into the next local day.
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.queryRows(ctx, `
 		WITH days AS (
 			SELECT generate_series(
 				((now() AT TIME ZONE 'UTC')::date - ($1::int - 1)),
@@ -865,7 +1505,212 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 	return out, rows.Err()
 }
 
+// GetMonitorStats reports one monitor's alert, delivery and per-rule counts.
+// Two statements, whatever the monitor's rule count: the aggregate row and one
+// grouped per-rule count. Routable reads for the same reason as GetStats —
+// every number here is a count over history that only ever grows, and nothing
+// is written back from them.
+//
+// The existence probe rides along in the aggregate rather than being a third
+// query, so a monitor deleted a moment ago reports ErrNotFound instead of a
+// page of zeroes that looks like a healthy but quiet monitor.
+func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
+	var (
+		ms     MonitorStats
+		exists bool
+	)
+	ms.MonitorID = monitorID
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
+			&ms.LastAlertAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
+	}, `
+		SELECT
+			(SELECT count(*) FROM monitors WHERE id = $1) > 0,
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '7 days'),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $2),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND da.status = $3)`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed)
+	if err != nil {
+		return ms, err
+	}
+	if !exists {
+		return ms, ErrNotFound
+	}
+
+	rows, err := p.queryRows(ctx, `
+		SELECT r.id, r.type, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id
+		WHERE r.monitor_id = $1
+		GROUP BY r.id, r.type
+		ORDER BY r.id`, monitorID)
+	if err != nil {
+		return ms, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Type, &rc.Alerts); err != nil {
+			return ms, err
+		}
+		ms.Rules = append(ms.Rules, rc)
+	}
+	return ms, rows.Err()
+}
+
 // --- helpers ---
+
+// --- saved searches ---
+
+func (p *Postgres) CreateSavedSearch(ctx context.Context, s *SavedSearch) error {
+	filter, _ := json.Marshal(s.Filter)
+	if s.IsDefault {
+		_, _ = p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO saved_searches (name, filter, is_default) VALUES ($1, $2, $3) RETURNING id, created_at`,
+		s.Name, filter, s.IsDefault).Scan(&s.ID, &s.CreatedAt)
+}
+
+func (p *Postgres) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SavedSearch
+	for rows.Next() {
+		var s SavedSearch
+		var filter []byte
+		if err := rows.Scan(&s.ID, &s.Name, &filter, &s.IsDefault, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(filter, &s.Filter)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
+	var s SavedSearch
+	var filter []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = $1`, id).
+		Scan(&s.ID, &s.Name, &filter, &s.IsDefault, &s.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	_ = json.Unmarshal(filter, &s.Filter)
+	return &s, nil
+}
+
+func (p *Postgres) DeleteSavedSearch(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "saved_searches", id)
+}
+
+func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
+	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) ClearDefaultSearch(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- monitor templates ---
+
+func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON).Scan(&t.ID, &t.CreatedAt)
+}
+
+func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
+	var t MonitorTemplate
+	var rulesJSON, paramsJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = $1`, id).
+		Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &t.ChannelIDs, &paramsJSON, &t.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	_ = json.Unmarshal(rulesJSON, &t.Rules)
+	_ = json.Unmarshal(paramsJSON, &t.Parameters)
+	if t.ChannelIDs == nil {
+		t.ChannelIDs = []int64{}
+	}
+	return &t, nil
+}
+
+func (p *Postgres) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MonitorTemplate
+	for rows.Next() {
+		var t MonitorTemplate
+		var rulesJSON, paramsJSON []byte
+		if err := rows.Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &t.ChannelIDs, &paramsJSON, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(rulesJSON, &t.Rules)
+		_ = json.Unmarshal(paramsJSON, &t.Parameters)
+		if t.ChannelIDs == nil {
+			t.ChannelIDs = []int64{}
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6`,
+		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON, t.ID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteMonitorTemplate(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "monitor_templates", id)
+}
 
 func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error {
 	tag, err := p.pool.Exec(ctx, `DELETE FROM `+table+` WHERE id = $1`, id)
@@ -881,6 +1726,13 @@ func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error
 func jsonOrEmpty(raw json.RawMessage) []byte {
 	if len(raw) == 0 {
 		return []byte(`{}`)
+	}
+	return raw
+}
+
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
 	}
 	return raw
 }
@@ -916,4 +1768,10 @@ func mapErr(err error) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
 	}
 	return err
+}
+
+// ListAlertsStream implements Store by paging ListAlerts with the keyset
+// cursor, so peak memory is one page rather than the whole result set.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
+	return streamAlerts(ctx, f, p.ListAlerts, fn)
 }

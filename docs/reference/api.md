@@ -40,6 +40,7 @@ reach the port. Set `API_TOKEN` on anything beyond a trusted network.
 | `POST /monitors` | Create. Body: `name`, `contract_ids` (validated strkeys), optional `enabled`, `channel_ids`. |
 | `GET /monitors` | List. `?enabled=true` filters to enabled. |
 | `GET /monitors/{id}` | Get one (includes `channel_ids`). |
+| `GET /monitors/{id}/stats` | Per-monitor counts: `alerts`, `alerts_last_24h`, `alerts_last_7d`, `last_alert_at` (omitted when the monitor has never alerted), `deliveries_succeeded`, `deliveries_failed`, and `rules` — one `{rule_id, type, alerts}` entry per rule, always an array. A monitor with no history returns explicit zeroes, not nulls; an unknown id is a 404, because "this monitor has not fired" and "there is no such monitor" are different answers. |
 | `PATCH /monitors/{id}` | Partial update; any subset of the create fields. `channel_ids` replaces attachments. |
 | `DELETE /monitors/{id}` | Delete (cascades to rules and alerts). |
 
@@ -61,25 +62,38 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 | `PATCH /monitors/{id}/rules/{ruleID}` | Partial update; params re-validated. |
 | `DELETE /monitors/{id}/rules/{ruleID}` | Delete. |
 
-Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md). Invalid params are rejected with `400` at create/update time.
+Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md). Invalid params are rejected with `400` at create/update time.
 
 ## Channels
 
 | Method & path | Description |
 | --- | --- |
-| `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`. |
+| `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`, optional `digest_mode` (`""` or `"window"`) and `digest_window_seconds` (must be > 0 when the mode is `window`). See [Digest mode](../channels/digest.md). |
 | `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** |
 | `PATCH /channels/{id}` | Partial update; config re-validated. |
 | `DELETE /channels/{id}` | Delete. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 
-Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
+Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [ntfy](../channels/ntfy.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
+
+## Maintenance windows
+
+| Method & path | Description |
+| --- | --- |
+| `POST /maintenance-windows` | Create. Body: `reason`, `scope` (`global`/`monitor`/`contract`), `start_at`, `end_at`, plus `monitor_id` or `contract_id` for those scopes. `end_at` must be after `start_at`. |
+| `GET /maintenance-windows` | List. `?active=true` filters to windows containing now; `?upcoming=true` to future windows. |
+| `GET /maintenance-windows/{id}` | Get one. |
+| `PATCH /maintenance-windows/{id}` | Partial update; re-validated. |
+| `DELETE /maintenance-windows/{id}` | Delete. |
+
+Alerts raised inside a window are still stored; they are marked `suppressed`
+with the window's reason and not delivered. See [Maintenance windows](../guides/maintenance-windows.md).
 
 ## Alerts
 
 | Method & path | Description |
 | --- | --- |
-| `GET /alerts` | History. Query: `monitor_id`, `rule_id`, `contract_id` (matches `payload.contract_id`), `from`/`to` (RFC 3339), `sort` (`created_at_desc` default, `created_at_asc`; anything else is 400), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`; comparison follows `sort`). |
+| `GET /alerts` | History. Query: `monitor_id`, `rule_id`, `contract_id` (matches `payload.contract_id`), `q` (case-insensitive substring, matched against the alert's `event_id` and the full text of its JSON payload — which is where `contract_id`, `event_name` and every other rule-specific field live, so no per-rule-type field list is needed. `%`, `_` and `\` in the term are literal, not wildcards. Blank or whitespace-only means no search filter; over 256 characters is 400. Composes with every other filter and with `cursor`, so a searched page keeps its search while paging), `from`/`to` (RFC 3339), `sort` (`created_at_desc` default, `created_at_asc`; anything else is 400), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`; comparison follows `sort`). |
 | `GET /alerts.csv` | CSV export of the same filtered alerts (same query params as `GET /alerts`; `cursor` is ignored). Responds `text/csv` with an attachment filename carrying the requested date range. Columns, in order: `id`, `monitor_name`, `rule_id`, `contract_id`, `event_name`, `event_id`, `ledger`, `created_at` (RFC 3339), `payload` (the raw JSON). Values beginning with `=`, `+`, `-` or `@` are prefixed with an apostrophe so spreadsheet software treats them as text, not formulas. With no `limit` the export is capped at 10000 rows; an explicit `limit` is honoured up to that cap. |
 | `GET /alerts/{id}/deliveries` | Delivery attempts for one alert. `?status=success` or `?status=failed` filters in SQL; omit for all. Unknown values are `400`. |
 
@@ -95,3 +109,4 @@ curl -s 'localhost:8080/api/v1/alerts?monitor_id=1&from=2026-07-01T00:00:00Z&lim
 | `GET /health` | Checks the database and the RPC. `200` when both are ok, `503` with per-dependency detail when degraded. Adds `leader`, `leader_election` and (while polling) `leader_since` so an operator can see which replica holds the poller lease; a follower is still `200`, because it serves everything except polling. |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. |
+| `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. |
