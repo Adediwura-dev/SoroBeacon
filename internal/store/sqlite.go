@@ -1023,6 +1023,14 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 		q += ` AND json_extract(payload, '$.contract_id') = ?`
 		args = append(args, f.ContractID)
 	}
+	if pattern := AlertSearchPattern(f.Query); pattern != "" {
+		// The same literal pattern the Postgres backend feeds ILIKE: SQLite's
+		// LIKE is already case-insensitive for ASCII, which is all a contract
+		// id or an event name is, and ESCAPE keeps the term's own wildcards
+		// literal. payload is stored as TEXT, so no cast is needed.
+		q += ` AND (event_id LIKE ? ESCAPE '\' OR payload LIKE ? ESCAPE '\')`
+		args = append(args, pattern, pattern)
+	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ?`
 		args = append(args, sqliteTimeString(f.From))
@@ -1601,6 +1609,78 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 		out = append(out, AlertDayCount{Day: day, Count: count})
 	}
 	return out, rows.Err()
+}
+
+// GetMonitorStats mirrors the Postgres backend statement for statement: the
+// same two queries, the same explicit zeroes, ErrNotFound for a monitor that
+// is not there. The windows are computed in Go rather than with strftime
+// because the fixed-width TEXT layout already makes a text comparison a
+// chronological one — the same trick GetStats uses.
+//
+// The monitor id repeats per subselect because this backend's placeholders are
+// positional. That is the cost of the second guarantee in the issue: a monitor
+// with twenty rules still costs two queries, not twenty.
+func (s *SQLite) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
+	var (
+		ms     MonitorStats
+		exists int64
+		lastAt sql.NullString
+	)
+	ms.MonitorID = monitorID
+	day := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
+	week := sqliteTimeString(time.Now().UTC().Add(-7 * 24 * time.Hour))
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM monitors WHERE id = ?),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ?),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND created_at > ?),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND created_at > ?),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = ?),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = ? AND da.status = ?),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = ? AND da.status = ?)`,
+		monitorID, monitorID,
+		monitorID, day,
+		monitorID, week,
+		monitorID,
+		monitorID, DeliveryStatusSuccess,
+		monitorID, DeliveryStatusFailed).
+		Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
+			&lastAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
+	if err != nil {
+		return ms, mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return ms, ErrNotFound
+	}
+	if lastAt.Valid && lastAt.String != "" {
+		at, err := parseSQLiteTime(lastAt.String)
+		if err != nil {
+			return ms, err
+		}
+		ms.LastAlertAt = &at
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.id, r.type, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id
+		WHERE r.monitor_id = ?
+		GROUP BY r.id, r.type
+		ORDER BY r.id`, monitorID)
+	if err != nil {
+		return ms, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Type, &rc.Alerts); err != nil {
+			return ms, mapSQLiteErr(err)
+		}
+		ms.Rules = append(ms.Rules, rc)
+	}
+	return ms, rows.Err()
 }
 
 // --- saved searches ---

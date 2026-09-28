@@ -31,6 +31,9 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
+	return store.MonitorStats{}, nil
+}
 func (emptyStore) AlertCountsByDay(context.Context, int) ([]store.AlertDayCount, error) {
 	return nil, nil
 }
@@ -392,13 +395,15 @@ func TestAlertsPageFilterControlsAndPreservedPaging(t *testing.T) {
 }
 
 func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
-	if got := alertFilterQuery(0, 0, "", "", ""); got != "" {
+	if got := alertFilterQuery(store.AlertFilter{}); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := alertFilterQuery(0, 0, "", "", "created_at_desc"); got != "" {
+	if got := alertFilterQuery(store.AlertFilter{Sort: "created_at_desc"}); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := alertFilterQuery(7, 9, "CAAA", "", "created_at_asc")
+	got := alertFilterQuery(store.AlertFilter{
+		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc",
+	})
 	if !strings.Contains(got, "monitor_id=7") || !strings.Contains(got, "rule_id=9") ||
 		!strings.Contains(got, "contract_id=CAAA") || !strings.Contains(got, "sort=created_at_asc") ||
 		!strings.HasSuffix(got, "&") {
@@ -406,14 +411,38 @@ func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
 	}
 }
 
+// TestAlertFilterQueryCarriesSearchAndRange is the paging half of #98 and #321:
+// a search term or a date window that is dropped by the Older link turns the
+// second page into a different query than the one the operator ran.
+func TestAlertFilterQueryCarriesSearchAndRange(t *testing.T) {
+	from := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 3, 8, 0, 0, 0, 0, time.UTC)
+	got := alertFilterQuery(store.AlertFilter{
+		Query: "transfer", From: from, To: to,
+	})
+	for _, want := range []string{"q=transfer", "from=2026-03-01T00%3A00%3A00Z", "to=2026-03-08T00%3A00%3A00Z"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("filter query %q missing %q", got, want)
+		}
+	}
+	// The bounds leave as instants, never as the calendar dates the form
+	// collected: re-deriving the exclusive end from a date would add a day to
+	// the range on every page.
+	if strings.Contains(got, "from=2026-03-01&") {
+		t.Fatalf("range must not round-trip as a bare date: %q", got)
+	}
+}
+
 // TestAlertExportHref covers the dashboard CSV link: it must target the
 // JSON API's export endpoint, drop the (meaningless) cursor, and preserve
 // the filters applied to the list on screen.
 func TestAlertExportHref(t *testing.T) {
-	if got := alertExportHref(0, 0, "", "", ""); got != "/api/v1/alerts.csv" {
+	if got := alertExportHref(store.AlertFilter{}); got != "/api/v1/alerts.csv" {
 		t.Fatalf("defaults = %q, want the bare export URL", got)
 	}
-	got := string(alertExportHref(7, 9, "CAAA", "", "created_at_asc"))
+	got := string(alertExportHref(store.AlertFilter{
+		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc",
+	}))
 	for _, want := range []string{"/api/v1/alerts.csv?", "monitor_id=7", "rule_id=9", "contract_id=CAAA", "sort=created_at_asc"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("export href %q missing %q", got, want)
@@ -421,6 +450,59 @@ func TestAlertExportHref(t *testing.T) {
 	}
 	if strings.Contains(got, "cursor=") {
 		t.Fatalf("export href must not carry the list cursor: %q", got)
+	}
+}
+
+// TestAlertExportHrefSendsTheAPIFormat checks the other half of #321's
+// "accepted formats match what the API already accepts": the picker sends a
+// calendar date, but the export link is an API URL, so it must go out as the
+// RFC 3339 instant the API parses.
+func TestAlertExportHrefSendsTheAPIFormat(t *testing.T) {
+	from, fromValue, ok := parseAlertDate("2026-03-01", false)
+	if !ok || fromValue != "2026-03-01" {
+		t.Fatalf("parseAlertDate(from) = %v, %q, %v", from, fromValue, ok)
+	}
+	to, toValue, ok := parseAlertDate("2026-03-01", true)
+	if !ok || toValue != "2026-03-01" {
+		t.Fatalf("parseAlertDate(to) = %v, %q, %v", to, toValue, ok)
+	}
+	// One picked day is the whole day: from is that midnight, to the next.
+	if to.Sub(from) != 24*time.Hour {
+		t.Fatalf("one-day range = %v..%v (%s), want 24h", from, to, to.Sub(from))
+	}
+	href := string(alertExportHref(store.AlertFilter{Query: "mint", From: from, To: to}))
+	for _, want := range []string{"from=2026-03-01T00%3A00%3A00Z", "to=2026-03-02T00%3A00%3A00Z", "q=mint"} {
+		if !strings.Contains(href, want) {
+			t.Fatalf("export href %q missing %q", href, want)
+		}
+	}
+
+	// The instant form is what the Older link round-trips, so it has to come
+	// back as the same window and the same day in the picker.
+	roundTrip, display, ok := parseAlertDate(to.Format(time.RFC3339), true)
+	if !ok || !roundTrip.Equal(to) {
+		t.Fatalf("round-tripped end bound = %v (%v), want %v", roundTrip, ok, to)
+	}
+	if display != "2026-03-01" {
+		t.Fatalf("round-tripped picker value = %q, want the day it closes", display)
+	}
+}
+
+// TestParseAlertDateRejectsGarbage keeps a typo'd or hand-edited bound visible
+// as a message instead of silently widening the list back to everything.
+func TestParseAlertDateRejectsGarbage(t *testing.T) {
+	if _, display, ok := parseAlertDate("yesterday", true); ok || display != "yesterday" {
+		t.Fatalf("bad date = %q, %v; want unreadable and echoed back", display, ok)
+	}
+	// Blank is "no bound", not an error, and still round-trips as blank.
+	bound, display, ok := parseAlertDate("", false)
+	if !ok || !bound.IsZero() || display != "" {
+		t.Fatalf("blank = %v, %q, %v", bound, display, ok)
+	}
+	// A date the API would reject as a bare calendar day is not a date the
+	// dashboard sends to the API; alertExportHref is what converts it.
+	if _, _, ok := parseAlertDate("2026-13-45", false); ok {
+		t.Fatal("month 45 accepted as a date")
 	}
 }
 
