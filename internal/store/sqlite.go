@@ -1068,6 +1068,8 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	return out, rows.Err()
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
 func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string
