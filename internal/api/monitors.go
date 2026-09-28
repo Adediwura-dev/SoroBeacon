@@ -126,6 +126,34 @@ func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+// monitorStats serves GET /monitors/{id}/stats — the per-monitor counts
+// GET /stats cannot answer, because an instance-wide total says nothing about
+// whether one particular monitor is doing any work.
+//
+// An unknown monitor is a 404 rather than a body of zeroes: "this monitor has
+// not fired" and "there is no such monitor" are different answers to the same
+// question, and a caller that cannot tell them apart will conclude a deleted
+// monitor is a healthy quiet one.
+func (s *Server) monitorStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	stats, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// A monitor with no rules serialises as an empty array. The counts are
+	// explicit zeroes for the same reason: absence and zero mean different
+	// things to a client, and this endpoint only promises numbers.
+	if stats.Rules == nil {
+		stats.Rules = []store.RuleMatchCount{}
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {

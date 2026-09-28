@@ -198,6 +198,25 @@
         }
       }
     },
+    "/monitors/{id}/stats": {
+      "parameters": [ { "$ref": "#/components/parameters/ID" } ],
+      "get": {
+        "summary": "Per-monitor statistics",
+        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "responses": {
+          "200": {
+            "description": "MonitorStats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MonitorStats" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/monitors/{id}/duplicate": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -563,22 +582,28 @@
             "description": "Exact match on payload.contract_id"
           },
           {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
             "name": "sort",
             "in": "query",
             "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
             "description": "Keyset order; anything else is 400"
           },
           {
-            "name": "since",
+            "name": "from",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 lower bound on alert creation"
+            "description": "RFC 3339 lower bound on alert creation, inclusive"
           },
           {
-            "name": "until",
+            "name": "to",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 upper bound on alert creation"
+            "description": "RFC 3339 upper bound on alert creation, exclusive"
           },
           {
             "name": "limit",
@@ -651,6 +676,12 @@
             "description": "Exact match on payload.contract_id"
           },
           {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
             "name": "from",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
@@ -708,6 +739,12 @@
             "in": "query",
             "schema": { "type": "string" },
             "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "from",
@@ -1330,6 +1367,31 @@
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
           }
+        }
+      },
+      "MonitorStats": {
+        "type": "object",
+        "properties": {
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "alerts": { "type": "integer", "format": "int64" },
+          "alerts_last_24h": { "type": "integer", "format": "int64" },
+          "alerts_last_7d": { "type": "integer", "format": "int64" },
+          "last_alert_at": { "type": "string", "format": "date-time", "description": "Absent when the monitor has never alerted" },
+          "deliveries_succeeded": { "type": "integer", "format": "int64" },
+          "deliveries_failed": { "type": "integer", "format": "int64" },
+          "rules": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleMatchCount" },
+            "description": "Every rule of the monitor, matched or not"
+          }
+        }
+      },
+      "RuleMatchCount": {
+        "type": "object",
+        "properties": {
+          "rule_id": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "alerts": { "type": "integer", "format": "int64" }
         }
       },
       "MonitorInput": {
