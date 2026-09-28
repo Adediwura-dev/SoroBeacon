@@ -22,6 +22,7 @@ import (
 const (
 	TypeEventEmitted       = "event_emitted"
 	TypeValueThreshold     = "value_threshold"
+	TypeContractAllowlist  = "contract_allowlist"
 	TypeEventNameGlob      = "event_name_glob"
 	TypeNumericRange       = "numeric_range"
 	TypeFrequencyThreshold = "frequency_threshold"
@@ -104,6 +105,7 @@ func NewRegistry() *Registry {
 	r := &Registry{evaluators: map[string]RuleEvaluator{}}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
+	r.Register(TypeContractAllowlist, &ContractAllowlist{})
 	r.Register(TypeEventNameGlob, EventNameGlob{})
 	r.Register(TypeNumericRange, NumericRange{})
 	r.Register(TypeTokenEvent, TokenEvent{})
