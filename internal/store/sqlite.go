@@ -927,10 +927,10 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	var id int64
 	var created string
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, ledger) VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, ledger) VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
 		 RETURNING id, created_at`,
-		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), int64(a.Ledger),
+		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), int64(a.Ledger),
 	).Scan(&id, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
@@ -1001,7 +1001,7 @@ func (s *SQLite) GroupAlerts(ctx context.Context, key string, windowStart time.T
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE id = ?`, id))
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -1009,7 +1009,7 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE 1 = 1`
 	args := []any{}
 	if f.MonitorID != 0 {
 		q += ` AND monitor_id = ?`
@@ -1070,75 +1070,15 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 
 // ListAlertsStream streams alerts matching the filter to the callback.
 // It is used for large exports where loading all rows into memory is not feasible.
-func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, inhibited_by_rule_id FROM alerts WHERE 1 = 1`
-	args := []any{}
-	if f.MonitorID != 0 {
-		q += ` AND monitor_id = ?`
-		args = append(args, f.MonitorID)
-	}
-	if f.RuleID != 0 {
-		q += ` AND rule_id = ?`
-		args = append(args, f.RuleID)
-	}
-	if f.ContractID != "" {
-		q += ` AND json_extract(payload, '$.contract_id') = ?`
-		args = append(args, f.ContractID)
-	}
-	if !f.From.IsZero() {
-		q += ` AND created_at >= ?`
-		args = append(args, sqliteTimeString(f.From))
-	}
-	if !f.To.IsZero() {
-		q += ` AND created_at < ?`
-		args = append(args, sqliteTimeString(f.To))
-	}
-	sort := alertSort(f.Sort)
-	if f.AfterID != 0 {
-		cursor := `(SELECT created_at, id FROM alerts WHERE id = ?)`
-		if sort == "created_at_asc" {
-			q += ` AND (created_at, id) > ` + cursor
-		} else {
-			q += ` AND (created_at, id) < ` + cursor
-		}
-		args = append(args, f.AfterID)
-	}
-	if sort == "created_at_asc" {
-		q += ` ORDER BY created_at ASC, id ASC`
-	} else {
-		q += ` ORDER BY created_at DESC, id DESC`
-	}
-	if f.Limit > 0 {
-		q += ` LIMIT ?`
-		args = append(args, pageLimit(f.Limit))
-	}
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		a, err := scanSQLiteAlert(rows)
-		if err != nil {
-			return err
-		}
-		if err := cb(a); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
-}
-
 func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string
+	var enrichment sql.NullString
 	var created string
 	var ledger int64
 	var retracted sql.NullString
 	var inhibited sql.NullInt64
-	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &created, &ledger, &retracted, &inhibited); err != nil {
+	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	if inhibited.Valid {
@@ -1146,6 +1086,9 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 		a.InhibitedByRuleID = &v
 	}
 	a.Payload = json.RawMessage(payload)
+	if enrichment.Valid {
+		a.Enrichment = json.RawMessage(enrichment.String)
+	}
 	a.Ledger = uint32(ledger)
 	var err error
 	if a.CreatedAt, err = parseSQLiteTime(created); err != nil {
@@ -1237,7 +1180,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, inhibited_by_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {

@@ -185,12 +185,13 @@ type Channel struct {
 // TOID-based id; (RuleID, EventID) is unique so the same match can never
 // fire twice.
 type Alert struct {
-	ID        int64           `json:"id"`
-	MonitorID int64           `json:"monitor_id"`
-	RuleID    int64           `json:"rule_id"`
-	EventID   string          `json:"event_id"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID         int64           `json:"id"`
+	MonitorID  int64           `json:"monitor_id"`
+	RuleID     int64           `json:"rule_id"`
+	EventID    string          `json:"event_id"`
+	Payload    json.RawMessage `json:"payload"`
+	Enrichment json.RawMessage `json:"enrichment,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
 	// InhibitedByRuleID is set when an inhibition rule suppressed this
 	// alert's delivery. Nil means delivered (or never subjected to
 	// inhibition); the alert row itself is always stored.
@@ -490,7 +491,6 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
-	ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error
 	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
 	// row. f.Limit caps the total rows, not the page size, so an export
 	// streams with bounded memory. See streamAlerts for the guarantees.

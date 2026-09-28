@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
@@ -156,6 +157,11 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 // dashboard.
 func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
 	p.live = b
+	return p
+}
+
+func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
+	p.ing.WithEnricher(e)
 	return p
 }
 
