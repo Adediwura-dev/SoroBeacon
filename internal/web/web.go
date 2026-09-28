@@ -27,6 +27,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -37,6 +38,12 @@ import (
 // PositionReader is the poller's race-free snapshot of ingest progress.
 type PositionReader interface {
 	Position() poller.Position
+}
+
+// LeaderReader reports this instance's leader-election status, shown on the
+// overview page so an operator can tell which replica is polling.
+type LeaderReader interface {
+	Status() lease.Status
 }
 
 //go:embed templates/*.html
@@ -53,6 +60,7 @@ type Server struct {
 	log      *slog.Logger
 	pages    map[string]*template.Template
 	poller   PositionReader
+	leader   LeaderReader
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
@@ -206,6 +214,14 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 // WithPoller attaches the ingest-position source shown on the overview page.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	return s
+}
+
+// WithLeadership attaches the leader-election status shown on the overview
+// page. Not wiring it leaves the page exactly as it was before leader
+// election existed.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
 	return s
 }
 
@@ -596,6 +612,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		if pos := s.poller.Position(); pos.Ready() {
 			data["Poller"] = pos
 		}
+	}
+	if s.leader != nil {
+		data["Leadership"] = s.leader.Status()
 	}
 	s.render(w, r, "index", data)
 }

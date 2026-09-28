@@ -65,6 +65,15 @@ error rather than a setting that silently does nothing.
 read replica and is likewise rejected with a `sqlite` URL. It is off by
 default; see [Read replicas](operations/scaling.md#read-replicas).
 
+A SQLite deployment is also exempt from leader election. Several SoroBeacon
+instances sharing a Postgres database elect a single poller between them with a
+session-level advisory lock, which SQLite does not have — and a SQLite file
+cannot be shared between machines anyway. So the instance polls
+unconditionally, and `GET /api/v1/health` reports `"leader": true` alongside
+`"leader_election": false` to say that nothing was elected. See
+[Deployment](../README.md#deployment) for the Postgres behaviour and its
+failover timings.
+
 ## API authentication
 
 | Variable | Type | Default | Required | What it does |
