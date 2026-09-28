@@ -10,7 +10,6 @@ type FieldSchema struct {
 	Required    bool     `json:"required"`
 	Description string   `json:"description"`
 	Options     []string `json:"options,omitempty"`
-	Default     string   `json:"default"`
 	Default     string   `json:"default,omitempty"`
 }
 
