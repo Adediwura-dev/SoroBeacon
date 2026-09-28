@@ -38,6 +38,15 @@ type fakeDispatchStore struct {
 	window *store.MaintenanceWindow
 	// suppressed records the alert ID and reason of each suppression.
 	suppressed []string
+	// inhibitions feeds the inhibition check; firing answers RuleFiredWithin.
+	inhibitions []store.Inhibition
+	firing      map[int64]bool
+	inhibited   []inhibitedMark
+}
+
+type inhibitedMark struct {
+	alertID  int64
+	sourceID int64
 }
 
 func (f *fakeDispatchStore) ListChannelsForMonitor(_ context.Context, _ int64) ([]store.Channel, error) {
@@ -55,6 +64,29 @@ func (f *fakeDispatchStore) ActiveMaintenanceWindow(_ context.Context, _ int64, 
 
 func (f *fakeDispatchStore) SetAlertSuppressed(_ context.Context, _ int64, reason string) error {
 	f.suppressed = append(f.suppressed, reason)
+	return nil
+}
+
+func (f *fakeDispatchStore) ListChannels(_ context.Context, _ bool) ([]store.Channel, error) {
+	return f.channels, nil
+}
+
+func (f *fakeDispatchStore) ListInhibitionsForTarget(_ context.Context, target int64) ([]store.Inhibition, error) {
+	var out []store.Inhibition
+	for _, in := range f.inhibitions {
+		if in.TargetRuleID == target {
+			out = append(out, in)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDispatchStore) RuleFiredWithin(_ context.Context, ruleID int64, _ time.Duration) (bool, error) {
+	return f.firing[ruleID], nil
+}
+
+func (f *fakeDispatchStore) MarkAlertInhibited(_ context.Context, alertID, sourceID int64) error {
+	f.inhibited = append(f.inhibited, inhibitedMark{alertID: alertID, sourceID: sourceID})
 	return nil
 }
 
@@ -200,4 +232,98 @@ func TestDispatchBadConfigRecordsFailure(t *testing.T) {
 	require.Len(t, st.attempts, 1, "bad config is recorded once, not retried")
 	assert.Equal(t, "failed", st.attempts[0].Status)
 	assert.Contains(t, st.attempts[0].ResponseSnippet, "unknown channel type")
+}
+
+func TestDispatchInhibitedSkipsDeliveryAndMarks(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		inhibitions: []store.Inhibition{
+			{SourceRuleID: 7, TargetRuleID: 9, FiringWindowSeconds: 300},
+		},
+		firing: map[int64]bool{7: true},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 20, MonitorID: 2, RuleID: 9})
+
+	assert.Equal(t, 0, n.calls, "inhibited alert must not reach any notifier")
+	assert.Empty(t, st.attempts, "inhibited alert records no delivery attempts")
+	require.Len(t, st.inhibited, 1, "the suppression must be recorded on the alert")
+	assert.Equal(t, int64(20), st.inhibited[0].alertID)
+	assert.Equal(t, int64(7), st.inhibited[0].sourceID)
+}
+
+func TestDispatchQuietSourceDelivers(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		inhibitions: []store.Inhibition{
+			{SourceRuleID: 7, TargetRuleID: 9, FiringWindowSeconds: 300},
+		},
+		firing: map[int64]bool{7: false},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 21, MonitorID: 2, RuleID: 9})
+
+	assert.Equal(t, 1, n.calls, "a quiet source must not suppress delivery")
+	assert.Empty(t, st.inhibited)
+}
+
+// timeoutNotifier captures the context deadline it was called with.
+type timeoutNotifier struct {
+	gotDeadline time.Time
+	hasDeadline bool
+}
+
+func (n *timeoutNotifier) Send(ctx context.Context, _ Alert) error {
+	dl, ok := ctx.Deadline()
+	n.hasDeadline = ok
+	n.gotDeadline = dl
+	return nil
+}
+
+func TestDispatchAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 5 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(5*time.Second), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestDispatchAppliesDefaultTimeoutWhenUnset(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 0 // unset
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 16, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(DefaultTimeout), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestRetryAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 8 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	da := d.Retry(context.Background(), Alert{ID: 17, MonitorID: 2}, ch)
+
+	require.NotNil(t, da)
+	assert.Equal(t, "success", da.Status)
+	require.True(t, n.hasDeadline, "Retry must apply channel timeout to ctx")
+	assert.WithinDuration(t, before.Add(8*time.Second), n.gotDeadline, 500*time.Millisecond)
 }

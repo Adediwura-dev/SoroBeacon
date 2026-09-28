@@ -8,10 +8,12 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -19,9 +21,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -52,6 +56,12 @@ type Server struct {
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
+	// auth gates every page on a dashboard session once a token is
+	// configured. Nil (until WithAuth, or with no API_TOKEN) leaves the
+	// dashboard open.
+	a     *auth.Authenticator
+	auth  *auth.Authenticator
+	roles *auth.RoleEnforcer
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -64,11 +74,12 @@ type monitorListRow struct {
 
 // templateFuncs are available to every page template.
 var templateFuncs = template.FuncMap{
-	"prettyJSON":   prettyJSON,
-	"formatTime":   formatTime,
-	"decodedEvent": decodedEvent,
-	"truncateID":   truncateID,
-	"relTime":      relTime,
+	"prettyJSON":    prettyJSON,
+	"formatTime":    formatTime,
+	"decodedEvent":  decodedEvent,
+	"truncateID":    truncateID,
+	"relTime":       relTime,
+	"severityClass": severityClass,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -127,6 +138,24 @@ func relTime(t time.Time, now ...time.Time) string {
 	}
 }
 
+// severityClass returns a CSS class for the given severity level.
+//
+// It takes store.Severity rather than a string because every template call site
+// passes a Severity field, and html/template checks argument types when the
+// action runs: a string parameter made any alert or rule that actually carried
+// a severity fail the page render rather than print a pill. Anything outside
+// the closed set, including the empty value, keeps the default warning colour.
+func severityClass(severity store.Severity) string {
+	switch severity {
+	case store.SeverityCritical:
+		return "critical"
+	case store.SeverityInfo:
+		return "info"
+	default:
+		return "warning"
+	}
+}
+
 // prettyJSON indents raw JSON for display. Invalid or empty input falls
 // back to the raw string rather than erroring the page — a payload is
 // still worth showing even if it turns out not to parse.
@@ -164,8 +193,8 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "maintenance", "error"} {
-		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches"} {
+		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
 		}
@@ -210,9 +239,23 @@ func (s *Server) monitorRows(monitors []store.Monitor, tz string, now time.Time)
 	return out
 }
 
+// WithRoles attaches role enforcement to the dashboard router.
+func (s *Server) WithRoles(re *auth.RoleEnforcer) *Server {
+	s.roles = re
+	return s
+}
+
 // Routes returns the dashboard router, mounted at / by cmd/sorobeacon.
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
+	// Registered before any route, so the gate covers everything below it.
+	// With no token configured it is the identity function.
+	r.Use(s.authMiddleware())
+	r.Use(auth.RoleMiddleware(s.roles, auth.RoleViewer))
+	r.Get(loginPath, s.loginPage)
+	r.Post(loginPath, s.login)
+	r.Post(logoutPath, s.logout)
+
 	r.Get("/", s.index)
 	r.Get("/favicon.ico", s.favicon)
 	r.Post("/theme", s.setTheme)
@@ -225,7 +268,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/monitors/{id}/toggle", s.toggleMonitor)
 	r.Post("/monitors/{id}/delete", s.deleteMonitor)
 	r.Post("/monitors/{id}/duplicate", s.duplicateMonitor)
-	r.Post("/monitors/{id}/rules", s.createRule)
+	r.Post("/monitors/{id}/rules", s.createRuleFromBuilder)
 	r.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
 	r.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
 	r.Post("/monitors/{id}/channels", s.setMonitorChannels)
@@ -234,6 +277,16 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels", s.createChannel)
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
+
+	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
+
+	r.Get("/searches", s.searches)
+	r.Post("/searches", s.createSearch)
+	r.Post("/searches/{id}/delete", s.deleteSearch)
+	r.Post("/searches/{id}/default", s.setDefaultSearch)
+	r.Post("/searches/{id}/undefault", s.clearDefaultSearch)
+
+	r.Post("/monitors/import", s.importContractsWeb)
 
 	r.Get("/alerts", s.alerts)
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
@@ -259,6 +312,7 @@ var navSection = map[string]string{
 	"alerts":      "alerts",
 	"alert":       "alerts",
 	"maintenance": "maintenance",
+	"searches":    "alerts",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -272,6 +326,10 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int
 		}
 		m["Theme"] = themeFromRequest(r)
 		m["Timezone"] = tzFromRequest(r)
+		// The sign-in page has nothing to sign out of, so it hides the header's
+		// sign-out button even though authentication is on.
+		m["AuthEnabled"] = s.authEnabled() && page != "login"
+		m["SessionHours"] = int(s.auth.SessionTTL().Hours())
 		m["Version"] = displayVersion(buildinfo.Version)
 		m["Commit"] = displayCommit(buildinfo.Commit)
 		m["CommitURL"] = commitURL(buildinfo.Commit)
@@ -520,13 +578,19 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	series, err := s.store.AlertCountsByDay(r.Context(), store.AlertSeriesDays)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	names := map[int64]string{}
 	for _, m := range monitors {
 		names[m.ID] = m.Name
 	}
 	data := map[string]any{
 		"Title": "Overview", "Stats": stats, "Alerts": alerts, "MonitorNames": names,
-		"Empty": emptyKind(monitors, channels, alerts),
+		"Empty":      emptyKind(monitors, channels, alerts),
+		"AlertChart": alertChartSVG(series),
 	}
 	if s.poller != nil {
 		if pos := s.poller.Position(); pos.Ready() {
@@ -534,6 +598,51 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.render(w, r, "index", data)
+}
+
+// alertChartSVG draws a 30-day (or shorter) bar series as inline SVG so the
+// dashboard does not take a JavaScript charting dependency. An all-zero
+// series returns empty HTML: a flat axis would look like a missing chart.
+func alertChartSVG(days []store.AlertDayCount) template.HTML {
+	if len(days) == 0 {
+		return ""
+	}
+	var max int64
+	for _, d := range days {
+		if d.Count > max {
+			max = d.Count
+		}
+	}
+	if max == 0 {
+		return ""
+	}
+	const (
+		width  = 300.0
+		height = 88.0
+		padT   = 6.0
+		padB   = 18.0
+	)
+	innerH := height - padT - padB
+	barW := width / float64(len(days))
+	var b strings.Builder
+	fmt.Fprintf(&b,
+		`<svg class="alert-chart-svg" viewBox="0 0 %g %g" role="img" aria-label="Daily alert counts for the last %d days, UTC">`,
+		width, height, len(days))
+	for i, d := range days {
+		bh := innerH * float64(d.Count) / float64(max)
+		x := float64(i)*barW + 1
+		y := padT + innerH - bh
+		title := html.EscapeString(fmt.Sprintf("%s: %d", d.Day, d.Count))
+		fmt.Fprintf(&b,
+			`<rect x="%g" y="%g" width="%g" height="%g"><title>%s</title></rect>`,
+			x, y, barW-2, bh, title)
+	}
+	first := html.EscapeString(days[0].Day)
+	last := html.EscapeString(days[len(days)-1].Day)
+	fmt.Fprintf(&b,
+		`<text x="0" y="%g" font-size="8">%s</text><text x="%g" y="%g" font-size="8" text-anchor="end">%s</text></svg>`,
+		height-4, first, width, height-4, last)
+	return template.HTML(b.String())
 }
 
 func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
@@ -635,8 +744,14 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
+
+// recentAlertsPanelSize bounds the monitor page's recent-alerts table. The
+// page is a summary of one monitor, not the alerts list: five rows answers
+// "is this firing?" and anything more belongs on /alerts?monitor_id=.
+const recentAlertsPanelSize = 5
 
 func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
@@ -659,14 +774,50 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	recent, err := s.store.ListAlerts(r.Context(), store.AlertFilter{
+		MonitorID: id, Limit: recentAlertsPanelSize,
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	stats, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	attached := map[int64]bool{}
 	for _, cid := range m.ChannelIDs {
 		attached[cid] = true
 	}
+	tz := tzFromRequest(r)
+	// The panel and the last-matched cue are rendered from one value: the same
+	// monitorRow the list pages use. Two readings of "when did this fire" on
+	// one page would be the disagreement the issue asks not to create.
+	row := s.monitorRow(*m, tz, time.Now())
 	s.render(w, r, "monitor", map[string]any{
-		"Title": m.Name, "Monitor": s.monitorRow(*m, tzFromRequest(r), time.Now()), "Rules": ruleList,
+		"Title": m.Name, "Monitor": row, "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
+		"RecentAlerts": recent,
+		// The alerts page already filters by monitor, so the panel is a summary
+		// with a way to see everything rather than a second, shorter list.
+		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)),
+		"Stats":      stats,
+		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
 	})
+}
+
+// formatStatTime renders the nullable most-recent-alert timestamp from
+// store.MonitorStats. It returns template.HTML rather than a time.Time because
+// formatTime takes a time.Time and html/template will not hand it the
+// *time.Time the field is — the same reason monitorListRow carries MatchedHTML.
+// A nil timestamp (a monitor that has never alerted) renders as the empty
+// string, which is what formatTime already does for a zero time.
+func formatStatTime(t *time.Time, tz string) template.HTML {
+	if t == nil {
+		return ""
+	}
+	return formatTime(*t, tz)
 }
 
 func (s *Server) bulkMonitors(w http.ResponseWriter, r *http.Request) {
@@ -716,6 +867,7 @@ func (s *Server) toggleMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "enabled")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -734,6 +886,7 @@ func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", m.ID), http.StatusSeeOther)
 }
 
@@ -747,30 +900,8 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "monitor", id)
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
-}
-
-func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r, "id")
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	ruleType := r.FormValue("type")
-	params := []byte(r.FormValue("params"))
-	if len(params) == 0 {
-		params = []byte(`{}`)
-	}
-	if err := s.registry.Validate(ruleType, params); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	rule := store.Rule{MonitorID: id, Type: ruleType, Params: params, Enabled: true}
-	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
-		s.fail(w, err)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
@@ -793,6 +924,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "rule", ruleID, "monitor_id")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -817,6 +949,7 @@ func (s *Server) toggleRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "rule", ruleID, "enabled")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -843,6 +976,7 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "channel_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -896,6 +1030,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "channel", ch.ID, "name", "type", "config")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -905,11 +1040,49 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	monitors, err := s.store.ListMonitorsForChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	signature := channelDeleteSignature(monitors)
+	if r.FormValue("confirm") != "1" || r.FormValue("confirmed_signature") != signature {
+		shown := monitors
+		if len(shown) > 5 {
+			shown = shown[:5]
+		}
+		s.render(w, r, "channel-delete", map[string]any{
+			"Channel": ch, "Monitors": shown, "AttachedCount": len(monitors),
+			"More":      len(monitors) - len(shown),
+			"Signature": signature, "Stale": r.FormValue("confirm") == "1",
+		})
+		return
+	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "channel", id)
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func channelDeleteSignature(monitors []store.Monitor) string {
+	var b strings.Builder
+	for _, monitor := range monitors {
+		b.WriteString(strconv.FormatInt(monitor.ID, 10))
+		b.WriteByte(':')
+		for _, channelID := range monitor.ChannelIDs {
+			b.WriteString(strconv.FormatInt(channelID, 10))
+			b.WriteByte(',')
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // testChannel is the htmx target for the "Send test" button; it returns a
@@ -927,7 +1100,9 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	notifier, err := s.factory.New(ch.Type, ch.Config)
 	if err == nil {
-		err = notifier.Send(r.Context(), notify.Alert{
+		testCtx, cancel := context.WithTimeout(r.Context(), ch.TimeoutDuration())
+		defer cancel()
+		err = notifier.Send(testCtx, notify.Alert{
 			MonitorName: "Test monitor",
 			RuleType:    "test",
 			EventName:   "sorobeacon_test",
@@ -1057,6 +1232,54 @@ func parseUTCInput(v string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
+// alertDateLayout is the value an <input type="date"> submits.
+const alertDateLayout = "2006-01-02"
+
+// parseAlertDate reads one end of the dashboard's date range and returns the
+// instant to filter on, the value to put back in the form, and whether the
+// input was readable at all.
+//
+// It accepts the calendar date the picker sends and the RFC 3339 instant the
+// API documents, because the page's own Older link round-trips the bound
+// through the API form: a link that could not be re-read would silently drop
+// the date range on the second page.
+//
+// A date is a calendar day in UTC, not in the viewer's zone. The dashboard can
+// render timestamps in a preferred zone, but "local" means the browser's zone
+// and the server never learns it, so a filter interpreted in the zone the page
+// happens to be labelled in would be wrong for exactly the readers who changed
+// that setting. The form says UTC beside both fields.
+//
+// end marks the upper bound, which alerts.go compares with < : the day picked
+// is inside the range, so the bound is the following midnight. When that
+// midnight comes back on an Older link the form shows the day it closes rather
+// than the day after it, or every click of paging would move the picker
+// forward a day.
+func parseAlertDate(v string, end bool) (bound time.Time, display string, ok bool) {
+	if v == "" {
+		return time.Time{}, "", true
+	}
+	if d, err := time.Parse(alertDateLayout, v); err == nil {
+		bound = d.UTC()
+		if end {
+			bound = bound.AddDate(0, 0, 1)
+		}
+		return bound, v, true
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, v, false
+	}
+	bound = t.UTC()
+	display = bound.Format(alertDateLayout)
+	if end {
+		if h, m, s := bound.Clock(); h == 0 && m == 0 && s == 0 {
+			display = bound.AddDate(0, 0, -1).Format(alertDateLayout)
+		}
+	}
+	return bound, display, true
+}
+
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.AlertFilter{Limit: 50}
@@ -1071,6 +1294,12 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		f.RuleID = selectedRule
 	}
 	f.ContractID = strings.TrimSpace(q.Get("contract_id"))
+	severity := strings.TrimSpace(q.Get("severity"))
+	if severity != "" {
+		if parsed, ok := store.ParseSeverity(severity); ok {
+			f.Severity = parsed
+		}
+	}
 	switch q.Get("sort") {
 	case "created_at_asc", "created_at_desc":
 		f.Sort = q.Get("sort")
@@ -1078,11 +1307,37 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("cursor"); v != "" {
 		f.AfterID, _ = strconv.ParseInt(v, 10, 64)
 	}
-	alerts, err := s.store.ListAlerts(r.Context(), f)
-	if err != nil {
-		s.fail(w, err)
-		return
+
+	// The search term and the date range are collected here rather than handed
+	// straight to the store because the page has to say *why* it came back with
+	// nothing. A filter the store never saw is indistinguishable from a filter
+	// that matched no alerts unless the form reports it.
+	search := store.NormalizeAlertSearch(q.Get("q"))
+	note := ""
+	if search != "" {
+		if utf8.RuneCountInString(search) > store.MaxAlertSearchLen {
+			// Nothing is listed, the same way an unreadable date lists nothing:
+			// a full table under a search box the operator just typed into
+			// reads like results for that term whether or not it was applied.
+			// The term stays in the box so it can be trimmed in place.
+			note = fmt.Sprintf("Search is limited to %d characters, so nothing was listed. Trim the term and search again.", store.MaxAlertSearchLen)
+		} else {
+			f.Query = search
+		}
 	}
+	from, fromValue, fromOK := parseAlertDate(q.Get("from"), false)
+	to, toValue, toOK := parseAlertDate(q.Get("to"), true)
+	f.From, f.To = from, to
+	switch {
+	case !fromOK || !toOK:
+		note = "Those dates could not be read. Pick a date, or send them as RFC 3339."
+	case !from.IsZero() && !to.IsZero() && !to.After(from):
+		// An inverted range is an empty result set, and an empty table does not
+		// say so; the operator would conclude there were no alerts rather than
+		// that the range asked for none.
+		note = "That range is empty: the end date is before the start date."
+	}
+
 	monitors, err := s.store.ListMonitors(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
@@ -1092,14 +1347,6 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	for _, m := range monitors {
 		names[m.ID] = m.Name
 	}
-	next := ""
-	if len(alerts) == f.Limit {
-		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
-	}
-	sort := f.Sort
-	if sort == "" {
-		sort = "created_at_desc"
-	}
 	// Channels are only needed to tell the empty states apart: "no alerts
 	// yet" reads very differently when nothing is being watched, when every
 	// monitor is off, and when there is nowhere to deliver to.
@@ -1108,35 +1355,105 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+
+	var alerts []store.Alert
+	next := ""
+	if note == "" {
+		alerts, err = s.store.ListAlerts(r.Context(), f)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		if len(alerts) == f.Limit {
+			next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
+		}
+	}
+	sort := f.Sort
+	if sort == "" {
+		sort = "created_at_desc"
+	}
 	data := map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected,
-		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Sort": sort,
-		"Empty": emptyKind(monitors, channels, alerts),
+		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Severity": severity, "Sort": sort,
+		"Query": search, "FromDate": fromValue, "ToDate": toValue, "Note": note,
+		// FromRFC/ToRFC are the bounds in the form the live stream compares
+		// against, so a row that arrives for a window the page is not showing
+		// does not talk its way into the table.
+		"FromRFC": rfc3339OrEmpty(f.From), "ToRFC": rfc3339OrEmpty(f.To),
+		// Any one of the controls makes an empty list an answer rather than a
+		// state of the instance, so the page says "no alerts match" instead of
+		// walking the operator through creating a monitor they already have.
+		"HasFilters": selected != 0 || selectedRule != 0 || f.ContractID != "" ||
+			severity != "" || search != "" || !f.From.IsZero() || !f.To.IsZero(),
+		"ExportHref": alertExportHref(f),
+		"Empty":      emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(f) + "cursor=" + next)
 	}
 	s.render(w, r, "alerts", data)
 }
 
-// alertFilterQuery is the monitor/rule/contract/sort prefix preserved on
-// the Older paging link. Empty when every control is at its default, so
-// the existing `?cursor=` link stays stable.
-func alertFilterQuery(monitorID, ruleID int64, contractID, sort string) string {
+// rfc3339OrEmpty renders a bound for the page's JavaScript. A zero bound is an
+// empty string, which the script reads as "no bound", the same way the store
+// reads a zero time.
+func rfc3339OrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// alertExportHref is the dashboard's CSV export link: the same filters as
+// the list currently on screen, pointed at the JSON API's /alerts.csv. The
+// cursor is deliberately dropped — an export is the whole filtered set, not
+// just the page after the one being viewed.
+func alertExportHref(f store.AlertFilter) template.URL {
+	q := strings.TrimSuffix(alertFilterQuery(f), "&")
+	if q == "" {
+		return template.URL("/api/v1/alerts.csv")
+	}
+	return template.URL("/api/v1/alerts.csv?" + q)
+}
+
+// alertFilterQuery is the filter prefix preserved on the Older paging link and
+// mirrored onto the CSV export link. Empty when every control is at its
+// default, so the existing `?cursor=` link stays stable.
+//
+// It takes the store filter rather than a list of arguments because the page
+// now has seven of them: every control that narrows the list on the first
+// request has to narrow it on the second, and a positional parameter list is
+// how a filter ends up silently missing from the encoding.
+func alertFilterQuery(f store.AlertFilter) string {
 	v := url.Values{}
-	if monitorID != 0 {
-		v.Set("monitor_id", strconv.FormatInt(monitorID, 10))
+	if f.MonitorID != 0 {
+		v.Set("monitor_id", strconv.FormatInt(f.MonitorID, 10))
 	}
-	if ruleID != 0 {
-		v.Set("rule_id", strconv.FormatInt(ruleID, 10))
+	if f.RuleID != 0 {
+		v.Set("rule_id", strconv.FormatInt(f.RuleID, 10))
 	}
-	if contractID != "" {
-		v.Set("contract_id", contractID)
+	if f.ContractID != "" {
+		v.Set("contract_id", f.ContractID)
 	}
-	if sort != "" && sort != "created_at_desc" {
-		v.Set("sort", sort)
+	if f.Query != "" {
+		v.Set("q", f.Query)
+	}
+	if sev := string(f.Severity); sev != "" {
+		v.Set("severity", sev)
+	}
+	if f.Sort != "" && f.Sort != "created_at_desc" {
+		v.Set("sort", f.Sort)
+	}
+	// The bounds go out as instants, not as the calendar dates the form
+	// collected: re-deriving the exclusive end from a date would add the day
+	// again on every page.
+	if !f.From.IsZero() {
+		v.Set("from", f.From.UTC().Format(time.RFC3339))
+	}
+	if !f.To.IsZero() {
+		v.Set("to", f.To.UTC().Format(time.RFC3339))
 	}
 	enc := v.Encode()
 	if enc == "" {
@@ -1197,6 +1514,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		EventID:   alert.EventID,
 		Payload:   alert.Payload,
 		CreatedAt: alert.CreatedAt,
+		Severity:  string(alert.Severity),
 	}
 	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
 		na.MonitorName = m.Name

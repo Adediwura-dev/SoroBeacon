@@ -143,7 +143,7 @@ func TestSetAlertSuppressed(t *testing.T) {
 	a := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "e1", Payload: json.RawMessage(`{}`)}
 	created, err := st.CreateAlert(ctx, a)
 	require.NoError(t, err)
-	require.True(t, created)
+	require.Equal(t, AlertCreated, created)
 
 	require.NoError(t, st.SetAlertSuppressed(ctx, a.ID, "planned upgrade"))
 
