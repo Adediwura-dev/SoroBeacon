@@ -837,3 +837,15 @@ func (f *fakeStore) RuleFiredWithin(context.Context, int64, time.Duration) (bool
 func (f *fakeStore) MarkAlertInhibited(context.Context, int64, int64) error {
 	return nil
 }
+
+// ActiveMaintenanceWindow and SetAlertSuppressed complete the dispatcher's
+// store interface. They are inert like the inhibition trio above: no window
+// exists, so nothing is silenced, and a test that wants to exercise
+// maintenance suppression can return a window from its own fake.
+func (f *fakeStore) ActiveMaintenanceWindow(context.Context, int64, string, time.Time) (*store.MaintenanceWindow, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) SetAlertSuppressed(context.Context, int64, string) error {
+	return nil
+}

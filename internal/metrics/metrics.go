@@ -42,16 +42,17 @@ type Metrics struct {
 
 	// Reorg detection: how many reorgs have been seen, and the ledger of the
 	// most recent one. Both are expected to sit at zero.
-	reorgsTotal     prometheus.Counter
-	lastReorgLedger prometheus.Gauge
+	reorgsTotal     *prometheus.CounterVec
+	lastReorgLedger *prometheus.GaugeVec
 
-	eventsScanned  prometheus.Counter
-	eventsMatched  prometheus.Counter
-	alertsFired    prometheus.Counter
+	eventsScanned  *prometheus.CounterVec
+	eventsMatched  *prometheus.CounterVec
+	alertsFired    *prometheus.CounterVec
 	deliveries     *prometheus.CounterVec
 	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
-	lastPollAgoSec prometheus.Gauge
+	lastPollAgoSec *prometheus.GaugeVec
+	pollPanics     *prometheus.CounterVec
 	breakerStates  *prometheus.GaugeVec
 
 	storeReads     *prometheus.CounterVec
@@ -150,11 +151,6 @@ func New() *Metrics {
 			Help:    "HTTP request duration by route pattern, method and status.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "method", "status"}),
-
-		lastPollAgoSec: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "sorobeacon_seconds_since_last_poll",
-			Help: "Seconds since the poller last completed a cycle. Grows without bound when polling has stopped.",
-		}),
 
 		// Where read-only queries actually went. The pool label is the closed
 		// set {primary, replica}, so cardinality is bounded; watching the ratio

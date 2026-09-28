@@ -240,6 +240,14 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/test", s.testChannel)
 	})
 
+	r.Route("/maintenance-windows", func(r chi.Router) {
+		r.Post("/", s.createMaintenanceWindow)
+		r.Get("/", s.listMaintenanceWindows)
+		r.Get("/{id}", s.getMaintenanceWindow)
+		r.Patch("/{id}", s.updateMaintenanceWindow)
+		r.Delete("/{id}", s.deleteMaintenanceWindow)
+	})
+
 	r.Route("/inhibitions", func(r chi.Router) {
 		r.Post("/", s.createInhibition)
 		r.Get("/", s.listInhibitions)

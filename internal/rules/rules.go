@@ -111,6 +111,8 @@ func NewRegistry() *Registry {
 	r.Register(TypeNumericRange, NumericRange{})
 	r.Register(TypeTokenSupplyChange, TokenSupplyChange{})
 	r.Register(TypeTokenEvent, TokenEvent{})
+	r.Register(TypeSelfTransfer, SelfTransfer{})
+	r.Register(TypeTimeWindow, TimeWindow{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
