@@ -373,8 +373,11 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	}
 
 	backoff := d.BaseBackoff
+	timeout := ch.TimeoutDuration()
 	for attempt := 1; ; attempt++ {
-		err = d.sendWithRecovery(ctx, a, ch, notifier)
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = d.sendWithRecovery(attemptCtx, a, ch, notifier)
+		cancel()
 		if err == nil {
 			cb.RecordSuccess()
 			if d.metrics != nil {
@@ -538,7 +541,10 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 	}
-	err = notifier.Send(ctx, a)
+	timeout := ch.TimeoutDuration()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	err = notifier.Send(attemptCtx, a)
+	cancel()
 	if err == nil {
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, true)

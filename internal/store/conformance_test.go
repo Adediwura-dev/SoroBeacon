@@ -50,6 +50,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
+	t.Run("ChannelTimeout", func(t *testing.T) { testChannelTimeout(t, newStore) })
 	t.Run("MonitorLastMatchedAt", func(t *testing.T) { testMonitorLastMatchedAt(t, newStore) })
 	t.Run("AlertDedupAndListing", func(t *testing.T) { testAlertDedupAndListing(t, newStore) })
 	t.Run("CreateAlertCooldown", func(t *testing.T) { testCreateAlertCooldown(t, newStore) })
@@ -562,6 +563,53 @@ func testListChannelsFilters(t *testing.T, newStore conformanceFactory) {
 	unknown, err := st.ListChannelsPage(ctx, ListFilter{Type: "not-a-real-type"})
 	require.NoError(t, err)
 	assert.Empty(t, unknown, "unknown types return an empty list, not an error")
+}
+
+func testChannelTimeout(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	// Default timeout when unset (0 duration)
+	cDefault := &Channel{Name: "default-timeout", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, cDefault))
+	got, err := st.GetChannel(ctx, cDefault.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultChannelTimeout, got.Timeout)
+
+	// Explicit custom timeout
+	cCustom := &Channel{Name: "custom-timeout", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true, Timeout: 30 * time.Second}
+	require.NoError(t, st.CreateChannel(ctx, cCustom))
+	got, err = st.GetChannel(ctx, cCustom.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, got.Timeout)
+
+	// Update timeout
+	got.Timeout = 45 * time.Second
+	require.NoError(t, st.UpdateChannel(ctx, got))
+	gotAfterUpdate, err := st.GetChannel(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, gotAfterUpdate.Timeout)
+
+	// Verify ListChannels returns timeout
+	list, err := st.ListChannels(ctx, false)
+	require.NoError(t, err)
+	for _, c := range list {
+		switch c.ID {
+		case cCustom.ID:
+			assert.Equal(t, 45*time.Second, c.Timeout)
+		case cDefault.ID:
+			assert.Equal(t, DefaultChannelTimeout, c.Timeout)
+		}
+	}
+
+	// Verify ListChannelsForMonitor returns timeout
+	m := &Monitor{Name: "m-timeout", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	require.NoError(t, st.SetMonitorChannels(ctx, m.ID, []int64{cCustom.ID}))
+	attached, err := st.ListChannelsForMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.Len(t, attached, 1)
+	assert.Equal(t, 45*time.Second, attached[0].Timeout)
 }
 
 func testMonitorLastMatchedAt(t *testing.T, newStore conformanceFactory) {

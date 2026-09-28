@@ -242,3 +242,60 @@ func TestDispatchQuietSourceDelivers(t *testing.T) {
 	assert.Equal(t, 1, n.calls, "a quiet source must not suppress delivery")
 	assert.Empty(t, st.inhibited)
 }
+
+// timeoutNotifier captures the context deadline it was called with.
+type timeoutNotifier struct {
+	gotDeadline time.Time
+	hasDeadline bool
+}
+
+func (n *timeoutNotifier) Send(ctx context.Context, _ Alert) error {
+	dl, ok := ctx.Deadline()
+	n.hasDeadline = ok
+	n.gotDeadline = dl
+	return nil
+}
+
+func TestDispatchAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 5 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(5*time.Second), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestDispatchAppliesDefaultTimeoutWhenUnset(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 0 // unset
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 16, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(DefaultTimeout), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestRetryAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 8 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	da := d.Retry(context.Background(), Alert{ID: 17, MonitorID: 2}, ch)
+
+	require.NotNil(t, da)
+	assert.Equal(t, "success", da.Status)
+	require.True(t, n.hasDeadline, "Retry must apply channel timeout to ctx")
+	assert.WithinDuration(t, before.Add(8*time.Second), n.gotDeadline, 500*time.Millisecond)
+}

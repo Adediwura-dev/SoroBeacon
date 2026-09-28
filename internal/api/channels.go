@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -36,11 +37,12 @@ type channelRequest struct {
 	Enabled *bool            `json:"enabled"`
 	// DigestMode and DigestWindowSeconds opt the channel into batched
 	// delivery. Omitted keeps immediate delivery (the pre-digest default).
-	DigestMode          *string `json:"digest_mode"`
-	DigestWindowSeconds *int64  `json:"digest_window_seconds"`
+	DigestMode          *string          `json:"digest_mode"`
+	DigestWindowSeconds *int64           `json:"digest_window_seconds"`
 	// MinSeverity is the minimum alert severity this channel will receive.
 	// Empty means no filter (receive all severities).
-	MinSeverity *string `json:"min_severity"`
+	MinSeverity         *string          `json:"min_severity"`
+	Timeout             *json.RawMessage `json:"timeout"`
 }
 
 // validateDigest checks a channel's digest settings. Empty mode means
@@ -75,6 +77,17 @@ func validateMinSeverity(minSeverity string) []FieldError {
 	return nil
 }
 
+func timeoutDetail(raw *json.RawMessage) (time.Duration, *FieldError) {
+	if raw == nil {
+		return 0, nil
+	}
+	d, err := store.ParseTimeout(*raw)
+	if err != nil {
+		return 0, &FieldError{Field: "timeout", Reason: err.Error()}
+	}
+	return d, nil
+}
+
 func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	var req channelRequest
 	if !readJSON(w, r, &req) {
@@ -86,6 +99,15 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type == nil || *req.Type == "" {
 		details = append(details, FieldError{Field: "type", Reason: "type is required"})
+	}
+	timeout := store.DefaultChannelTimeout
+	if req.Timeout != nil {
+		t, terr := timeoutDetail(req.Timeout)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			timeout = t
+		}
 	}
 	config := json.RawMessage(`{}`)
 	if req.Config != nil {
@@ -125,6 +147,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		DigestMode:          digestMode,
 		DigestWindowSeconds: digestWindow,
 		MinSeverity:         store.Severity(minSeverity),
+		Timeout:             timeout,
 	}
 	if err := s.store.CreateChannel(r.Context(), &ch); err != nil {
 		s.fail(w, r, err)
@@ -204,6 +227,14 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 			details = append(details, FieldError{Field: "type", Reason: "type is required"})
 		} else {
 			ch.Type = *req.Type
+		}
+	}
+	if req.Timeout != nil {
+		t, terr := timeoutDetail(req.Timeout)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			ch.Timeout = t
 		}
 	}
 	if req.Config != nil {
@@ -287,7 +318,9 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		EventID:     "test-0000000000000000000",
 		CreatedAt:   time.Now(),
 	}
-	if err := notifier.Send(r.Context(), testAlert); err != nil {
+	testCtx, cancel := context.WithTimeout(r.Context(), ch.TimeoutDuration())
+	defer cancel()
+	if err := notifier.Send(testCtx, testAlert); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"status": "failed", "error": err.Error()})
 		return
 	}
