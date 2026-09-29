@@ -49,6 +49,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
+	t.Run("ListChannelsByIDs", func(t *testing.T) { testListChannelsByIDs(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
 	t.Run("ChannelTimeout", func(t *testing.T) { testChannelTimeout(t, newStore) })
 	t.Run("MonitorLastMatchedAt", func(t *testing.T) { testMonitorLastMatchedAt(t, newStore) })
@@ -1768,4 +1769,42 @@ func testAbsenceState(t *testing.T, newStore conformanceFactory) {
 	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, states)
+}
+
+// testListChannelsByIDs covers the escalation reader: a step resolves its
+// channel set in one query, and a channel disabled after the policy was
+// written is skipped rather than erroring. It is a conformance test because
+// the two backends write the id list differently — = ANY($1) on Postgres, an
+// expanded IN list on SQLite — and because a column list that has drifted
+// from scanChannel shows up here rather than in a Postgres-only test.
+func testListChannelsByIDs(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	on := &Channel{Name: "on", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true}
+	off := &Channel{Name: "off", Type: "slack", Config: json.RawMessage(`{}`), Enabled: false}
+	other := &Channel{Name: "other", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, on))
+	require.NoError(t, st.CreateChannel(ctx, off))
+	require.NoError(t, st.CreateChannel(ctx, other))
+
+	got, err := st.ListChannelsByIDs(ctx, []int64{on.ID, off.ID})
+	require.NoError(t, err)
+	require.Len(t, got, 1, "a disabled channel is skipped, not an error")
+	assert.Equal(t, on.ID, got[0].ID)
+	assert.Equal(t, "on", got[0].Name)
+	assert.NotZero(t, got[0].TimeoutDuration(), "the row is scanned whole, not just its id")
+
+	// A repeated id is de-duplicated rather than delivering twice.
+	got, err = st.ListChannelsByIDs(ctx, []int64{on.ID, on.ID})
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+
+	got, err = st.ListChannelsByIDs(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	got, err = st.ListChannelsByIDs(ctx, []int64{999999})
+	require.NoError(t, err)
+	assert.Empty(t, got, "an unknown id is not an error")
 }

@@ -729,7 +729,7 @@ func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channe
 		return nil, nil
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels
 		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
