@@ -34,14 +34,15 @@ type Metrics struct {
 	reorgsTotal     prometheus.Counter
 	lastReorgLedger prometheus.Gauge
 
-	eventsScanned  prometheus.Counter
-	eventsMatched  prometheus.Counter
-	alertsFired    prometheus.Counter
-	deliveries     *prometheus.CounterVec
-	throttles      *prometheus.CounterVec
-	httpDuration   *prometheus.HistogramVec
-	lastPollAgoSec prometheus.Gauge
-	breakerStates  *prometheus.GaugeVec
+	eventsScanned   prometheus.Counter
+	eventsMatched   prometheus.Counter
+	ruleEvaluations prometheus.Counter
+	alertsFired     prometheus.Counter
+	deliveries      *prometheus.CounterVec
+	throttles       *prometheus.CounterVec
+	httpDuration    *prometheus.HistogramVec
+	lastPollAgoSec  prometheus.Gauge
+	breakerStates   *prometheus.GaugeVec
 
 	storeReads     *prometheus.CounterVec
 	storeFallbacks prometheus.Counter
@@ -100,6 +101,11 @@ func New() *Metrics {
 			Help: "Events that matched at least one monitor rule.",
 		}),
 
+		ruleEvaluations: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_evaluations_total",
+			Help: "Rule evaluations: each event checked against each of its monitor's enabled rules.",
+		}),
+
 		alertsFired: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "sorobeacon_alerts_fired_total",
 			Help: "Alerts created by rule matches.",
@@ -151,7 +157,7 @@ func New() *Metrics {
 		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
+		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled)
@@ -254,6 +260,17 @@ func (m *Metrics) RecordEvents(scanned, matched int) {
 	}
 	m.eventsScanned.Add(float64(scanned))
 	m.eventsMatched.Add(float64(matched))
+}
+
+// RecordRuleEvaluations counts the rule evaluations (one per event x enabled
+// rule) in the cycle that just ran. It is deliberately separate from
+// RecordEvents so a monitor with many rules is distinguishable from a busy
+// contract.
+func (m *Metrics) RecordRuleEvaluations(n int) {
+	if m == nil {
+		return
+	}
+	m.ruleEvaluations.Add(float64(n))
 }
 
 // RecordAlert counts one alert fired.

@@ -73,8 +73,9 @@ events and delivering every alert twice.
 ## Observability (`internal/metrics`, `internal/reqid`, `internal/buildinfo`)
 
 * `/metrics` — Prometheus: poll outcomes/duration, lag behind the tip,
-  seconds since last poll, the scanned→matched→alerted funnel, deliveries
-  per channel and outcome, HTTP duration by route pattern.
+  seconds since last poll, the scanned→evaluated→matched→alerted funnel,
+  deliveries per channel and outcome, HTTP duration by route pattern. The
+  full list is in the [metrics reference](metrics.md).
 * `/api/v1/livez`, `/api/v1/readyz` — liveness checks nothing (restart
   loops otherwise); readiness checks the database and the event source
   concurrently, bounded per check, with per-dependency detail.
