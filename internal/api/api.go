@@ -230,6 +230,8 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/export", s.exportAlertsNDJSON)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	r.Get("/dead-letters", s.listDeadLetters)
+	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
 	r.Get("/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)

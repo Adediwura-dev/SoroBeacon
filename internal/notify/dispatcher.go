@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strconv"
@@ -43,6 +44,11 @@ const DefaultRetryCooldown = 30 * time.Second
 type DispatchStore interface {
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]store.Channel, error)
 	RecordDeliveryAttempt(ctx context.Context, d *store.DeliveryAttempt) error
+	CreateDeadLetter(ctx context.Context, d *store.DeadLetter) error
+	GetAlert(ctx context.Context, id int64) (*store.Alert, error)
+	GetChannel(ctx context.Context, id int64) (*store.Channel, error)
+	ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]store.DeliveryAttempt, error)
+	DeleteDeadLetter(ctx context.Context, id int64) error
 	// ListChannels is how the digest flusher discovers channels with a
 	// window to close. Dispatch itself only needs ListChannelsForMonitor.
 	ListChannels(ctx context.Context, enabledOnly bool) ([]store.Channel, error)
@@ -451,6 +457,22 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		}
 
 		if attempt >= d.MaxAttempts || ctx.Err() != nil || cb.State() == StateOpen {
+			lastStatus := 0
+			if statusErr, ok := err.(*StatusError); ok {
+				lastStatus = statusErr.Code
+			}
+			dl := &store.DeadLetter{
+				AlertID:      a.ID,
+				ChannelID:    ch.ID,
+				LastError:    sanitizeDeliveryError(redactURLError(err)).Error(),
+				AttemptCount: attempt,
+				LastStatus:   lastStatus,
+			}
+			if errStore := d.store.CreateDeadLetter(ctx, dl); errStore != nil {
+				d.log.Error("create dead letter", "alert_id", a.ID, "channel_id", ch.ID, "err", errStore)
+			} else if d.metrics != nil {
+				d.metrics.RecordDeadLetter()
+			}
 			return
 		}
 		select {
@@ -510,6 +532,65 @@ func (d *Dispatcher) record(ctx context.Context, alertID, channelID int64, statu
 		d.log.Error("record delivery attempt", "alert_id", alertID, "channel_id", channelID, "err", err)
 	}
 	return da
+}
+
+// RedriveDeadLetter attempts delivery for a dead-letter record and deletes the record on success.
+func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, dl store.DeadLetter) error {
+	alert, err := d.store.GetAlert(ctx, dl.AlertID)
+	if err != nil {
+		return fmt.Errorf("get alert: %w", err)
+	}
+	ch, err := d.store.GetChannel(ctx, dl.ChannelID)
+	if err != nil {
+		return fmt.Errorf("get channel: %w", err)
+	}
+	if !ch.Enabled {
+		return ErrChannelDisabled
+	}
+
+	attempts, err := d.store.ListDeliveryAttempts(ctx, dl.AlertID, "")
+	if err != nil {
+		return fmt.Errorf("list attempts: %w", err)
+	}
+	for _, att := range attempts {
+		if att.ChannelID == dl.ChannelID && att.Status == store.DeliveryStatusSuccess {
+			_ = d.store.DeleteDeadLetter(ctx, deadLetterID)
+			return ErrAlreadySucceeded
+		}
+	}
+
+	notifier, err := d.factory.New(ch.Type, ch.Config)
+	if err != nil {
+		return fmt.Errorf("build notifier: %w", err)
+	}
+
+	timeout := ch.TimeoutDuration()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	alertObj := Alert{
+		ID:         alert.ID,
+		MonitorID:  alert.MonitorID,
+		RuleID:     alert.RuleID,
+		EventID:    alert.EventID,
+		Payload:    alert.Payload,
+		Enrichment: alert.Enrichment,
+		Severity:   string(alert.Severity),
+		CreatedAt:  alert.CreatedAt,
+	}
+
+	err = notifier.Send(attemptCtx, alertObj)
+	if err != nil {
+		safeErr := sanitizeDeliveryError(redactURLError(err))
+		d.record(ctx, alert.ID, ch.ID, "failed", safeErr.Error())
+		return safeErr
+	}
+
+	d.record(ctx, alert.ID, ch.ID, "success", "")
+	if err := d.store.DeleteDeadLetter(ctx, deadLetterID); err != nil {
+		d.log.Error("delete dead letter after successful redrive", "dead_letter_id", deadLetterID, "err", err)
+	}
+	return nil
 }
 
 // GateRetry decides whether a manual retry is allowed. attempts is the
