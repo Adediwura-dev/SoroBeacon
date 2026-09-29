@@ -83,27 +83,28 @@ type Factory struct {
 
 // Channel type names understood by DefaultFactory.
 const (
-	TypeDiscord    = "discord"
-	TypeSlack      = "slack"
-	TypeTelegram   = "telegram"
-	TypeEmail      = "email"
-	TypeWebhook    = "webhook"
-	TypeNtfy       = "ntfy"
-	TypeMatrix     = "matrix"
-	TypePagerDuty  = "pagerduty"
-	TypeTwilio     = "twilio"
-	TypeSignal     = "signal"
-	TypeWebex      = "webex"
-	TypeLark       = "lark"
-	TypeDingTalk   = "dingtalk"
-	TypeMattermost = "mattermost"
-	TypeRocketChat = "rocketchat"
-	TypeZulip      = "zulip"
-	TypePushover   = "pushover"
-	TypeGoogleChat = "googlechat"
-	TypeOpsgenie   = "opsgenie"
-	TypeGotify     = "gotify"
-	TypeSNS        = "sns"
+	TypeDiscord      = "discord"
+	TypeSlack        = "slack"
+	TypeTelegram     = "telegram"
+	TypeEmail        = "email"
+	TypeWebhook      = "webhook"
+	TypeNtfy         = "ntfy"
+	TypeMatrix       = "matrix"
+	TypePagerDuty    = "pagerduty"
+	TypeTwilio       = "twilio"
+	TypeSignal       = "signal"
+	TypeWebex        = "webex"
+	TypeLark         = "lark"
+	TypeDingTalk     = "dingtalk"
+	TypeMattermost   = "mattermost"
+	TypeRocketChat   = "rocketchat"
+	TypeZulip        = "zulip"
+	TypePushover     = "pushover"
+	TypeGoogleChat   = "googlechat"
+	TypeOpsgenie     = "opsgenie"
+	TypeGotify       = "gotify"
+	TypeSNS          = "sns"
+	TypeJSONTemplate = "jsontemplate"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -131,6 +132,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeOpsgenie, NewOpsgenie)
 	f.Register(TypeGotify, NewGotify)
 	f.Register(TypeSNS, NewSNS)
+	f.Register(TypeJSONTemplate, NewJSONTemplate)
 	return f
 }
 
