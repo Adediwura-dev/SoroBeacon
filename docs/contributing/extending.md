@@ -90,6 +90,7 @@ specs live somewhere else, such as an indexer or a local cache.
 
 ## Wanted (open by design)
 
-* Rule types: absence-of-event ("no heartbeat for N minutes")
-* Channels: ntfy.sh
+* Rule types: absence-of-event ("no heartbeat for N minutes"), frequency ("more than N matches in M minutes")
+* Channels: Matrix, PagerDuty, ntfy.sh
+* Contract-spec-aware decoding (named event fields via `stellar.Decoder`)
 * A richer dashboard

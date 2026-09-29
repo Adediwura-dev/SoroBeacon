@@ -22,7 +22,7 @@ Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 |-------------------------|------------------------|------------------------------------------------|
 | a notification channel  | `notify.Notifier`      | `DefaultFactory` in `internal/notify/notify.go`|
 | a rule type             | `rules.RuleEvaluator`  | `NewRegistry` in `internal/rules/rules.go`     |
-| a different event source| `stellar.Client`       | wiring in `cmd/sorobeacon/main.go`             |
+| a different event source| `poller.EventSource`   | wiring in `cmd/sorobeacon/main.go`             |
 | a decoder (e.g. spec-aware) | `stellar.Decoder`  | wiring in `cmd/sorobeacon/main.go`             |
 | another database        | `store.Store` (or a sub-interface) | wiring in `cmd/sorobeacon/main.go` |
 
@@ -52,6 +52,8 @@ The README has worked examples for channels and rules.
 - New rule types: absence-of-event ("no heartbeat for N minutes"),
   frequency ("more than N matches in M minutes").
 - New channels: Matrix, PagerDuty, ntfy.sh.
+- Contract-spec-aware decoding: fetch the contract spec and decode events
+  into named fields behind `stellar.Decoder`.
 - Dashboard improvements (kept deliberately minimal in the MVP).
 
 ## Pull requests

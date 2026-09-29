@@ -1,8 +1,6 @@
--- SQLite equivalent of the Postgres 0008_monitor_templates. Postgres keeps
--- channel_ids in a BIGINT[]; SQLite has no array type, so the ids live in TEXT
--- as a JSON array — the same encoding monitors.contract_ids already uses.
--- rules and parameters are JSON documents for the same reason filter is TEXT
--- in 0007: SQLite has no JSONB, only text that the JSON1 functions can query.
+-- Parity with the Postgres 0008. rules, channel_ids and parameters are JSONB
+-- and BIGINT[] upstream; SQLite stores all three as TEXT holding the same JSON
+-- bytes, so the Go layer round-trips them through encoding/json unchanged.
 CREATE TABLE monitor_templates (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,

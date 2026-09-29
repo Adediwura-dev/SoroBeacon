@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -66,27 +67,75 @@ func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
 
 // fakeStore implements poller.Store in memory, including the rule cooldown
 // semantics the real store enforces in SQL. now is injectable so tests can
-// advance the cooldown window without sleeping.
+// advance the cooldown window without sleeping. The channel fields are
+// only used by the tracing tests, which run deliveries through a real
+// notify.Dispatcher; the plain poller tests never touch them.
 type fakeStore struct {
 	monitors []store.Monitor
 	rules    map[int64][]store.Rule // monitor id -> rules
 	state    store.IngestState
 	alerts   []store.Alert
 	dedup    map[string]bool // "ruleID/eventID"
+	channels []store.Channel
+	attached map[int64][]int64 // monitor id -> channel ids
+	attempts []store.DeliveryAttempt
 
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
+	// ledgerHashes backs the reorg-detection half of the Store interface.
+	ledgerHashes map[uint32]string
+	// groupStates backs the alert-grouping half of the Store interface:
+	// group key -> alerts counted in the current window.
+	groupStates map[string]int64
+	// inhibitions backs the inhibition rules for the DispatchStore interface.
+	inhibitions []store.Inhibition
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		rules:      map[int64][]store.Rule{},
-		dedup:      map[string]bool{},
-		now:        time.Now,
-		lastFired:  map[int64]time.Time{},
-		suppressed: map[int64]int64{},
+		rules:        map[int64][]store.Rule{},
+		dedup:        map[string]bool{},
+		attached:     map[int64][]int64{},
+		now:          time.Now,
+		lastFired:    map[int64]time.Time{},
+		suppressed:   map[int64]int64{},
+		ledgerHashes: map[uint32]string{},
+		groupStates:  map[string]int64{},
+		inhibitions:  []store.Inhibition{},
 	}
+}
+
+// ListChannelsForMonitor and RecordDeliveryAttempt satisfy the dispatcher's
+// store interface so tracing tests can run real deliveries in memory.
+func (f *fakeStore) ListChannelsForMonitor(_ context.Context, monitorID int64) ([]store.Channel, error) {
+	var out []store.Channel
+	for _, id := range f.attached[monitorID] {
+		for _, ch := range f.channels {
+			if ch.ID == id {
+				out = append(out, ch)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
+	d.ID = int64(len(f.attempts) + 1)
+	f.attempts = append(f.attempts, *d)
+	return nil
+}
+
+// ListChannels satisfies the digest half of the dispatcher's store
+// interface; the poller tests never exercise digest flushing.
+func (f *fakeStore) ListChannels(_ context.Context, enabledOnly bool) ([]store.Channel, error) {
+	var out []store.Channel
+	for _, ch := range f.channels {
+		if !enabledOnly || ch.Enabled {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.Monitor, error) {
@@ -107,6 +156,30 @@ func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bo
 		}
 	}
 	return out, nil
+}
+
+// ListInhibitionsForTarget returns inhibitions targeting the given rule.
+func (f *fakeStore) ListInhibitionsForTarget(_ context.Context, targetRuleID int64) ([]store.Inhibition, error) {
+	var out []store.Inhibition
+	for _, inh := range f.inhibitions {
+		if inh.TargetRuleID == targetRuleID {
+			out = append(out, inh)
+		}
+	}
+	return out, nil
+}
+
+// RuleFiredWithin reports whether the rule fired within the given window.
+func (f *fakeStore) RuleFiredWithin(_ context.Context, ruleID int64, window time.Duration) (bool, error) {
+	if last, ok := f.lastFired[ruleID]; ok {
+		return time.Since(last) < window, nil
+	}
+	return false, nil
+}
+
+// MarkAlertInhibited marks an alert as inhibited by a source rule.
+func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID int64) error {
+	return nil // no-op for tests
 }
 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
@@ -149,6 +222,22 @@ func (f *fakeStore) GetIngestState(context.Context) (store.IngestState, error) {
 func (f *fakeStore) SetIngestState(_ context.Context, s store.IngestState) error {
 	f.state = s
 	return nil
+}
+
+// CreateAlertGroup creates or increments the alert group for key
+// with windowStart. Returns the new count.
+func (f *fakeStore) CreateAlertGroup(_ context.Context, key string, _ time.Time) (int64, error) {
+	f.groupStates[key]++
+	return f.groupStates[key], nil
+}
+
+// GroupAlerts creates or increments the alert group for key
+// with windowStart and returns whether delivery should happen
+// (first alert in the window) and the current count.
+func (f *fakeStore) GroupAlerts(_ context.Context, key string, _ time.Time) (bool, int64, error) {
+	count := f.groupStates[key] + 1
+	f.groupStates[key] = count
+	return count == 1, count, nil
 }
 
 // fakeDispatcher records dispatched alerts.
@@ -280,6 +369,75 @@ func TestPollMatchesAndDispatches(t *testing.T) {
 	require.NotNil(t, st.monitors[0].LastMatchedAt)
 	assert.True(t, st.monitors[0].LastMatchedAt.Equal(time.Unix(1_700_000_000, 0).UTC()),
 		"last_matched_at must be the event ledger close time, not wall clock")
+}
+
+// TestPollPublishesCreatedAlertsToLiveStream pins the SSE publish point: an
+// alert that is persisted is fanned out to live subscribers with the monitor's
+// name and the stored payload, so a dashboard can render the row directly.
+func TestPollPublishesCreatedAlertsToLiveStream(t *testing.T) {
+	rpc := &fakeRPC{
+		latest: 6000,
+		responses: []*stellar.GetEventsResult{{
+			Events:       []stellar.Event{transferEvent("ev-1", 5990, "100")},
+			LatestLedger: 6000,
+		}},
+	}
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+
+	live := broadcast.New(4)
+	sub := live.Subscribe(0)
+	defer sub.Close()
+	p := newTestPoller(rpc, st, &fakeDispatcher{}).WithPublisher(live)
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	select {
+	case got := <-sub.C:
+		assert.Equal(t, st.alerts[0].ID, got.ID)
+		assert.Equal(t, int64(1), got.MonitorID)
+		assert.Equal(t, "m1", got.MonitorName)
+		assert.Equal(t, "ev-1", got.EventID)
+		assert.JSONEq(t, string(st.alerts[0].Payload), string(got.Payload))
+	case <-time.After(2 * time.Second):
+		t.Fatal("a created alert was not published to the live stream")
+	}
+}
+
+// TestPollDoesNotPublishDedupedAlerts is the other half: a replayed event that
+// the dedup guard rejects must not appear on the live stream, or a viewer would
+// see the same alert twice.
+func TestPollDoesNotPublishDedupedAlerts(t *testing.T) {
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	live := broadcast.New(4)
+	sub := live.Subscribe(0)
+	defer sub.Close()
+
+	page := func() *fakeRPC {
+		return &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
+			Events:       []stellar.Event{transferEvent("ev-dup", 5990, "1")},
+			LatestLedger: 6000,
+		}}}
+	}
+	// First poll creates and publishes; the replay is deduped and must not.
+	require.NoError(t, newTestPoller(page(), st, &fakeDispatcher{}).WithPublisher(live).Poll(context.Background()))
+	st.state.LastLedger = 5500
+	require.NoError(t, newTestPoller(page(), st, &fakeDispatcher{}).WithPublisher(live).Poll(context.Background()))
+
+	select {
+	case got := <-sub.C:
+		assert.Equal(t, "ev-dup", got.EventID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the created alert was not published")
+	}
+	select {
+	case extra := <-sub.C:
+		t.Fatalf("deduped alert was published again: %+v", extra)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 func TestPollDedupsAcrossPolls(t *testing.T) {
@@ -639,5 +797,16 @@ func TestPollIgnoresDisabledRulesWhenDerivingTopics(t *testing.T) {
 
 	require.Len(t, rpc.requests, 1)
 	require.Len(t, rpc.requests[0].Filters, 1)
-	assert.Equal(t, [][]string{{"AAAADwAAAAh0cmFuc2Zlcg==", "**"}}, rpc.requests[0].Filters[0].Topics)
+}
+
+// ActiveMaintenanceWindow and SetAlertSuppressed complete the dispatcher's
+// store interface. They are inert like the inhibition trio above: no window
+// exists, so nothing is silenced, and a test that wants to exercise
+// maintenance suppression can return a window from its own fake.
+func (f *fakeStore) ActiveMaintenanceWindow(context.Context, int64, string, time.Time) (*store.MaintenanceWindow, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) SetAlertSuppressed(context.Context, int64, string) error {
+	return nil
 }

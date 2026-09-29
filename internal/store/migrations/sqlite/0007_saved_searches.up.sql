@@ -1,16 +1,18 @@
--- SQLite equivalent of the Postgres 0007_saved_searches. As in 0001_init,
--- JSONB becomes TEXT holding JSON (saved searches filter with json_extract)
--- and BOOLEAN becomes INTEGER 0/1.
---
--- The Postgres partial unique index is written as `WHERE is_default = TRUE`
--- and needs no such clause here: SQLite stores false as 0, which is not NULL,
--- so the index would otherwise allow only one non-default row too. The WHERE
--- clause is what keeps it "at most one default" rather than "at most one row".
+-- Parity with the Postgres 0007. JSONB becomes TEXT (the Go layer marshals
+-- the filter, exactly as it does for monitors.contract_ids), TIMESTAMPTZ
+-- becomes TEXT in the fixed 'YYYY-MM-DDTHH:MM:SS.mmmZ' format so lexicographic
+-- order equals chronological order, and BOOLEAN becomes INTEGER 0/1. The
+-- partial unique index keeps at most one default row, mirroring the Postgres
+-- index, so "set this one default" stays a two-statement operation.
+-- SQLite equivalent of the Postgres 0007_saved_searches. JSONB becomes TEXT
+-- (queried with json_extract), timestamps use the fixed strftime format, and
+-- BOOLEAN becomes INTEGER 0/1. The partial unique index on the default row is
+-- supported by SQLite and keeps "exactly one default" true on both backends.
 CREATE TABLE saved_searches (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT    NOT NULL,
     filter     TEXT    NOT NULL DEFAULT '{}',
-    is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+    is_default INTEGER NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
