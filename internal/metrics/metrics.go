@@ -23,13 +23,30 @@ type Metrics struct {
 	pollDuration  prometheus.Histogram
 	pollLagLedger prometheus.Gauge
 
+	// Priority tier gauges: how many contracts each tier carries, and how
+	// far behind the tip the freshest event seen for that tier is. The lag
+	// gauge is labelled by the closed tier set, so cardinality is bounded.
+	pollPriorityContracts *prometheus.GaugeVec
+	pollPriorityLag       *prometheus.GaugeVec
+
+	// Reorg detection: how many reorgs have been seen, and the ledger of the
+	// most recent one. Both are expected to sit at zero.
+	reorgsTotal     prometheus.Counter
+	lastReorgLedger prometheus.Gauge
+
 	eventsScanned   prometheus.Counter
 	eventsMatched   prometheus.Counter
 	ruleEvaluations prometheus.Counter
 	alertsFired     prometheus.Counter
 	deliveries      *prometheus.CounterVec
-	httpDuration   *prometheus.HistogramVec
-	lastPollAgoSec prometheus.Gauge
+	throttles       *prometheus.CounterVec
+	httpDuration    *prometheus.HistogramVec
+	lastPollAgoSec  prometheus.Gauge
+	breakerStates   *prometheus.GaugeVec
+
+	storeReads     *prometheus.CounterVec
+	storeFallbacks prometheus.Counter
+	replicaEnabled prometheus.Gauge
 }
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
@@ -52,6 +69,26 @@ func New() *Metrics {
 		pollLagLedger: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers",
 			Help: "How far the poller's resume point trails the chain tip, in ledgers.",
+		}),
+
+		pollPriorityContracts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_poll_priority_contracts",
+			Help: "Watched contracts per poll-priority tier (low|normal|high).",
+		}, []string{"priority"}),
+
+		pollPriorityLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_poll_lag_ledgers_by_priority",
+			Help: "Ledger lag of the freshest event seen for each poll-priority tier this cycle.",
+		}, []string{"priority"}),
+
+		reorgsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_reorgs_total",
+			Help: "Chain reorganisations detected within the tracking window. Expected to stay at zero.",
+		}),
+
+		lastReorgLedger: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_last_reorg_ledger",
+			Help: "Ledger at which the most recent reorganisation diverged from the ingested chain.",
 		}),
 
 		eventsScanned: prometheus.NewCounter(prometheus.CounterOpts{
@@ -79,6 +116,16 @@ func New() *Metrics {
 			Help: "Alert deliveries, by channel type and outcome (ok|error).",
 		}, []string{"channel", "outcome"}),
 
+		throttles: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_throttles_total",
+			Help: "Throttled alert delivery attempts, by channel type.",
+		}, []string{"channel"}),
+
+		breakerStates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_breaker_state",
+			Help: "Circuit breaker state for each channel (0=closed, 1=half-open, 2=open).",
+		}, []string{"channel_id", "channel_type", "state"}),
+
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
 			Help:    "HTTP request duration by route pattern, method and status.",
@@ -89,16 +136,53 @@ func New() *Metrics {
 			Name: "sorobeacon_seconds_since_last_poll",
 			Help: "Seconds since the poller last completed a cycle. Grows without bound when polling has stopped.",
 		}),
+
+		// Where read-only queries actually went. The pool label is the closed
+		// set {primary, replica}, so cardinality is bounded; watching the ratio
+		// is how an operator confirms replica routing is doing anything, and
+		// the fallback counter is how they see it stop.
+		storeReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_store_reads_total",
+			Help: "Read-only store queries by the pool that served them.",
+		}, []string{"pool"}),
+
+		storeFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_store_replica_fallbacks_total",
+			Help: "Read-only queries that were served by the primary because the replica was unavailable.",
+		}),
+
+		replicaEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_enabled",
+			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired,
-		m.deliveries, m.httpDuration, m.lastPollAgoSec)
+		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
+		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
+		m.reorgsTotal, m.lastReorgLedger, m.breakerStates,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled)
 	return m
 }
 
 // Handler serves the metrics registry in Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// RegisterStreamDropped exposes the live-alerts broadcaster's dropped-event
+// counter on /metrics. The callback is read lazily on each scrape, so the
+// broadcaster keeps its own cheap atomic counter and this package does not
+// need to import it. A nil callback (or nil receiver) registers nothing.
+func (m *Metrics) RegisterStreamDropped(dropped func() uint64) {
+	if m == nil || dropped == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "sorobeacon_alerts_stream_dropped_total",
+		Help: "Alert events dropped from the live SSE stream because a subscriber could not keep up.",
+	}, func() float64 {
+		return float64(dropped())
+	}))
 }
 
 // RecordPoll observes one completed poll cycle.
@@ -124,6 +208,41 @@ func (m *Metrics) SetPollLag(ledgersBehind int64) {
 	m.pollLagLedger.Set(float64(ledgersBehind))
 }
 
+// SetPriorityContracts records how many contracts the cycle scheduled in each
+// priority tier. It is a gauge, not a counter: contracts are added and removed
+// constantly, so the useful question is "how big is this tier now".
+func (m *Metrics) SetPriorityContracts(priority string, contracts int) {
+	if m == nil {
+		return
+	}
+	m.pollPriorityContracts.WithLabelValues(priority).Set(float64(contracts))
+}
+
+// RecordReorg counts one detected chain reorganisation and records where it
+// diverged.
+func (m *Metrics) RecordReorg(ledger uint32) {
+	if m == nil {
+		return
+	}
+	m.reorgsTotal.Inc()
+	m.lastReorgLedger.Set(float64(ledger))
+}
+
+// SetPollLagByPriority records the ledger lag of the freshest event seen for
+// one priority tier in the cycle that just finished. A tier whose contracts
+// are scheduled later in a slow cycle shows a larger lag here even though the
+// cycle-wide lag is the same, which is what makes the scheduling effect
+// measurable.
+func (m *Metrics) SetPollLagByPriority(priority string, ledgersBehind int64) {
+	if m == nil {
+		return
+	}
+	if ledgersBehind < 0 {
+		ledgersBehind = 0
+	}
+	m.pollPriorityLag.WithLabelValues(priority).Set(float64(ledgersBehind))
+}
+
 // TickPollAge advances the seconds-since-last-poll gauge; called on a timer
 // so the gauge climbs visibly when polling has stalled.
 func (m *Metrics) TickPollAge(secondsSince float64) {
@@ -143,7 +262,7 @@ func (m *Metrics) RecordEvents(scanned, matched int) {
 	m.eventsMatched.Add(float64(matched))
 }
 
-// RecordRuleEvaluations counts the rule evaluations (one per event × enabled
+// RecordRuleEvaluations counts the rule evaluations (one per event x enabled
 // rule) in the cycle that just ran. It is deliberately separate from
 // RecordEvents so a monitor with many rules is distinguishable from a busy
 // contract.
@@ -177,6 +296,62 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
 }
 
+// RecordStoreRead counts one read-only store query and which pool answered it.
+// pool is "primary" or "replica" — a static set chosen by the store, never
+// request-derived, so cardinality stays bounded.
+func (m *Metrics) RecordStoreRead(pool string) {
+	if m == nil {
+		return
+	}
+	m.storeReads.WithLabelValues(pool).Inc()
+}
+
+// RecordReplicaFallback counts one read that was routed to the replica but had
+// to be replayed on the primary. A steady rate here means the replica is
+// unreachable or lagging past its timeout and the routing is buying nothing.
+func (m *Metrics) RecordReplicaFallback() {
+	if m == nil {
+		return
+	}
+	m.storeFallbacks.Inc()
+}
+
+// SetReplicaEnabled records whether a read replica is configured. It is a
+// gauge, not a constant, because routing can be turned off at runtime without
+// a restart by the store itself.
+func (m *Metrics) SetReplicaEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	if enabled {
+		m.replicaEnabled.Set(1)
+		return
+	}
+	m.replicaEnabled.Set(0)
+}
+
+// RecordThrottle counts one throttled delivery per channel type.
+func (m *Metrics) RecordThrottle(channelType string) {
+	if m == nil {
+		return
+	}
+	m.throttles.WithLabelValues(channelType).Inc()
+}
+
+// SetBreakerState sets the gauge value for a channel's circuit breaker state.
+func (m *Metrics) SetBreakerState(channelID string, channelType string, state string) {
+	if m == nil {
+		return
+	}
+	for _, s := range []string{"closed", "open", "half-open"} {
+		val := float64(0)
+		if s == state {
+			val = 1
+		}
+		m.breakerStates.WithLabelValues(channelID, channelType, s).Set(val)
+	}
+}
+
 // statusRecorder captures the status code a handler wrote, for the HTTP
 // duration metric.
 type statusRecorder struct {
@@ -201,13 +376,9 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		// Fall back to the raw path if no route-pattern provider is wired: a
-		// nil function must not panic the whole server over a metric.
 		route := r.URL.Path
-		if RoutePattern != nil {
-			if p := RoutePattern(r); p != "" {
-				route = p
-			}
+		if p := RoutePattern(r); p != "" {
+			route = p
 		}
 		m.httpDuration.WithLabelValues(route, r.Method, strconv.Itoa(rec.status)).
 			Observe(time.Since(start).Seconds())

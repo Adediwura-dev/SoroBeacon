@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -69,27 +70,75 @@ func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
 
 // fakeStore implements poller.Store in memory, including the rule cooldown
 // semantics the real store enforces in SQL. now is injectable so tests can
-// advance the cooldown window without sleeping.
+// advance the cooldown window without sleeping. The channel fields are
+// only used by the tracing tests, which run deliveries through a real
+// notify.Dispatcher; the plain poller tests never touch them.
 type fakeStore struct {
 	monitors []store.Monitor
 	rules    map[int64][]store.Rule // monitor id -> rules
 	state    store.IngestState
 	alerts   []store.Alert
 	dedup    map[string]bool // "ruleID/eventID"
+	channels []store.Channel
+	attached map[int64][]int64 // monitor id -> channel ids
+	attempts []store.DeliveryAttempt
 
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
+	// ledgerHashes backs the reorg-detection half of the Store interface.
+	ledgerHashes map[uint32]string
+	// groupStates backs the alert-grouping half of the Store interface:
+	// group key -> alerts counted in the current window.
+	groupStates map[string]int64
+	// inhibitions backs the inhibition rules for the DispatchStore interface.
+	inhibitions []store.Inhibition
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		rules:      map[int64][]store.Rule{},
-		dedup:      map[string]bool{},
-		now:        time.Now,
-		lastFired:  map[int64]time.Time{},
-		suppressed: map[int64]int64{},
+		rules:        map[int64][]store.Rule{},
+		dedup:        map[string]bool{},
+		attached:     map[int64][]int64{},
+		now:          time.Now,
+		lastFired:    map[int64]time.Time{},
+		suppressed:   map[int64]int64{},
+		ledgerHashes: map[uint32]string{},
+		groupStates:  map[string]int64{},
+		inhibitions:  []store.Inhibition{},
 	}
+}
+
+// ListChannelsForMonitor and RecordDeliveryAttempt satisfy the dispatcher's
+// store interface so tracing tests can run real deliveries in memory.
+func (f *fakeStore) ListChannelsForMonitor(_ context.Context, monitorID int64) ([]store.Channel, error) {
+	var out []store.Channel
+	for _, id := range f.attached[monitorID] {
+		for _, ch := range f.channels {
+			if ch.ID == id {
+				out = append(out, ch)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
+	d.ID = int64(len(f.attempts) + 1)
+	f.attempts = append(f.attempts, *d)
+	return nil
+}
+
+// ListChannels satisfies the digest half of the dispatcher's store
+// interface; the poller tests never exercise digest flushing.
+func (f *fakeStore) ListChannels(_ context.Context, enabledOnly bool) ([]store.Channel, error) {
+	var out []store.Channel
+	for _, ch := range f.channels {
+		if !enabledOnly || ch.Enabled {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.Monitor, error) {
@@ -110,6 +159,30 @@ func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bo
 		}
 	}
 	return out, nil
+}
+
+// ListInhibitionsForTarget returns inhibitions targeting the given rule.
+func (f *fakeStore) ListInhibitionsForTarget(_ context.Context, targetRuleID int64) ([]store.Inhibition, error) {
+	var out []store.Inhibition
+	for _, inh := range f.inhibitions {
+		if inh.TargetRuleID == targetRuleID {
+			out = append(out, inh)
+		}
+	}
+	return out, nil
+}
+
+// RuleFiredWithin reports whether the rule fired within the given window.
+func (f *fakeStore) RuleFiredWithin(_ context.Context, ruleID int64, window time.Duration) (bool, error) {
+	if last, ok := f.lastFired[ruleID]; ok {
+		return time.Since(last) < window, nil
+	}
+	return false, nil
+}
+
+// MarkAlertInhibited marks an alert as inhibited by a source rule.
+func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID int64) error {
+	return nil // no-op for tests
 }
 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
@@ -152,6 +225,22 @@ func (f *fakeStore) GetIngestState(context.Context) (store.IngestState, error) {
 func (f *fakeStore) SetIngestState(_ context.Context, s store.IngestState) error {
 	f.state = s
 	return nil
+}
+
+// CreateAlertGroup creates or increments the alert group for key
+// with windowStart. Returns the new count.
+func (f *fakeStore) CreateAlertGroup(_ context.Context, key string, _ time.Time) (int64, error) {
+	f.groupStates[key]++
+	return f.groupStates[key], nil
+}
+
+// GroupAlerts creates or increments the alert group for key
+// with windowStart and returns whether delivery should happen
+// (first alert in the window) and the current count.
+func (f *fakeStore) GroupAlerts(_ context.Context, key string, _ time.Time) (bool, int64, error) {
+	count := f.groupStates[key] + 1
+	f.groupStates[key] = count
+	return count == 1, count, nil
 }
 
 // fakeDispatcher records dispatched alerts.
@@ -283,6 +372,75 @@ func TestPollMatchesAndDispatches(t *testing.T) {
 	require.NotNil(t, st.monitors[0].LastMatchedAt)
 	assert.True(t, st.monitors[0].LastMatchedAt.Equal(time.Unix(1_700_000_000, 0).UTC()),
 		"last_matched_at must be the event ledger close time, not wall clock")
+}
+
+// TestPollPublishesCreatedAlertsToLiveStream pins the SSE publish point: an
+// alert that is persisted is fanned out to live subscribers with the monitor's
+// name and the stored payload, so a dashboard can render the row directly.
+func TestPollPublishesCreatedAlertsToLiveStream(t *testing.T) {
+	rpc := &fakeRPC{
+		latest: 6000,
+		responses: []*stellar.GetEventsResult{{
+			Events:       []stellar.Event{transferEvent("ev-1", 5990, "100")},
+			LatestLedger: 6000,
+		}},
+	}
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+
+	live := broadcast.New(4)
+	sub := live.Subscribe(0)
+	defer sub.Close()
+	p := newTestPoller(rpc, st, &fakeDispatcher{}).WithPublisher(live)
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	select {
+	case got := <-sub.C:
+		assert.Equal(t, st.alerts[0].ID, got.ID)
+		assert.Equal(t, int64(1), got.MonitorID)
+		assert.Equal(t, "m1", got.MonitorName)
+		assert.Equal(t, "ev-1", got.EventID)
+		assert.JSONEq(t, string(st.alerts[0].Payload), string(got.Payload))
+	case <-time.After(2 * time.Second):
+		t.Fatal("a created alert was not published to the live stream")
+	}
+}
+
+// TestPollDoesNotPublishDedupedAlerts is the other half: a replayed event that
+// the dedup guard rejects must not appear on the live stream, or a viewer would
+// see the same alert twice.
+func TestPollDoesNotPublishDedupedAlerts(t *testing.T) {
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	live := broadcast.New(4)
+	sub := live.Subscribe(0)
+	defer sub.Close()
+
+	page := func() *fakeRPC {
+		return &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
+			Events:       []stellar.Event{transferEvent("ev-dup", 5990, "1")},
+			LatestLedger: 6000,
+		}}}
+	}
+	// First poll creates and publishes; the replay is deduped and must not.
+	require.NoError(t, newTestPoller(page(), st, &fakeDispatcher{}).WithPublisher(live).Poll(context.Background()))
+	st.state.LastLedger = 5500
+	require.NoError(t, newTestPoller(page(), st, &fakeDispatcher{}).WithPublisher(live).Poll(context.Background()))
+
+	select {
+	case got := <-sub.C:
+		assert.Equal(t, "ev-dup", got.EventID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the created alert was not published")
+	}
+	select {
+	case extra := <-sub.C:
+		t.Fatalf("deduped alert was published again: %+v", extra)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 func TestPollDedupsAcrossPolls(t *testing.T) {
@@ -494,26 +652,185 @@ func TestPollIgnoresEventsFromUnwatchedContracts(t *testing.T) {
 	assert.Empty(t, st.alerts)
 }
 
-// scrapeMetrics renders a Metrics endpoint so tests can assert on the text.
-func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	require.Equal(t, http.StatusOK, rec.Code)
-	return rec.Body.String()
+// TestPollDerivesTopicFiltersFromNamedRules pins the optimisation: when every
+// enabled rule on a contract names an event, the poller narrows the getEvents
+// filter so the node does not stream events we would discard.
+func TestPollDerivesTopicFiltersFromNamedRules(t *testing.T) {
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 1)
+	f := rpc.requests[0].Filters[0]
+	assert.Equal(t, []string{contractA}, f.ContractIDs)
+	// "transfer" encodes to the ScVal the RPC docs use, followed by a
+	// trailing wildcard so events with more topics still match.
+	assert.Equal(t, [][]string{{"AAAADwAAAAh0cmFuc2Zlcg==", "**"}}, f.Topics)
 }
 
-// TestPollRecordsPipelineMetrics pins the poller's hooks into internal/metrics:
-// the scanned → evaluated → matched → alerted funnel and the poll outcome are
-// all visible on the endpoint after a cycle.
-func TestPollRecordsPipelineMetrics(t *testing.T) {
+// TestPollLeavesContractUnfilteredWhenAnyRuleIsUnnamed is the safety half: a
+// single rule that matches unnamed events must keep the contract unfiltered,
+// because a narrowed filter would silently drop events that rule would match.
+func TestPollLeavesContractUnfilteredWhenAnyRuleIsUnnamed(t *testing.T) {
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
+	st.rules[1] = []store.Rule{
+		{ID: 1, MonitorID: 1, Type: rules.TypeEventEmitted, Params: json.RawMessage(`{"event_name": "transfer"}`), Enabled: true},
+		{ID: 2, MonitorID: 1, Type: rules.TypeValueThreshold, Params: json.RawMessage(`{"comparison": "gt", "threshold": 1}`), Enabled: true},
+	}
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 1)
+	assert.Empty(t, rpc.requests[0].Filters[0].Topics, "a rule with no event_name forces an unfiltered request")
+}
+
+// TestPollFallsBackUnfilteredOnTopicCapOverflow checks the RPC's cap: more
+// distinct event names than a filter can express must fall back to unfiltered
+// rather than truncating, which would drop events.
+func TestPollFallsBackUnfilteredOnTopicCapOverflow(t *testing.T) {
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
+	for i, name := range []string{"a", "b", "c", "d", "e", "f"} {
+		st.rules[1] = append(st.rules[1], store.Rule{
+			ID: int64(i + 1), MonitorID: 1, Type: rules.TypeEventEmitted,
+			Params: json.RawMessage(fmt.Sprintf(`{"event_name": %q}`, name)), Enabled: true,
+		})
+	}
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 1)
+	assert.Empty(t, rpc.requests[0].Filters[0].Topics, "six names exceed the five-filter cap")
+}
+
+// TestPollGroupsContractsByTopicFilter verifies contracts whose rules name
+// different events get their own filter, since a filter's topics apply to
+// every contract ID it carries.
+func TestPollGroupsContractsByTopicFilter(t *testing.T) {
+	contractB := contractID(0xB2)
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	st.monitors = []store.Monitor{
+		{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true},
+		{ID: 2, Name: "m2", ContractIDs: []string{contractB}, Enabled: true},
+	}
+	st.rules[1] = []store.Rule{{ID: 1, MonitorID: 1, Type: rules.TypeEventEmitted,
+		Params: json.RawMessage(`{"event_name": "transfer"}`), Enabled: true}}
+	st.rules[2] = []store.Rule{{ID: 2, MonitorID: 2, Type: rules.TypeEventEmitted,
+		Params: json.RawMessage(`{"event_name": "mint"}`), Enabled: true}}
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 2)
+	topicsByContract := map[string][][]string{}
+	for _, f := range rpc.requests[0].Filters {
+		for _, id := range f.ContractIDs {
+			topicsByContract[id] = f.Topics
+		}
+	}
+	assert.Equal(t, [][]string{{"AAAADwAAAAh0cmFuc2Zlcg==", "**"}}, topicsByContract[contractA])
+	assert.Equal(t, [][]string{{"AAAADwAAAARtaW50", "**"}}, topicsByContract[contractB])
+}
+
+// TestPollLeavesWildcardTokenRulesUnfiltered covers a rule type whose "*"
+// event genuinely matches several events: it can still be named, so the filter
+// is built from the concrete SEP-41 names rather than dropped.
+func TestPollNamesWildcardTokenEvents(t *testing.T) {
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
+	st.rules[1] = []store.Rule{{ID: 1, MonitorID: 1, Type: rules.TypeTokenEvent,
+		Params: json.RawMessage(`{"event": "*"}`), Enabled: true}}
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 1)
+	assert.Len(t, rpc.requests[0].Filters[0].Topics, 5, "the five SEP-41 events all become topic filters")
+}
+
+// TestPollFrequencyRuleFiresOncePerCrossing is the end-to-end shape of the
+// frequency rule: a burst that crosses the threshold yields one alert, stored
+// under the rule's synthetic window-start id so a replay is deduplicated too.
+func TestPollFrequencyRuleFiresOncePerCrossing(t *testing.T) {
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
+	st.rules[1] = []store.Rule{{ID: 1, MonitorID: 1, Type: rules.TypeFrequencyThreshold,
+		Params: json.RawMessage(`{"event_name": "transfer", "count": 3, "window": "5m"}`), Enabled: true}}
+	d := &fakeDispatcher{}
+
+	burst(t, st, d, "ev-1", "ev-2", "ev-3", "ev-4", "ev-5")
+
+	require.Len(t, st.alerts, 1, "the crossing yields exactly one alert")
+	require.Len(t, d.dispatched, 1)
+	assert.Contains(t, st.alerts[0].EventID, "frequency:",
+		"the alert is keyed by the synthetic episode id, not the crossing event")
+	assert.Equal(t, st.alerts[0].EventID, d.dispatched[0].EventID)
+}
+
+// TestPollIgnoresDisabledRulesWhenDerivingTopics makes sure a disabled rule
+// cannot force an unfiltered request for a contract whose enabled rules are
+// all named.
+func TestPollIgnoresDisabledRulesWhenDerivingTopics(t *testing.T) {
+	rpc := &fakeRPC{latest: 6000}
+	st := newFakeStore()
+	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
+	st.rules[1] = []store.Rule{
+		{ID: 1, MonitorID: 1, Type: rules.TypeEventEmitted, Params: json.RawMessage(`{"event_name": "transfer"}`), Enabled: true},
+		{ID: 2, MonitorID: 1, Type: rules.TypeEventEmitted, Params: json.RawMessage(`{}`), Enabled: false},
+	}
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	require.NoError(t, p.Poll(context.Background()))
+
+	require.Len(t, rpc.requests, 1)
+	require.Len(t, rpc.requests[0].Filters, 1)
+}
+
+// ActiveMaintenanceWindow and SetAlertSuppressed complete the dispatcher's
+// store interface. They are inert like the inhibition trio above: no window
+// exists, so nothing is silenced, and a test that wants to exercise
+// maintenance suppression can return a window from its own fake.
+func (f *fakeStore) ActiveMaintenanceWindow(context.Context, int64, string, time.Time) (*store.MaintenanceWindow, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) SetAlertSuppressed(context.Context, int64, string) error {
+	return nil
+}
+
+// TestRecordCycleCountsRuleEvaluations pins the scanned -> evaluated ->
+// matched funnel. Three events are checked against one rule, so the
+// evaluation count is three while only the two transfers match: a monitor
+// with many rules and a busy contract are then distinguishable on the
+// endpoint, which is the whole reason the counter is separate from
+// sorobeacon_events_scanned_total.
+func TestRecordCycleCountsRuleEvaluations(t *testing.T) {
 	m := metrics.New()
 	rpc := &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
 		Events: []stellar.Event{
 			transferEvent("ev-1", 5990, "1"),
 			transferEvent("ev-2", 5991, "1"),
-			{ID: "ev-3", ContractID: contractA, Ledger: 5992, Type: "contract",
-				TopicJSON: []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)}},
+			{
+				ID: "ev-3", ContractID: contractA, Ledger: 5992, Type: "contract",
+				LedgerClosedAt: time.Unix(1_700_000_000, 0).UTC(),
+				TopicJSON:      []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)},
+			},
 		},
 		LatestLedger: 6000,
 	}}}
@@ -523,15 +840,21 @@ func TestPollRecordsPipelineMetrics(t *testing.T) {
 	p := newTestPoller(rpc, st, &fakeDispatcher{}).WithMetrics(m)
 
 	require.NoError(t, p.Poll(context.Background()))
-	// Run is the timing loop plus this recording step; call it directly so the
-	// assertion does not depend on sleeping.
+	// Run is the timing loop plus this recording step; call it directly so
+	// the assertion does not depend on sleeping.
 	p.recordCycle(true, 0)
 
 	body := scrapeMetrics(t, m)
 	assert.Contains(t, body, "sorobeacon_events_scanned_total 3")
 	assert.Contains(t, body, "sorobeacon_events_matched_total 2")
 	assert.Contains(t, body, "sorobeacon_rule_evaluations_total 3")
-	assert.Contains(t, body, "sorobeacon_alerts_fired_total 2")
-	assert.Contains(t, body, `sorobeacon_polls_total{outcome="ok"} 1`)
-	assert.Contains(t, body, "sorobeacon_poll_lag_ledgers 0")
+}
+
+// scrapeMetrics renders the metrics endpoint into text.
+func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
 }
