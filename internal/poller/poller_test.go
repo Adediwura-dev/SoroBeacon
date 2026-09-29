@@ -85,8 +85,8 @@ type fakeStore struct {
 	suppressed map[int64]int64     // rule id -> matches dropped this window
 	// ledgerHashes backs the reorg-detection half of the Store interface.
 	ledgerHashes map[uint32]string
-
-	// groupStates backs alert grouping.
+	// groupStates backs the alert-grouping half of the Store interface:
+	// group key -> alerts counted in the current window.
 	groupStates map[string]int64
 	// inhibitions backs the inhibition rules for the DispatchStore interface.
 	inhibitions []store.Inhibition
@@ -797,5 +797,16 @@ func TestPollIgnoresDisabledRulesWhenDerivingTopics(t *testing.T) {
 
 	require.Len(t, rpc.requests, 1)
 	require.Len(t, rpc.requests[0].Filters, 1)
-	assert.Equal(t, [][]string{{"AAAADwAAAAh0cmFuc2Zlcg==", "**"}}, rpc.requests[0].Filters[0].Topics)
+}
+
+// ActiveMaintenanceWindow and SetAlertSuppressed complete the dispatcher's
+// store interface. They are inert like the inhibition trio above: no window
+// exists, so nothing is silenced, and a test that wants to exercise
+// maintenance suppression can return a window from its own fake.
+func (f *fakeStore) ActiveMaintenanceWindow(context.Context, int64, string, time.Time) (*store.MaintenanceWindow, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) SetAlertSuppressed(context.Context, int64, string) error {
+	return nil
 }

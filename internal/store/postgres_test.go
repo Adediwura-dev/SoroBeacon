@@ -34,6 +34,36 @@ func newTestPostgres(t *testing.T) conformanceStore {
 	return st
 }
 
+// testStore returns a migrated Postgres store, skipping the test when
+// TEST_DATABASE_URL is unset so `go test ./...` still works without a
+// database. It returns the concrete *Postgres rather than conformanceStore
+// because callers need the methods that are not on that interface, chiefly
+// WithConfigCipher.
+func testStore(t *testing.T) *Postgres {
+	t.Helper()
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres-backed test")
+	}
+	require.NoError(t, Migrate(url))
+	st, err := NewPostgres(context.Background(), url, PoolSettings{})
+	require.NoError(t, err)
+	t.Cleanup(st.Close)
+	require.NoError(t, st.resetConformance(context.Background()))
+	return st
+}
+
+// rawChannelConfig reads the config column straight out of the table, so a
+// test can assert on what actually landed rather than on what the store hands
+// back after decryption. It fails the test instead of returning an error,
+// which keeps the call sites to one line.
+func rawChannelConfig(t *testing.T, st *Postgres, id int64) []byte {
+	t.Helper()
+	raw, err := st.rawChannelConfig(context.Background(), id)
+	require.NoError(t, err)
+	return raw
+}
+
 // The methods below satisfy conformanceStore. They are the only Postgres-aware
 // code in the suite: everything else asserts on the Store interface, so the
 // SQLite backend is held to the identical contract.
@@ -41,7 +71,7 @@ func newTestPostgres(t *testing.T) conformanceStore {
 func (p *Postgres) resetConformance(ctx context.Context) error {
 	_, err := p.pool.Exec(ctx,
 		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts,
-		         saved_searches, monitor_templates, audit_log, pending_digests RESTART IDENTITY CASCADE;
+		         saved_searches, monitor_templates, audit_log, pending_digests, maintenance_windows RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	return err
 }

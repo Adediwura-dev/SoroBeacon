@@ -198,6 +198,25 @@
         }
       }
     },
+    "/monitors/{id}/stats": {
+      "parameters": [ { "$ref": "#/components/parameters/ID" } ],
+      "get": {
+        "summary": "Per-monitor statistics",
+        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "responses": {
+          "200": {
+            "description": "MonitorStats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MonitorStats" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/monitors/{id}/duplicate": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -471,6 +490,113 @@
         }
       }
     },
+    "/maintenance-windows": {
+      "post": {
+        "summary": "Create a maintenance window",
+        "description": "Time-bounded silence. Alerts raised inside the window are still persisted and visible but are not delivered.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List maintenance windows",
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows containing the current time"
+          },
+          {
+            "name": "upcoming",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows starting in the future"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Maintenance windows",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindowPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/maintenance-windows/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Fetch one maintenance window",
+        "responses": {
+          "200": {
+            "description": "Maintenance window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a maintenance window",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a maintenance window",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/inhibitions": {
       "post": {
         "summary": "Create an inhibition rule",
@@ -563,22 +689,28 @@
             "description": "Exact match on payload.contract_id"
           },
           {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
             "name": "sort",
             "in": "query",
             "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
             "description": "Keyset order; anything else is 400"
           },
           {
-            "name": "since",
+            "name": "from",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 lower bound on alert creation"
+            "description": "RFC 3339 lower bound on alert creation, inclusive"
           },
           {
-            "name": "until",
+            "name": "to",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 upper bound on alert creation"
+            "description": "RFC 3339 upper bound on alert creation, exclusive"
           },
           {
             "name": "limit",
@@ -651,6 +783,12 @@
             "description": "Exact match on payload.contract_id"
           },
           {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
             "name": "from",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
@@ -708,6 +846,12 @@
             "in": "query",
             "schema": { "type": "string" },
             "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "from",
@@ -846,7 +990,7 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. Reports `leader` (whether this instance holds the poller lease), `leader_election` (whether a lease exists to hold at all; false for a single-node/ SQLite deployment) and `leader_since`. A follower is healthy: it serves the API and dashboard and returns 200.",
         "security": [],
         "responses": {
           "200": { "description": "Healthy" },
@@ -901,6 +1045,21 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Version" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rule-types": {
+      "get": {
+        "summary": "List rule types and parameter schemas",
+        "responses": {
+          "200": {
+            "description": "Registered rule types",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RuleTypesResponse" }
               }
             }
           }
@@ -1230,6 +1389,39 @@
       }
     },
     "schemas": {
+      "RuleTypesResponse": {
+        "type": "object",
+        "required": ["rule_types"],
+        "properties": {
+          "rule_types": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleType" }
+          }
+        }
+      },
+      "RuleType": {
+        "type": "object",
+        "required": ["type", "parameters"],
+        "properties": {
+          "type": { "type": "string" },
+          "parameters": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleParameter" }
+          }
+        }
+      },
+      "RuleParameter": {
+        "type": "object",
+        "required": ["name", "type", "required", "default", "description"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["string", "number", "object", "select"] },
+          "required": { "type": "boolean" },
+          "default": { "type": "string" },
+          "description": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],
@@ -1284,6 +1476,31 @@
           }
         }
       },
+      "MonitorStats": {
+        "type": "object",
+        "properties": {
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "alerts": { "type": "integer", "format": "int64" },
+          "alerts_last_24h": { "type": "integer", "format": "int64" },
+          "alerts_last_7d": { "type": "integer", "format": "int64" },
+          "last_alert_at": { "type": "string", "format": "date-time", "description": "Absent when the monitor has never alerted" },
+          "deliveries_succeeded": { "type": "integer", "format": "int64" },
+          "deliveries_failed": { "type": "integer", "format": "int64" },
+          "rules": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleMatchCount" },
+            "description": "Every rule of the monitor, matched or not"
+          }
+        }
+      },
+      "RuleMatchCount": {
+        "type": "object",
+        "properties": {
+          "rule_id": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "alerts": { "type": "integer", "format": "int64" }
+        }
+      },
       "MonitorInput": {
         "type": "object",
         "required": ["name", "contract_ids"],
@@ -1333,7 +1550,7 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window"]
           },
           "params": { "type": "object" },
           "enabled": { "type": "boolean" }
@@ -1370,7 +1587,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window"]
           },
           "params": {
             "type": "object",
@@ -1386,10 +1603,14 @@
           "name": { "type": "string" },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": { "type": "object" },
-          "enabled": { "type": "boolean" }
+          "enabled": { "type": "boolean" },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
+          }
         }
       },
       "ChannelInput": {
@@ -1399,7 +1620,7 @@
           "name": { "type": "string", "minLength": 1 },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": {
             "type": "object",
@@ -1417,6 +1638,10 @@
             "format": "int64",
             "minimum": 0,
             "description": "Accumulation window when digest_mode is window; must be > 0 then"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
           }
         }
       },
@@ -1469,7 +1694,43 @@
           "event_id": { "type": "string" },
           "event_name": { "type": "string" },
           "payload": { "type": "object" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "suppressed": { "type": "boolean", "description": "True when a maintenance window silenced delivery" },
+          "suppression_reason": { "type": "string" }
+        }
+      },
+      "MaintenanceWindow": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "reason": { "type": "string" },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "contract_id": { "type": "string" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time" },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MaintenanceWindowInput": {
+        "type": "object",
+        "required": ["reason", "scope", "start_at", "end_at"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64", "description": "Required when scope is monitor" },
+          "contract_id": { "type": "string", "description": "Required when scope is contract" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time", "description": "Must be after start_at; open-ended windows are rejected" }
+        }
+      },
+      "MaintenanceWindowPage": {
+        "type": "object",
+        "properties": {
+          "maintenance_windows": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MaintenanceWindow" }
+          }
         }
       },
       "DeliveryAttempt": {

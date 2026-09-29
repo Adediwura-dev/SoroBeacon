@@ -18,15 +18,17 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/api/graphql"
 	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
-	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/backfill"
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	sorogrpc "github.com/sorotrail/sorobeacon/internal/grpc"
 	"github.com/sorotrail/sorobeacon/internal/horizon"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -154,11 +156,18 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
+	// Metrics are built before the store now, because the store labels every
+	// routed read with the pool that served it. Nothing else about the order
+	// changes: m is still the same instance the poller, the dispatcher and the
+	// HTTP middleware use below.
+	m := metrics.New()
 	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
+		ReplicaURL:      cfg.ReplicaDatabaseURL,
+		Metrics:         m,
 	}, configCipher)
 	if err != nil {
 		return err
@@ -174,6 +183,32 @@ func run() error {
 	}
 	defer st.Close()
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
+	if cfg.ReplicaDatabaseURL != "" {
+		// The URL itself stays out of the line: it carries credentials. The
+		// host is the part an operator checks, and LogAttrs already printed it
+		// redacted at startup.
+		log.Info("read replica enabled", "routed_reads", "monitors list, alert search, stats, alert counts by day")
+	}
+
+	// Leadership. Every instance serves the API and the dashboard, but only the
+	// one holding the lease runs the ingest loop: two pollers ingest the same
+	// events and race the same checkpoint, so alerts arrive twice and each
+	// instance believes the other's progress is its own. Postgres supplies the
+	// election as a session advisory lock, which needs no table and no
+	// migration. A SQLite database cannot be shared between machines and has no
+	// advisory locks, so a SQLite deployment is always the poller.
+	//
+	// Failing to build the lease is fatal rather than a silent fall back to
+	// "everyone polls", which is the bug this prevents.
+	var leader *lease.Lease
+	if store.BackendName(cfg.DatabaseURL) == "postgres" {
+		leader, err = lease.NewPostgres(cfg.DatabaseURL, lease.Options{}, log)
+		if err != nil {
+			return err
+		}
+	} else {
+		leader = lease.SingleNode(log)
+	}
 
 	// Postgres partitions alerts by month. Make sure the months just ahead
 	// exist before the poller can write into them, so a row never has to fall
@@ -194,14 +229,24 @@ func run() error {
 	}
 	logStartupHealth(ctx, log, health)
 
-	m := metrics.New()
 	registry := rules.NewRegistry()
 	// The frequency rule keeps a rolling window per rule in memory. Rebuild it
 	// from the alerts already stored so a restart does not forget that the rule
 	// fired and alert again for the same episode.
+	//
+	// This read has to see alerts this process wrote moments ago, so it
+	// bypasses replica routing when the store offers a primary-bound reader:
+	// a window rebuilt from a replica that is even slightly behind is missing
+	// its most recent matches, and the rule would re-fire for an episode it
+	// has already alerted on. SQLite does not route reads, so it does not
+	// implement PrimaryReader and its ListAlerts is already the primary.
+	rebuildAlerts := st.ListAlerts
+	if pr, ok := st.(store.PrimaryReader); ok {
+		rebuildAlerts = pr.ListAlertsPrimary
+	}
 	registry.Register(rules.TypeFrequencyThreshold, rules.NewFrequencyThreshold().WithMatchLog(
 		rules.MatchLogFunc(func(ctx context.Context, ruleID int64, since time.Time) ([]rules.MatchRecord, error) {
-			alerts, err := st.ListAlerts(ctx, store.AlertFilter{RuleID: ruleID, From: since, Sort: "created_at_asc", Limit: 1000})
+			alerts, err := rebuildAlerts(ctx, store.AlertFilter{RuleID: ruleID, From: since, Sort: "created_at_asc", Limit: 1000})
 			if err != nil {
 				return nil, err
 			}
@@ -219,6 +264,10 @@ func run() error {
 		factory.WithSecrets(resolver)
 	}
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m).WithDigestQueue(st)
+	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
+	if err != nil {
+		return err
+	}
 	// One in-process fan-out carries newly created alerts to the SSE endpoint.
 	// The poller publishes into exactly the instance the API serves from, so
 	// /alerts/stream needs no database round-trip to show a live alert.
@@ -227,11 +276,13 @@ func run() error {
 	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
 		WithMetrics(m).
 		WithPublisher(liveAlerts).
+		WithEnricher(enricher).
 		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
 		WithPoller(p).
+		WithLeadership(leader).
 		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
 		WithRateLimit(api.RateLimitConfig{
 			RPS:            cfg.RateLimitRPS,
@@ -245,7 +296,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	webSrv.WithPoller(p).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn)
+	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can
@@ -290,8 +341,8 @@ func run() error {
 			errCh <- err
 		}
 	}()
-	go p.Run(ctx)
-	go dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
+	// gRPC serves reads exactly as the HTTP API does, so every instance runs
+	// it regardless of leadership.
 	if cfg.GRPCAddr != "" {
 		grpcSrv := sorogrpc.New(st, authn, log)
 		go func() {
@@ -302,7 +353,9 @@ func run() error {
 	}
 	// Retention can tier expired alerts to object storage before deleting
 	// them. Off by default: an empty ARCHIVE_URL leaves the pruner behaving
-	// exactly as it did before archiving existed.
+	// exactly as it did before archiving existed. Built here rather than
+	// inside the job so a bad ARCHIVE_URL fails startup rather than the first
+	// promotion.
 	var archiver store.AlertArchiver
 	if cfg.ArchiveURL != "" {
 		back, err := archive.FromURL(cfg.ArchiveURL)
@@ -318,13 +371,33 @@ func run() error {
 		// query string. The scheme is enough to confirm what was selected.
 		log.Info("alert archiving enabled")
 	}
-	if cfg.AlertRetention > 0 {
-		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
-	} else if archiver != nil {
+	if cfg.AlertRetention <= 0 && archiver != nil {
 		// Archiving only happens before a delete, so it is inert without
 		// retention. Warn rather than silently doing nothing.
 		log.Warn("ARCHIVE_URL is set but ALERT_RETENTION is unset; nothing will be archived or deleted")
 	}
+
+	// The poller, the retention pruner and the digest flusher all write on a
+	// schedule, so they run only while this instance holds the lease. Keeping
+	// them in one job means a demotion cancels the loop and the lease is not
+	// given up until the loop has genuinely returned, so a new leader cannot
+	// start polling while this one is still mid-cycle.
+	//
+	// The digest flusher is gated for the same reason as the pruner: it sends
+	// on a timer, and two instances flushing the same pending digests would
+	// deliver each one twice.
+	job := func(ctx context.Context) {
+		if cfg.AlertRetention > 0 {
+			go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
+		}
+		go dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
+		p.Run(ctx)
+	}
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		leader.Run(ctx, job)
+	}()
 
 	select {
 	case <-ctx.Done():
@@ -335,7 +408,12 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return httpSrv.Shutdown(shutdownCtx)
+	err = httpSrv.Shutdown(shutdownCtx)
+	// Wait for the election loop to finish before exiting: on the way out it
+	// releases the advisory lock, so the surviving instances promote at once
+	// instead of waiting for this session to disappear.
+	<-leaderDone
+	return err
 }
 
 // buildSecretResolver selects the external-secret provider named by
