@@ -294,8 +294,7 @@ func (s *SQLite) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel,
 		args = append(args, id)
 	}
 	return s.queryChannels(ctx,
-		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout
-		   FROM channels
+		`SELECT `+sqliteChannelCols+` FROM channels
 		  WHERE id IN (`+placeholders+`) AND enabled = 1
 		  ORDER BY id`, args...)
 }

@@ -899,6 +899,13 @@ func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
 	return rec.Body.String()
 }
 
+// RecordChannelHealth satisfies the health half of notify.DispatchStore. The
+// poller tests assert on deliveries, not on channel health, so the outcome is
+// accepted and dropped.
+func (f *fakeStore) RecordChannelHealth(context.Context, int64, store.ChannelHealthUpdate) error {
+	return nil
+}
+
 // The escalation half of notify.DispatchStore. The poller tests attach no
 // escalation policy, so every monitor takes the flat fan-out and the
 // scheduling calls are inert.

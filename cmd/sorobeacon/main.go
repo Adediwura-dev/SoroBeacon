@@ -263,7 +263,14 @@ func run() error {
 	if resolver := buildSecretResolver(cfg, log); resolver != nil {
 		factory.WithSecrets(resolver)
 	}
-	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m).WithDigestQueue(st)
+	// Channel health: delivery outcomes are folded into each channel so a
+	// revoked token surfaces as a broken channel instead of as silence. The
+	// threshold is off unless the operator sets it — auto-disabling a channel
+	// is a destructive answer to a temporary problem.
+	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithMetrics(m).
+		WithDigestQueue(st).
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
 		return err

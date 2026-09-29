@@ -745,6 +745,15 @@ func (s *SQLite) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName 
 
 // --- channels ---
 
+// sqliteChannelCols is the column list every single-table channel read uses,
+// in the order scanChannel expects. Delivery health is read alongside the
+// channel so the dashboard can show why a channel is failing without a second
+// query per row; spelling the list once keeps the four readers from drifting.
+const sqliteChannelCols = `id, name, type, config, enabled, created_at,
+	 digest_mode, digest_window_seconds, timeout,
+	 consecutive_failures, consecutive_permanent_failures, last_error,
+	 last_error_at, last_success_at, disabled_at`
+
 func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
@@ -765,7 +774,7 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	channels, err := s.queryChannels(ctx,
-		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE id = ?`, id)
+		`SELECT `+sqliteChannelCols+` FROM channels WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -776,7 +785,7 @@ func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 }
 
 func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels`
+	q := `SELECT ` + sqliteChannelCols + ` FROM channels`
 	if enabledOnly {
 		q += ` WHERE enabled = 1`
 	}
@@ -785,7 +794,7 @@ func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel,
 }
 
 func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE 1 = 1`
+	q := `SELECT ` + sqliteChannelCols + ` FROM channels WHERE 1 = 1`
 	args := []any{}
 	if f.EnabledOnly {
 		q += ` AND enabled = 1`
@@ -805,7 +814,9 @@ func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel,
 
 func (s *SQLite) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
 	return s.queryChannels(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout,
+		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
+		        c.last_error_at, c.last_success_at, c.disabled_at
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = ? AND c.enabled = 1
@@ -830,14 +841,19 @@ func (s *SQLite) queryChannels(ctx context.Context, query string, args ...any) (
 }
 
 // scanChannel reads one channels row and decrypts its config, so every caller
-// up the stack (API, dashboard, dispatcher) sees plaintext.
+// up the stack (API, dashboard, dispatcher) sees plaintext. The three health
+// timestamps are nullable, so a channel that has never failed (or never
+// succeeded) keeps a nil pointer rather than a fabricated zero time.
 func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	var c Channel
 	var config string
 	var enabled int64
 	var created string
 	var timeoutSec int
-	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec); err != nil {
+	var lastErrorAt, lastSuccessAt, disabledAt sql.NullString
+	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&lastErrorAt, &lastSuccessAt, &disabledAt); err != nil {
 		return c, mapSQLiteErr(err)
 	}
 	var err error
@@ -847,20 +863,59 @@ func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	c.Enabled = enabled != 0
 	c.Config = json.RawMessage(config)
 	c.Timeout = time.Duration(timeoutSec) * time.Second
+	if c.LastErrorAt, err = parseSQLiteTimePtr(lastErrorAt); err != nil {
+		return c, err
+	}
+	if c.LastSuccessAt, err = parseSQLiteTimePtr(lastSuccessAt); err != nil {
+		return c, err
+	}
+	if c.DisabledAt, err = parseSQLiteTimePtr(disabledAt); err != nil {
+		return c, err
+	}
 	if err := decryptChannel(s.cipher, &c); err != nil {
 		return c, err
 	}
 	return c, nil
 }
 
+// parseSQLiteTimePtr reverses a nullable timestamp column. NULL and the empty
+// string both mean "never", which is a nil pointer and never an error.
+func parseSQLiteTimePtr(ns sql.NullString) (*time.Time, error) {
+	if !ns.Valid || ns.String == "" {
+		return nil, nil
+	}
+	t, err := parseSQLiteTime(ns.String)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// UpdateChannel mirrors the Postgres implementation, including the health
+// reset. Turning a channel back on clears the state auto-disable left behind,
+// in the same statement, so a channel cannot re-disable on its next failure
+// because of counters accumulated before it was fixed. `enabled = 0` reads the
+// pre-update value (SQL set expressions all see the old row), so this fires on
+// a genuine off-to-on transition only: renaming a channel that is still
+// failing must not quietly wipe the evidence. ?4 is the enabled flag, reused
+// the way the Postgres version reuses $5.
 func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ?, digest_mode = ?, digest_window_seconds = ?, timeout = ? WHERE id = ?`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), c.ID)
+		`UPDATE channels SET
+		   name = ?1, type = ?2, config = ?3, enabled = ?4,
+		   digest_mode = ?5, digest_window_seconds = ?6, timeout = ?7,
+		   consecutive_failures = CASE WHEN ?4 AND enabled = 0 THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN ?4 AND enabled = 0 THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN ?4 AND enabled = 0 THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN ?4 AND enabled = 0 THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN ?4 AND enabled = 0 THEN NULL ELSE disabled_at END
+		 WHERE id = ?8`,
+		c.Name, c.Type, string(config), boolToInt(c.Enabled),
+		c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), c.ID)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -870,6 +925,48 @@ func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	}
 	if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordChannelHealth applies one delivery outcome to a channel's health
+// counters, mirroring the Postgres implementation. Everything happens in a
+// single statement so concurrent dispatches cannot lose an increment, and the
+// auto-disable decision is made against the value the row actually has rather
+// than one read earlier. Booleans go in as 0/1 because SQLite has no boolean
+// type; the numbered parameters stand in for the Postgres $n references.
+func (s *SQLite) RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error {
+	if u.At.IsZero() {
+		u.At = time.Now()
+	}
+	permanent := u.Permanent && !u.Success
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE channels SET
+		   consecutive_failures = CASE WHEN ?1 THEN 0 ELSE consecutive_failures + 1 END,
+		   consecutive_permanent_failures = CASE
+		     WHEN ?1 THEN 0
+		     WHEN ?2 THEN consecutive_permanent_failures + 1
+		     ELSE consecutive_permanent_failures
+		   END,
+		   last_error = CASE WHEN ?1 THEN '' ELSE ?3 END,
+		   last_error_at = CASE WHEN ?1 THEN NULL ELSE ?4 END,
+		   last_success_at = CASE WHEN ?1 THEN ?4 ELSE last_success_at END,
+		   -- A success clears the auto-disable marker only once the channel is
+		   -- actually back on, so a test send through a still-disabled channel
+		   -- cannot make the dashboard claim an operator turned it off.
+		   disabled_at = CASE
+		     WHEN ?1 THEN CASE WHEN enabled = 1 THEN NULL ELSE disabled_at END
+		     WHEN ?2 AND ?5 > 0 AND consecutive_permanent_failures + 1 >= ?5 THEN COALESCE(disabled_at, ?4)
+		     ELSE disabled_at
+		   END,
+		   enabled = CASE
+		     WHEN ?1 THEN enabled
+		     WHEN ?2 AND ?5 > 0 AND consecutive_permanent_failures + 1 >= ?5 THEN 0
+		     ELSE enabled
+		   END
+		 WHERE id = ?6`,
+		boolToInt(u.Success), boolToInt(permanent), u.Error, sqliteTimeString(u.At), u.DisableAfter, channelID); err != nil {
+		return err
 	}
 	return nil
 }
