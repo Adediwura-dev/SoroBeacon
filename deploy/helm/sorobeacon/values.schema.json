@@ -192,6 +192,11 @@
           "minimum": 0,
           "description": "Ledger lag at which /readyz fails. 0 disables the check."
         },
+        "channelDisableAfterFailures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Consecutive permanent channel failures after which a channel is auto-disabled. 0 never auto-disables."
+        },
         "rateLimitRps": {
           "type": "number",
           "minimum": 0,
@@ -220,6 +225,22 @@
         "configFile": {
           "type": "string",
           "description": "Path to a config file read as a fallback for unset variables. Empty disables it; the chart mounts nothing."
+        },
+        "horizonUrl": {
+          "type": "string",
+          "description": "Horizon REST base URL. Required when sourceMode is horizon."
+        },
+        "graphqlPlayground": {
+          "type": "boolean",
+          "description": "Serve the interactive GraphQL playground. Off by default."
+        },
+        "graphqlMaxDepth": {
+          "type": "string",
+          "description": "GraphQL query depth ceiling (1-50). Empty uses the application default."
+        },
+        "graphqlMaxComplexity": {
+          "type": "string",
+          "description": "GraphQL query complexity ceiling (1-10000). Empty uses the application default."
         },
         "rpcUrls": {
           "type": "string",

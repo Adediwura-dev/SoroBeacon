@@ -6,6 +6,8 @@ are the authority). Each rule also has a page of its own with matching
 semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
 [frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
+[address\_watchlist](address-watchlist.md), [composite](composite.md), and the
+cross-cutting [cooldown](cooldown.md).
 [address\_watchlist](address-watchlist.md), [topic\_position](topic-position.md),
 and the cross-cutting [cooldown](cooldown.md).
 
@@ -184,6 +186,16 @@ Complete, valid params document:
 }
 ```
 
+## composite
+
+Combines child rules with a boolean operator. Children are full rules
+(`type` + `params`) validated recursively through the registry; nesting is
+capped at five levels.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `op` | string | yes | — | One of `and`, `or`, `not`. |
+| `rules` | array | yes | — | Child rules, each `{"type": ..., "params": {...}}`. `and`/`or` need at least one; `not` needs exactly one. |
 ## topic\_position
 
 Matches when the decoded topic at a fixed position exactly equals a configured
@@ -208,6 +220,18 @@ Complete, valid params document:
 
 ```json
 {
+  "op": "and",
+  "rules": [
+    {"type": "token_event", "params": {"event": "transfer", "min_amount": "1000000"}},
+    {"type": "event_emitted", "params": {"topic_equals": {"1": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}}}
+  ]
+}
+```
+
+A child error is reported with the path to it, for example
+`rules[1].params.comparison`, so a malformed grandchild names its exact
+location.
+
   "position": 2,
   "equals": "POOL_USDC_XLM",
   "event": "deposit"
@@ -248,6 +272,11 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
 
 ```json
 {
+  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite topic_regex address_watchlist])",
+  "code": "Bad Request",
+  "request_id": "…",
+  "details": [
+    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite topic_regex address_watchlist])"}
   "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold topic_regex address_watchlist topic_position])",
   "code": "Bad Request",
   "request_id": "…",

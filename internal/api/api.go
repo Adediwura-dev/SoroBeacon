@@ -17,6 +17,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -39,11 +40,11 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
-// NetworkStatusReader is the multi-network supervisor's per-chain view.
-// Optional, and supplied by the same object as PositionReader: an instance
-// that polls one network has nothing to break out.
-type NetworkStatusReader interface {
-	Statuses(ctx context.Context) []poller.NetworkStatus
+// LeaderReader reports this instance's leader-election status. Only the
+// instance holding the lease polls, so /health exposes it: that is how an
+// operator tells a standby replica from one that has stopped working.
+type LeaderReader interface {
+	Status() lease.Status
 }
 
 // DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
@@ -51,19 +52,13 @@ type NetworkStatusReader interface {
 const DefaultMaxBodyBytes int64 = 1 << 20
 
 type Server struct {
-	store        store.Store
-	registry     *rules.Registry
-	factory      *notify.Factory
-	rpc          HealthChecker
-	log          *slog.Logger
-	poller       PositionReader
-	networkState NetworkStatusReader
-	// networkNames are the chains this instance polls, primary first, from
-	// NETWORKS/NETWORK. Empty (the New default, and every test that never
-	// calls WithNetworks) means no network may be named on a monitor, so
-	// monitors stay in the pre-multi-network '' state that single-poller
-	// deployments already use.
-	networkNames       []string
+	store              store.Store
+	registry           *rules.Registry
+	factory            *notify.Factory
+	rpc                HealthChecker
+	log                *slog.Logger
+	poller             PositionReader
+	leader             LeaderReader
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
@@ -125,15 +120,12 @@ func (s *Server) WithNetworks(names []string) *Server {
 	return s
 }
 
-// defaultNetwork is the chain a monitor lands on when the request does not
-// name one: the primary, which is the only chain a single-network instance
-// polls. Empty when the server has no configured list, which leaves a monitor
-// unlabelled exactly as it was before networks existed.
-func (s *Server) defaultNetwork() string {
-	if len(s.networkNames) == 0 {
-		return ""
-	}
-	return s.networkNames[0]
+// WithLeadership attaches the leader-election status reported by /health. Not
+// wiring it leaves the leadership fields out, exactly as an older deployment
+// behaved.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
+	return s
 }
 
 // WithReadyzLagThreshold fails /readyz when ledger lag exceeds n.
@@ -228,6 +220,9 @@ func (s *Server) Routes() chi.Router {
 			r.Post("/rules/bulk", s.createRulesBulk)
 			r.Patch("/rules/{ruleID}", s.updateRule)
 			r.Delete("/rules/{ruleID}", s.deleteRule)
+			r.Get("/escalation", s.getMonitorEscalation)
+			r.Put("/escalation", s.putMonitorEscalation)
+			r.Delete("/escalation", s.deleteMonitorEscalation)
 		})
 	})
 
@@ -283,6 +278,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/export", s.exportAlertsNDJSON)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	r.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
 	r.Get("/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)
@@ -546,7 +542,24 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.attachPoller(out)
+	s.attachLeadership(out)
 	writeJSON(w, status, out)
+}
+
+// attachLeadership adds whether this instance holds the poller lease. A
+// follower is healthy — it serves the API and the dashboard normally — so this
+// only reports the role; it never changes the status code. Absent when no
+// lease is wired.
+func (s *Server) attachLeadership(out map[string]any) {
+	if s.leader == nil {
+		return
+	}
+	st := s.leader.Status()
+	out["leader"] = st.Leader
+	out["leader_election"] = st.Enabled
+	if st.Leader && !st.Since.IsZero() {
+		out["leader_since"] = st.Since.UTC().Format(time.RFC3339)
+	}
 }
 
 // attachPoller adds last processed / chain ledger / lag / last poll time

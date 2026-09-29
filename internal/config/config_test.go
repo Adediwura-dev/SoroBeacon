@@ -31,16 +31,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "")
 	t.Setenv("CONFIG_ENCRYPTION_KEY", "")
 	t.Setenv("API_TOKEN", "")
-	t.Setenv("WORKSPACE_TOKENS", "")
-	t.Setenv("OIDC_ISSUER", "")
-	t.Setenv("OIDC_CLIENT_ID", "")
-	t.Setenv("OIDC_CLIENT_SECRET", "")
-	t.Setenv("OIDC_REDIRECT_URL", "")
-	t.Setenv("OIDC_SCOPES", "")
-	t.Setenv("OIDC_WORKSPACE", "")
-	t.Setenv("OIDC_WORKSPACE_CLAIM", "")
-	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
-	t.Setenv("OIDC_LOGIN_STATE_TTL", "")
+	t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -198,6 +189,52 @@ func TestLoadRejectsInvalidReadyzLagThreshold(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "READYZ_LAG_THRESHOLD")
+}
+
+// Auto-disabling a channel is a destructive answer to a temporary problem, so
+// it is off unless an operator asks for it and nothing else can turn it on.
+func TestLoadChannelDisableAfterFailures(t *testing.T) {
+	t.Run("defaults to never auto-disabling", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("reads the threshold", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "5")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("zero is a valid way to spell off", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "0")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	for _, value := range []string{"-1", "two", "2.5"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", value)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "CHANNEL_DISABLE_AFTER_FAILURES")
+		})
+	}
 }
 
 func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
@@ -570,6 +607,7 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"rpc_url",
 		"rpc_endpoint_count",
 		"sorotrail_url",
+		"horizon_url",
 		"cors_allowed_origins",
 		"config_encryption_enabled",
 		"secrets_provider",
@@ -581,6 +619,10 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"otlp_tracing_enabled",
 		"otlp_service_name",
 		"otlp_sample_rate",
+		"graphql_playground_enabled",
+		"graphql_max_depth",
+		"graphql_max_complexity",
+		"channel_disable_after_failures",
 	}, keys)
 }
 

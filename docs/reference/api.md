@@ -67,15 +67,15 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 | `PATCH /monitors/{id}/rules/{ruleID}` | Partial update; params re-validated. |
 | `DELETE /monitors/{id}/rules/{ruleID}` | Delete. |
 
-Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md). Invalid params are rejected with `400` at create/update time.
+Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md), [`absence_of_event`](../rules/absence-of-event.md). Invalid params are rejected with `400` at create/update time.
 
 ## Channels
 
 | Method & path | Description |
 | --- | --- |
 | `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`, optional `digest_mode` (`""` or `"window"`) and `digest_window_seconds` (must be > 0 when the mode is `window`). See [Digest mode](../channels/digest.md). |
-| `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** |
-| `PATCH /channels/{id}` | Partial update; config re-validated. |
+| `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** Each channel also carries its delivery health: `consecutive_failures`, `consecutive_permanent_failures`, `last_error`, `last_error_at`, `last_success_at` and `disabled_at` (set only by auto-disable). |
+| `PATCH /channels/{id}` | Partial update; config re-validated. Setting `enabled: true` on a channel that was off is the only way out of an auto-disable, and clears its failure counters in the same write. |
 | `DELETE /channels/{id}` | Delete. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 
@@ -153,7 +153,7 @@ Three behaviours worth knowing before you script against this:
 
 | Method & path | Description |
 | --- | --- |
-| `GET /health` | Checks Postgres and the RPC. `200` when both are ok, `503` with per-dependency detail when degraded. On a multi-network instance it gains a `networks` array (processed ledger, chain tip, lag, last poll, per-chain errors) and degrades when any polled chain degrades. |
+| `GET /health` | Checks the database and the RPC. `200` when both are ok, `503` with per-dependency detail when degraded. Adds `leader`, `leader_election` and (while polling) `leader_since` so an operator can see which replica holds the poller lease; a follower is still `200`, because it serves everything except polling. |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. |
 | `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. |

@@ -102,6 +102,17 @@ config:
   sourceMode: "rpc"
   # SoroTrail indexer base URL. Required when sourceMode is sorotrail.
   sorotrailUrl: ""
+  # Horizon REST base URL. Required when sourceMode is horizon, which reads
+  # events from Horizon's transaction history rather than the RPC.
+  horizonUrl: ""
+  # Serve the interactive GraphQL playground at /graphql/playground. Off by
+  # default: the endpoint itself is always available, and the playground is
+  # an extra surface you probably do not want on a public deployment.
+  graphqlPlayground: false
+  # Query depth and complexity ceilings for the GraphQL endpoint. Empty keeps
+  # the application's defaults.
+  graphqlMaxDepth: ""
+  graphqlMaxComplexity: ""
   # API + dashboard listen address. Must match service.targetPort.
   httpAddr: ":8080"
   # Maximum request body size for API write endpoints (POST/PATCH/PUT), in
@@ -117,6 +128,10 @@ config:
   # Ledger lag at which /readyz fails. 0 disables the check, so a lagging
   # poller cannot take itself out of a load balancer without opting in.
   readyzLagThreshold: 0
+  # Consecutive permanent channel failures (401/403/404) after which a
+  # channel is taken out of rotation. 0 never auto-disables, which is the
+  # behaviour every release before channel health had.
+  channelDisableAfterFailures: 0
   # Per-client API token-bucket refill rate. 0 disables the limiter. Health
   # and readiness probes are always exempt.
   rateLimitRps: 0

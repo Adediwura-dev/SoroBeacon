@@ -27,6 +27,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -39,12 +40,10 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
-// NetworkStatusReader is the multi-network supervisor's per-chain view, which
-// the overview page renders as one row per network. The supervisor satisfies
-// it; a bare poller does not, and the page then shows the single aggregate it
-// always showed.
-type NetworkStatusReader interface {
-	Statuses(ctx context.Context) []poller.NetworkStatus
+// LeaderReader reports this instance's leader-election status, shown on the
+// overview page so an operator can tell which replica is polling.
+type LeaderReader interface {
+	Status() lease.Status
 }
 
 //go:embed templates/*.html
@@ -61,11 +60,7 @@ type Server struct {
 	log      *slog.Logger
 	pages    map[string]*template.Template
 	poller   PositionReader
-	// networkNames are the chains this instance polls, primary first. With
-	// more than one, every list page grows a network filter and creating a
-	// monitor has to say which chain it means.
-	networkNames []string
-	networkState NetworkStatusReader
+	leader   LeaderReader
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
@@ -92,6 +87,7 @@ var templateFuncs = template.FuncMap{
 	"decodedEvent":  decodedEvent,
 	"truncateID":    truncateID,
 	"relTime":       relTime,
+	"relTimePtr":    relTimePtr,
 	"severityClass": severityClass,
 }
 
@@ -123,6 +119,16 @@ func formatTime(t time.Time, tz string) template.HTML {
 //
 // Rounding: seconds under a minute, minutes under an hour, hours under a
 // day, then whole days.
+// relTimePtr is relTime for the nullable timestamps channel health carries.
+// html/template does not dereference a pointer for you, so a nil-safe wrapper
+// keeps the channels table readable.
+func relTimePtr(t *time.Time, now ...time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return relTime(*t, now...)
+}
+
 func relTime(t time.Time, now ...time.Time) string {
 	ref := time.Now()
 	if len(now) > 0 && !now[0].IsZero() {
@@ -235,33 +241,12 @@ func (s *Server) WithNetworks(names []string) *Server {
 	return s
 }
 
-// defaultNetwork is the chain a dashboard-created monitor lands on: the
-// primary, which is the only chain a single-network instance polls. Empty when
-// no list was configured, which leaves a monitor unlabelled as it was before
-// networks existed.
-func (s *Server) defaultNetwork() string {
-	if len(s.networkNames) == 0 {
-		return ""
-	}
-	return s.networkNames[0]
-}
-
-// networkChoice validates a network named by a form or query string against
-// the configured list. Anything unknown or blank becomes the default rather
-// than an error: a filter that arrives with a stale name should show
-// something, and a create form left on its default should not be rejected
-// over a name the instance does not poll.
-func (s *Server) networkChoice(raw string) string {
-	n := strings.ToLower(strings.TrimSpace(raw))
-	if n == "" {
-		return s.defaultNetwork()
-	}
-	for _, cfg := range s.networkNames {
-		if cfg == n {
-			return n
-		}
-	}
-	return s.defaultNetwork()
+// WithLeadership attaches the leader-election status shown on the overview
+// page. Not wiring it leaves the page exactly as it was before leader
+// election existed.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
+	return s
 }
 
 // WithSilentAfter sets how long since last_matched_at before a monitor is
@@ -336,6 +321,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels", s.createChannel)
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
+	r.Post("/channels/{id}/toggle", s.toggleChannel)
 
 	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
 
@@ -660,11 +646,8 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 			data["Poller"] = pos
 		}
 	}
-	// One row per chain on a multi-network instance. The aggregate above is
-	// deliberately the worst network, so an overview that showed only it
-	// would hide which chain an operator needs to look at.
-	if s.networkState != nil && len(s.networkNames) > 1 {
-		data["NetworkStatuses"] = s.networkState.Statuses(r.Context())
+	if s.leader != nil {
+		data["Leadership"] = s.leader.Status()
 	}
 	s.render(w, r, "index", data)
 }
@@ -1199,12 +1182,42 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:   time.Now(),
 		})
 	}
+	// Record the outcome like the API's test endpoint does, so a channel that
+	// has just been fixed stops being reported as broken the moment the
+	// operator proves it works. A bookkeeping failure is logged, not shown:
+	// the send is what the operator asked about.
+	if err := s.store.RecordChannelHealth(r.Context(), ch.ID, notify.TestHealthUpdate(err, time.Now())); err != nil {
+		s.log.Error("record channel health", "channel_id", ch.ID, "err", err)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err != nil {
 		fmt.Fprintf(w, "❌ %s", template.HTMLEscapeString(err.Error()))
 		return
 	}
 	fmt.Fprint(w, "✅ sent")
+}
+
+// toggleChannel flips a channel's enabled flag. Turning one back on goes
+// through the same store write the API uses, so a channel that auto-disable
+// parked comes back with its failure count cleared instead of re-disabling on
+// the next failure.
+func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch.Enabled = !ch.Enabled
+	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
 // maintenanceRow is a window plus its computed status for the listing.

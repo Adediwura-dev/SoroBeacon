@@ -37,6 +37,10 @@ const (
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
 	// to cover the practical reorg depth.
 	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+	DefaultGraphQLMaxDepth      = 10
+	DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -111,11 +115,15 @@ type Config struct {
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
@@ -162,6 +170,13 @@ type Config struct {
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
 	GRPCAddr string
+	// ChannelDisableAfterFailures is how many consecutive permanent channel
+	// failures (401/403/404 — a revoked bot token, a deleted webhook) take a
+	// channel out of rotation. Zero, the default when the variable is unset,
+	// never auto-disables: silently switching off someone's alerting is a
+	// worse outcome than the failure it would fix, so opting in is the
+	// operator's call.
+	ChannelDisableAfterFailures int
 	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
 	// and re-checks each cycle for reorg detection
 	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
@@ -196,6 +211,9 @@ type Config struct {
 	// validates it when the pruner is built.
 	ArchiveURL string
 
+	// GraphQL is the GraphQL endpoint configuration.
+	GraphQL GraphQLConfig
+
 	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
 	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
 	NotifyRateLimitSlackRPS float64
@@ -228,6 +246,21 @@ type OTLPConfig struct {
 // "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
 // the tests cannot drift apart.
 func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+}
+
+// PlaygroundEnabled reports whether the interactive playground is served.
+// The endpoint itself is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
 
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
@@ -291,20 +324,16 @@ func Load() (Config, error) {
 	}
 
 	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode)
 	}
 	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
 	}
-	// The upstream source is one SoroTrail deployment reading one chain: it has
-	// no per-network request to make, so a second entry in NETWORKS would be
-	// polled by nobody. Fail here instead of starting a supervisor whose
-	// testnet unit never advances.
-	if cfg.SourceMode == "sorotrail" && len(cfg.Networks) > 1 {
-		return cfg, fmt.Errorf("NETWORKS=%s lists %d chains but SOURCE_MODE=sorotrail reads events from a single upstream deployment; use SOURCE_MODE=rpc to poll several networks",
-			strings.Join(NetworkNames(cfg.Networks), ","), len(cfg.Networks))
+	cfg.HorizonURL = lookupConfigValue("HORIZON_URL", fileValues)
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
 	}
 
 	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
@@ -375,6 +404,14 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
+	if v := lookupConfigValue("CHANNEL_DISABLE_AFTER_FAILURES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return cfg, fmt.Errorf("invalid CHANNEL_DISABLE_AFTER_FAILURES %q (want a non-negative integer)", v)
+		}
+		cfg.ChannelDisableAfterFailures = n
+	}
+
 	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -511,6 +548,36 @@ func Load() (Config, error) {
 		}
 		cfg.OTLP.SampleRate = r
 	}
+	// GraphQL configuration. Read through lookupConfigValue like every other
+	// setting, so CONFIG_FILE can supply these too.
+	cfg.GraphQL.EnablePlayground = false
+	if v := lookupConfigValue("GRAPHQL_PLAYGROUND", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			return cfg, fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v)
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := lookupConfigValue("GRAPHQL_MAX_DEPTH", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v)
+		}
+		cfg.GraphQL.MaxDepth = n
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := lookupConfigValue("GRAPHQL_MAX_COMPLEXITY", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v)
+		}
+		cfg.GraphQL.MaxComplexity = n
+	}
+
 	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
@@ -660,6 +727,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
 		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
+		// Redacted for the same reason as the others: a Horizon endpoint
+		// behind basic auth carries the credential in the URL.
+		slog.String("horizon_url", redactURLCredentials(c.HorizonURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
@@ -674,6 +744,10 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
 		slog.String("otlp_service_name", c.OTLP.ServiceName),
 		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
+		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
+		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
+		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }
 
