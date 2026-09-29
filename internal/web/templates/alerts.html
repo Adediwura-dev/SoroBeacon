@@ -1,6 +1,8 @@
 {{define "content"}}
 <h1>Alerts</h1>
 <form class="filters" method="get" action="/alerts">
+  <label for="q">Search</label>
+  <input type="search" id="q" name="q" value="{{.Query}}" placeholder="event id, contract, payload text" data-shortcut-filter>
   <label for="monitor_id">Monitor</label>
   <select id="monitor_id" name="monitor_id">
     <option value="">All monitors</option>
@@ -11,6 +13,7 @@
   <label for="rule_id">Rule</label>
   <input type="number" id="rule_id" name="rule_id" value="{{if .SelectedRule}}{{.SelectedRule}}{{end}}" min="1" placeholder="id">
   <label for="contract_id">Contract</label>
+  <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id" data-shortcut-filter>
   <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id">
   <label for="severity">Severity</label>
   <select id="severity" name="severity">
@@ -24,8 +27,14 @@
     <option value="created_at_desc" {{if eq .Sort "created_at_desc"}}selected{{end}}>Newest</option>
     <option value="created_at_asc" {{if eq .Sort "created_at_asc"}}selected{{end}}>Oldest</option>
   </select>
+  <label for="from">From (UTC)</label>
+  <input type="date" id="from" name="from" value="{{.FromDate}}">
+  <label for="to">To (UTC)</label>
+  <input type="date" id="to" name="to" value="{{.ToDate}}">
   <button>Filter</button>
 </form>
+<p class="muted">Dates are whole UTC days and both ends are included. Search matches the event id and the alert payload as plain text.</p>
+{{if .Note}}<p class="note">{{.Note}}</p>{{end}}
 <p class="export"><a href="{{.ExportHref}}">Export CSV</a> | <a href="/searches">Saved searches</a></p>
 <p class="muted" id="live-status" aria-live="polite"></p>
 {{if .Alerts}}
@@ -51,7 +60,8 @@
   </tbody>
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
-{{else if or .SelectedMonitor .SelectedRule .ContractID .Severity}}<p class="muted">No alerts match these filters.</p>
+{{else if .Note}}<p class="muted">No alerts are listed, because the search or date range sent could not be applied.</p>
+{{else if .HasFilters}}<p class="muted">No alerts match these filters.</p>
 {{else if eq .Empty "no_monitors"}}
 <section class="empty">
   <h2>Nothing is being watched yet</h2>
@@ -90,6 +100,12 @@
   var monitorID = "{{.SelectedMonitor}}";
   var ruleID = "{{.SelectedRule}}";
   var contractID = "{{.ContractID}}";
+  var query = "{{.Query}}".toLowerCase();
+  // The bounds arrive as instants (FromRFC/ToRFC), not as the picker's calendar
+  // day, so the stream compares against the exact window the list used. An
+  // unparsed value is NaN, which the checks below read as "no bound".
+  var fromTS = Date.parse("{{.FromRFC}}");
+  var toTS = Date.parse("{{.ToRFC}}");
   var status = document.getElementById("live-status");
   var columns = ["ID", "Monitor", "Rule", "Event", "Payload", "Deliveries", "At"];
 
@@ -170,11 +186,24 @@
     return row;
   }
 
-  // monitor_id is filtered server-side; rule_id and contract_id are applied
-  // here so a live row never contradicts the filters on screen.
+  // monitor_id is filtered server-side; rule_id, contract_id, the search term
+  // and the date window are applied here so a live row never contradicts the
+  // filters on screen. The search is a substring test on the event id and the
+  // re-serialised payload, which is the same ground the store's ILIKE covers;
+  // the two can differ only for a term that straddles JSON punctuation, since
+  // this side's spacing is not Postgres's jsonb spacing.
   function matches(a) {
     if (ruleID && String(a.rule_id) !== ruleID) return false;
     if (contractID && (!a.payload || a.payload.contract_id !== contractID)) return false;
+    if (query) {
+      var text = "";
+      try { text = JSON.stringify(a.payload || {}); } catch (err) { text = ""; }
+      if (String(a.event_id || "").toLowerCase().indexOf(query) === -1 &&
+          text.toLowerCase().indexOf(query) === -1) return false;
+    }
+    var at = a.created_at ? Date.parse(a.created_at) : NaN;
+    if (!isNaN(fromTS) && (isNaN(at) || at < fromTS)) return false;
+    if (!isNaN(toTS) && (isNaN(at) || at >= toTS)) return false;
     return true;
   }
 

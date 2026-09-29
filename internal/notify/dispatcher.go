@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -51,6 +53,11 @@ type DispatchStore interface {
 	ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]store.Inhibition, error)
 	RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error)
 	MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error
+	// ActiveMaintenanceWindow reports a window silencing this alert's
+	// monitor/contract at the given time, or nil when none is active.
+	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*store.MaintenanceWindow, error)
+	// SetAlertSuppressed records why an alert was not delivered.
+	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
 }
 
 // Dispatcher fans an alert out to its monitor's channels, retrying each
@@ -136,6 +143,12 @@ func digestEnabled(ch store.Channel) bool {
 // alert row itself is always kept.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	if d.inhibited(ctx, a) {
+		return
+	}
+	// Maintenance windows suppress delivery, not detection: the alert is
+	// already persisted and stays visible, it is only marked and skipped.
+	// The check happens here, before fan-out, so nothing is delivered.
+	if d.suppressed(ctx, a) {
 		return
 	}
 	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
@@ -315,6 +328,30 @@ func (d *Dispatcher) clearDigest(ctx context.Context, channelID int64, ids []int
 	}
 }
 
+// suppressed reports whether a maintenance window covers the alert, marking
+// the persisted alert with the window's reason when it does. A lookup error
+// fails open (delivery proceeds) so a transient store problem cannot silence
+// real alerts.
+func (d *Dispatcher) suppressed(ctx context.Context, a Alert) bool {
+	at := a.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	w, err := d.store.ActiveMaintenanceWindow(ctx, a.MonitorID, a.ContractID, at)
+	if err != nil {
+		d.log.Error("check maintenance window", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
+		return false
+	}
+	if w == nil {
+		return false
+	}
+	if err := d.store.SetAlertSuppressed(ctx, a.ID, w.Reason); err != nil {
+		d.log.Error("mark alert suppressed", "alert_id", a.ID, "window_id", w.ID, "err", err)
+	}
+	d.log.Info("alert suppressed by maintenance window", "alert_id", a.ID, "window_id", w.ID, "scope", w.Scope)
+	return true
+}
+
 func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	// One span per channel covers the whole delivery: notifier construction
 	// plus every retried attempt. The span's parent is whatever ctx carries
@@ -356,10 +393,13 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
-		// Bad config: record one failed attempt, no point retrying.
-		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
-		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
-		telemetry.RecordError(span, err)
+		// Bad config: record one failed attempt, no point retrying. The
+		// error is sanitized before it reaches the stored snippet, the log
+		// or the span, because a config error can quote the config.
+		safeErr := sanitizeDeliveryError(err)
+		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
+		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", safeErr)
+		telemetry.RecordError(span, safeErr)
 		cb.RecordFailure()
 		if d.metrics != nil {
 			d.metrics.SetBreakerState(strconv.FormatInt(ch.ID, 10), ch.Type, string(cb.State()))
@@ -368,8 +408,11 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	}
 
 	backoff := d.BaseBackoff
+	timeout := ch.TimeoutDuration()
 	for attempt := 1; ; attempt++ {
-		err := notifier.Send(ctx, a)
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		err = d.sendWithRecovery(attemptCtx, a, ch, notifier)
+		cancel()
 		if err == nil {
 			cb.RecordSuccess()
 			if d.metrics != nil {
@@ -389,10 +432,16 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, false)
 		}
-		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
+		// Sanitize once, then use it for every sink. The recorded string
+		// becomes the delivery attempt's response_snippet and the logged and
+		// traced values leave the process, so a raw transport error — which
+		// can carry the webhook URL or a token from the request — must not
+		// reach any of them.
+		safeErr := sanitizeDeliveryError(err)
+		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
 		d.log.Warn("alert delivery failed",
-			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", err)
-		telemetry.RecordError(span, err)
+			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", safeErr)
+		telemetry.RecordError(span, safeErr)
 
 		// Honor Retry-After if present in error message or headers
 		if errStr := err.Error(); strings.Contains(errStr, "Retry-After") || strings.Contains(errStr, "429") {
@@ -413,9 +462,43 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	}
 }
 
+func (d *Dispatcher) sendWithRecovery(ctx context.Context, a Alert, ch store.Channel, notifier Notifier) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error("notifier panicked", "alert_id", a.ID, "channel_id", ch.ID)
+			err = errors.New("delivery failed")
+		}
+	}()
+	return notifier.Send(ctx, a)
+}
+
+func sanitizeDeliveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return errors.New("delivery failed")
+	}
+	msg = redactSecretText(msg)
+	if msg == "" {
+		return errors.New("delivery failed")
+	}
+	return errors.New(msg)
+}
+
+func redactSecretText(s string) string {
+	secretPattern := regexp.MustCompile(`(?i)\b(?:token|secret|password|passwd|api[_-]?key|auth[_-]?token|access[_-]?token|bearer)\b(?:\s*[:=]\s*|\s+)[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+`)
+	return secretPattern.ReplaceAllString(s, "[redacted]")
+}
+
 func (d *Dispatcher) record(ctx context.Context, alertID, channelID int64, status, snippet string) *store.DeliveryAttempt {
 	if len(snippet) > 500 {
 		snippet = snippet[:500]
+	}
+	snippet = redactSecretText(snippet)
+	if snippet == "" {
+		snippet = "delivery failed"
 	}
 	da := &store.DeliveryAttempt{
 		AlertID:         alertID,
@@ -493,7 +576,10 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 	}
-	err = notifier.Send(ctx, a)
+	timeout := ch.TimeoutDuration()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	err = notifier.Send(attemptCtx, a)
+	cancel()
 	if err == nil {
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, true)

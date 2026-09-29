@@ -77,6 +77,12 @@ affinity: {}
 # `kubectl describe configmap` instead of being buried in a deployment spec.
 #
 config:
+  # Optional path to a config file read at startup. Environment variables
+  # always win; the file is only a fallback for values left unset. Empty
+  # disables it. Pointing this at a path only helps if something mounts a
+  # file there — a ConfigMap or Secret volume — since the chart does not
+  # create one.
+  configFile: ""
   # Which Stellar network to monitor: testnet | mainnet | futurenet | custom.
   # A network's passphrase is its identity, and SoroBeacon verifies at startup
   # that the RPC endpoint belongs to the configured network, refusing to start

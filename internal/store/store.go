@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -153,6 +155,18 @@ type Rule struct {
 	Severity Severity `json:"severity"`
 }
 
+// DefaultChannelTimeout is the timeout applied to channels when unset (15s),
+// matching the previous package-level HTTP client timeout.
+const DefaultChannelTimeout = 15 * time.Second
+
+// MinChannelTimeout bounds how short a channel timeout can be: anything less
+// is practically guaranteed to fail spuriously over real networks.
+const MinChannelTimeout = 1 * time.Second
+
+// MaxChannelTimeout is the ceiling on a channel's HTTP timeout: an operator
+// setting a ten-minute timeout will wedge delivery workers.
+const MaxChannelTimeout = 60 * time.Second
+
 // Channel is a configured notification destination. Config holds
 // channel-specific settings including secrets (webhook URLs, bot tokens,
 // SMTP credentials) — never log it and never return it from the API.
@@ -177,8 +191,98 @@ type Channel struct {
 	// Empty means no filter (receive all severities), so channels created
 	// before the field existed keep today's behaviour. It is validated at
 	// the API boundary.
-	MinSeverity Severity  `json:"min_severity"`
-	CreatedAt   time.Time `json:"created_at"`
+	MinSeverity Severity      `json:"min_severity"`
+	CreatedAt   time.Time     `json:"created_at"`
+	Timeout     time.Duration `json:"timeout"`
+}
+
+// TimeoutDuration returns the channel's timeout, falling back to
+// DefaultChannelTimeout when zero or negative.
+func (c Channel) TimeoutDuration() time.Duration {
+	if c.Timeout <= 0 {
+		return DefaultChannelTimeout
+	}
+	return c.Timeout
+}
+
+// TimeoutSeconds returns the channel's timeout as an integer number of seconds.
+func (c Channel) TimeoutSeconds() int {
+	return int(c.TimeoutDuration() / time.Second)
+}
+
+// MarshalJSON serializes the channel, outputting Timeout as integer seconds
+// rather than time.Duration's default nanosecond integer.
+func (c Channel) MarshalJSON() ([]byte, error) {
+	type Alias Channel
+	return json.Marshal(&struct {
+		Alias
+		Timeout int `json:"timeout"`
+	}{
+		Alias:   Alias(c),
+		Timeout: c.TimeoutSeconds(),
+	})
+}
+
+// UnmarshalJSON deserializes a channel, parsing Timeout from integer seconds
+// or a Go duration string.
+func (c *Channel) UnmarshalJSON(data []byte) error {
+	type Alias Channel
+	var aux struct {
+		Alias
+		Timeout *json.RawMessage `json:"timeout"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*c = Channel(aux.Alias)
+	if aux.Timeout != nil && len(*aux.Timeout) > 0 && string(*aux.Timeout) != "null" {
+		d, err := ParseTimeout(*aux.Timeout)
+		if err != nil {
+			return err
+		}
+		c.Timeout = d
+	}
+	return nil
+}
+
+// ParseTimeout parses and bounds a channel timeout value. It accepts integer
+// seconds (e.g. 15) or a Go duration string (e.g. "15s"). Values outside
+// [MinChannelTimeout, MaxChannelTimeout] are rejected.
+func ParseTimeout(raw []byte) (time.Duration, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return DefaultChannelTimeout, nil
+	}
+	// Try parsing as integer number of seconds first (e.g. 15).
+	var sec int
+	if err := json.Unmarshal(raw, &sec); err == nil {
+		d := time.Duration(sec) * time.Second
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	// Try parsing as a string (e.g. "15s", "30s", "1m", or "15").
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return DefaultChannelTimeout, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			if sec, errAtoi := strconv.Atoi(s); errAtoi == nil {
+				d = time.Duration(sec) * time.Second
+			} else {
+				return 0, fmt.Errorf("invalid duration %q (want a Go duration such as \"15s\" or integer seconds)", s)
+			}
+		}
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	return 0, fmt.Errorf("must be integer seconds or duration string such as \"15s\"")
 }
 
 // Alert records one rule match on one event. EventID is the source event's
@@ -205,6 +309,11 @@ type Alert struct {
 	// alert row. Zero skips the stamp so callers that only persist an
 	// alert (tests, retries) do not invent a wall-clock match time.
 	LedgerClosedAt time.Time `json:"-"`
+	// Suppressed is true when a maintenance window was active when the
+	// alert was dispatched. Detection still happened and the row is still
+	// persisted; SuppressionReason carries the window's reason.
+	Suppressed        bool   `json:"suppressed"`
+	SuppressionReason string `json:"suppression_reason,omitempty"`
 	// Ledger is the sequence of the ledger the matching event came from. It
 	// is stored so retention and reorg handling can address alerts by ledger
 	// without parsing the payload. Zero for alerts persisted without one.
@@ -227,6 +336,48 @@ type Alert struct {
 	// internal/backfill) rather than live ingestion. It is persisted so an
 	// operator can tell a replayed match from a real-time one.
 	Backfilled bool `json:"backfilled"`
+}
+
+// Maintenance window scopes. A window suppresses matching alerts for its
+// scope only: global (everything), monitor (one monitor), contract (one
+// contract ID across monitors).
+const (
+	MaintenanceScopeGlobal   = "global"
+	MaintenanceScopeMonitor  = "monitor"
+	MaintenanceScopeContract = "contract"
+)
+
+// ValidMaintenanceScope reports whether s names a scope the store accepts.
+func ValidMaintenanceScope(s string) bool {
+	return s == MaintenanceScopeGlobal || s == MaintenanceScopeMonitor || s == MaintenanceScopeContract
+}
+
+// MaintenanceWindow is a time-bounded silence. Alerts raised inside
+// [StartAt, EndAt) for its scope are persisted but not delivered.
+// MonitorID and ContractID are set only when the scope calls for them.
+type MaintenanceWindow struct {
+	ID         int64     `json:"id"`
+	Reason     string    `json:"reason"`
+	Scope      string    `json:"scope"`
+	MonitorID  *int64    `json:"monitor_id,omitempty"`
+	ContractID *string   `json:"contract_id,omitempty"`
+	StartAt    time.Time `json:"start_at"`
+	EndAt      time.Time `json:"end_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// MaintenanceWindowFilter narrows ListMaintenanceWindows. Zero values mean
+// "no constraint".
+//
+// Active, when true, restricts the listing to windows whose [start, end)
+// interval contains At (defaulting to now when At is zero). Upcoming, when
+// true, restricts it to windows that start after At. Both false lists every
+// window.
+type MaintenanceWindowFilter struct {
+	Active   bool
+	Upcoming bool
+	At       time.Time
+	Limit    int
 }
 
 // AlertOutcome reports what CreateAlert did with a match.
@@ -329,9 +480,14 @@ type AlertFilter struct {
 	RuleID    int64
 	// ContractID matches payload->>'contract_id'. Empty means no contract filter.
 	ContractID string
-	From       time.Time
-	To         time.Time
-	Limit      int
+	// Query is the free-text alert search: a case-insensitive substring of
+	// either the source event id or the payload's full text, which carries
+	// contract_id, event_name and every other field the API returns. Empty
+	// (or whitespace-only, see NormalizeAlertSearch) means no search filter.
+	Query string
+	From  time.Time
+	To    time.Time
+	Limit int
 	// AfterID is the keyset cursor (the last id of the previous page). The
 	// comparison flips with Sort: created_at_desc uses (created_at, id) <
 	// the cursor row; created_at_asc uses >. Comparing only on id would
@@ -346,6 +502,71 @@ type AlertFilter struct {
 	// "created_at_asc". Unknown values are treated as the default in the
 	// store; the API rejects them with 400. Never interpolate this into SQL.
 	Sort string
+}
+
+// MaxAlertSearchLen caps a ?q= search term. The term is always bound as a
+// parameter so a longer one could not corrupt the statement, but an
+// unbounded term turns the search into a full table scan of a text match
+// against every payload — the cap keeps one keystroke-worth of query from
+// becoming the most expensive read the instance performs.
+const MaxAlertSearchLen = 256
+
+// NormalizeAlertSearch maps a caller-supplied search term onto the term the
+// store matches. A blank or whitespace-only term is "no filter", not "match
+// nothing": an emptied search box that clears itself is what the operator
+// expects, and the alternative would render an empty list for a filter that
+// is no longer there.
+func NormalizeAlertSearch(q string) string { return strings.TrimSpace(q) }
+
+// AlertSearchPattern builds the LIKE pattern for AlertFilter.Query. Escaping
+// the term's own wildcards is what makes the search literal: an operator
+// looking for a contract id containing "_" must not get every row, and a
+// term taken from a URL is not in on the joke. The ESCAPE character is
+// declared by every backend that uses this, so the pattern and the clause
+// cannot disagree about whether a backslash is special.
+func AlertSearchPattern(q string) string {
+	q = NormalizeAlertSearch(q)
+	if q == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("%")
+	for _, r := range q {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString("%")
+	return b.String()
+}
+
+// MonitorStats answers "is this monitor actually doing anything" for one
+// monitor: the counts a caller checks before deleting it or debugging why it
+// never fires. Every field is an explicit zero rather than a null when the
+// monitor has no history, because "no alerts yet" is the common case and a
+// client should not have to special-case it.
+type MonitorStats struct {
+	MonitorID      int64            `json:"monitor_id"`
+	Alerts         int64            `json:"alerts"`
+	AlertsLast24h  int64            `json:"alerts_last_24h"`
+	AlertsLast7d   int64            `json:"alerts_last_7d"`
+	LastAlertAt    *time.Time       `json:"last_alert_at,omitempty"`
+	DeliveriesOK   int64            `json:"deliveries_succeeded"`
+	DeliveriesFail int64            `json:"deliveries_failed"`
+	Rules          []RuleMatchCount `json:"rules"`
+}
+
+// RuleMatchCount is one rule's share of a monitor's alerts. Rules are listed
+// whether or not they have matched, so a rule that never fires is visible as
+// a zero instead of being absent — the absence of a row and a rule that does
+// not match are the same thing to a client only if the client can tell them
+// apart, and this lets it.
+type RuleMatchCount struct {
+	RuleID int64  `json:"rule_id"`
+	Type   string `json:"type"`
+	Alerts int64  `json:"alerts"`
 }
 
 // ListFilter pages monitors or channels. Zero values mean "no constraint"
@@ -507,6 +728,22 @@ type Alerts interface {
 	// before DeleteExpiredAlerts removes it, so a failed archive can block the
 	// delete. Ordering matches DeleteExpiredAlerts exactly.
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
+}
+
+// MaintenanceWindows persists alert-silencing windows and marks suppressed
+// alerts. ActiveMaintenanceWindow is the one check on the delivery path.
+type MaintenanceWindows interface {
+	CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error)
+	ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error)
+	UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	DeleteMaintenanceWindow(ctx context.Context, id int64) error
+	// ActiveMaintenanceWindow returns the most specific window covering
+	// (monitorID, contractID) at time at, or nil when none is active.
+	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error)
+	// SetAlertSuppressed marks a persisted alert as silenced, recording
+	// the reason so the operator can see why it was not delivered.
+	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
 }
 
 // Ingest persists the poller checkpoint.
@@ -682,6 +919,7 @@ type Store interface {
 	Rules
 	Channels
 	Alerts
+	MaintenanceWindows
 	Inhibitions
 	Ingest
 	Backfills
@@ -691,6 +929,11 @@ type Store interface {
 	Audits
 	DigestQueue
 	GetStats(ctx context.Context) (Stats, error)
+	// GetMonitorStats returns one monitor's alert, delivery and per-rule
+	// counts, or ErrNotFound when the monitor does not exist. It exists
+	// because GetStats answers "how big is this instance" and says nothing
+	// about whether a particular monitor is doing any work.
+	GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.

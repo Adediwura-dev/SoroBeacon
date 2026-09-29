@@ -16,7 +16,18 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/secrets"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+// DefaultTimeout is the fallback timeout applied to channel deliveries
+// when no explicit channel timeout is configured.
+const DefaultTimeout = store.DefaultChannelTimeout
+
+// MinTimeout is the lower bound on channel delivery timeouts.
+const MinTimeout = store.MinChannelTimeout
+
+// MaxTimeout is the upper bound on channel delivery timeouts.
+const MaxTimeout = store.MaxChannelTimeout
 
 // Alert is the rendered-alert payload handed to a Notifier. It is a
 // flattened, channel-agnostic view of a stored alert plus its context.
@@ -77,6 +88,7 @@ const (
 	TypeTelegram   = "telegram"
 	TypeEmail      = "email"
 	TypeWebhook    = "webhook"
+	TypeNtfy       = "ntfy"
 	TypeMatrix     = "matrix"
 	TypePagerDuty  = "pagerduty"
 	TypeTwilio     = "twilio"
@@ -102,6 +114,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTelegram, NewTelegram)
 	f.Register(TypeEmail, NewEmail)
 	f.Register(TypeWebhook, NewWebhook)
+	f.Register(TypeNtfy, NewNtfy)
 	f.Register(TypeMatrix, NewMatrix)
 	f.Register(TypePagerDuty, NewPagerDuty)
 	f.Register(TypeFederation, NewFederation)

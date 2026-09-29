@@ -84,6 +84,13 @@ func (*ContractAllowlist) ParamSchema() []FieldSchema {
 	}
 }
 
+func (TokenSupplyChange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "direction", Type: "select", Description: "Supply direction to match (default any)", Options: []string{"mint", "burn", "any"}, Default: "any"},
+		{Name: "min_amount", Type: "string", Description: "Minimum amount (decimal integer string)"},
+	}
+}
+
 func (ValueThreshold) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
@@ -142,6 +149,21 @@ func (*Composite) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "op", Type: "select", Required: true, Description: "How the child results combine", Options: []string{opAnd, opOr, opNot}, Default: opAnd},
 		{Name: "rules", Type: "object", Required: true, Description: "Child rules as a JSON array of {\"type\": ..., \"params\": {...}}; exactly one for \"not\", at least one otherwise"},
+	}
+}
+
+func (SelfTransfer) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min_amount", Type: "string", Description: "Only match self-transfers of at least this amount (decimal integer string)"},
+	}
+}
+
+func (TimeWindow) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "start", Type: "string", Required: true, Description: "Window start in UTC (HH:MM, e.g. 09:00)"},
+		{Name: "end", Type: "string", Required: true, Description: "Window end in UTC (HH:MM); earlier than start crosses midnight"},
+		{Name: "days", Type: "object", Description: "Days to match (JSON array of mon|tue|wed|thu|fri|sat|sun); omit to match every day"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the window (default false)", Options: []string{"true", "false"}, Default: "false"},
 	}
 }
 

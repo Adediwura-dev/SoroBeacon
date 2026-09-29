@@ -2,9 +2,8 @@
 
 **Monitoring and alerting for Soroban smart contracts.** Point SoroBeacon at
 one or more contracts on Stellar, define rules ("this event fired", "an
-edmitted value crossed a threshold", "more than N in M minutes"), and get alerts
-on Discord, Slack, Telegram, Matrix, PagerDuty, Twilio SMS, email, or any webhook — with a
-small dashboard to manage monitors
+emitted value crossed a threshold", "more than N in M minutes"), and get alerts
+on Discord, Slack, Telegram, Matrix, PagerDuty, Twilio SMS, ntfy, email, or any webhook — with a small dashboard to manage monitors
 and review alert history.
 
 Stellar has no good open-source way to watch a contract and get notified when
@@ -194,6 +193,54 @@ see the [configuration guide](docs/getting-started/configuration.md#encrypting-c
 > Set it to require `Authorization: Bearer <token>` on `/api/v1` and a
 > sign-in on the dashboard, or keep the listener on a trusted network.
 
+## Deployment
+
+### Several instances (high availability)
+
+Every instance serves the API and the dashboard; exactly one of them polls.
+Instances compete for a Postgres session-level advisory lock
+(`pg_try_advisory_lock`, key `0x534F4245434F4E`), and the holder runs the ingest
+loop and the retention pruner. There is no extra table, no migration and no
+coordinator process to run — a second instance is just a second instance:
+
+```sh
+# Two replicas of the same deployment, one poller between them.
+docker compose up -d --scale sorobeacon=2
+```
+
+- **One poller, always.** Without the lease, two replicas ingest the same
+  events and race the same checkpoint, so every alert is delivered twice and
+  each instance believes the other's progress is its own.
+- **Failover is bounded by the lease interval (3s)** — the follower's next
+  attempt to take the lock. A leader that exits gracefully releases the lock on
+  the way out; a leader that is killed frees it when its database session
+  disappears. There is no long fixed timer in either path.
+- **A demoted leader stops polling.** Its poller context is cancelled and the
+  lock is not given up until the poller has returned. A leader that loses its
+  database connection notices on the next renewal and stops, rather than
+  polling alongside the new leader — that overlap is the split-brain case that
+  duplicates alerts.
+- **The lease uses one dedicated connection per instance**, outside the
+  `DATABASE_MAX_CONNS` pool, because an advisory lock lives on the session that
+  took it and a pooled connection cannot be pinned for that.
+- **A follower is healthy.** `GET /api/v1/health` reports `leader`,
+  `leader_election` and `leader_since` so an operator can see which replica
+  polls, and the overview page says the same. A follower answers every other
+  endpoint normally and never fails readiness for not polling.
+- **PgBouncer needs session pooling.** Leader election holds a session-level
+  lock, so `DATABASE_URL` must reach Postgres directly or through a
+  session-pooled PgBouncer; in transaction pooling mode the lock cannot be
+  held. Followers then never promote, and no instance polls.
+
+### SQLite: a single node, no election
+
+A `sqlite://` `DATABASE_URL` is single-node by construction: one file on one
+machine, and no advisory locks to take. SoroBeacon runs the poller
+unconditionally and `GET /api/v1/health` reports `"leader": true` with
+`"leader_election": false`. Do not point several instances at one SQLite file —
+use Postgres when you want more than one. See
+[capacity and scaling](docs/operations/scaling.md).
+
 ## HTTP API
 
 All endpoints are under `/api/v1`.
@@ -264,9 +311,30 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   "type": "token_event",
   "params": {
     "event": "transfer",
-    "from": "GDW6...SENDER",
-    "min_amount": "1000000000"
+    "from": "GDW6...SENDER",	"min_amount": "1000000000"
   }
+}'
+```
+
+**`self_transfer`** — SEP-41 `transfer` events whose from and to slots hold
+the same address: contract bugs and wash trading, caught without one rule per
+address pair. `min_amount` is an optional inclusive i128 lower bound:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "self_transfer",
+  "params": {"min_amount": "1000000000"}
+}'
+```
+
+**`time_window`** — matches when the event's ledger close time falls inside
+(or, with `outside: true`, outside) a recurring UTC window. `days` defaults
+to every day; a window whose `end` precedes its `start` crosses midnight:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "time_window",
+  "params": {"start": "09:00", "end": "17:00", "days": ["mon","tue","wed","thu","fri"], "outside": true}
 }'
 ```
 
@@ -386,18 +454,17 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Thirteen channel types ship with the MVP. `config` is validated on create/update
-and never returned in responses. Each has a page under
+More than twenty channel types ship with the MVP. `config` is validated on
+create/update and never returned in responses. Each has a page under
 [docs/channels/](docs/channels/):
 [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md),
 [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md),
-[PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md),
-[Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md),
-[DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md),
-[Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md),
-[AWS SNS](docs/channels/sns.md) and the
-[Lark](docs/channels/lark.md) and the [generic webhook](docs/channels/webhook.md).
-[DingTalk](docs/channels/dingtalk.md) and the
+[PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md),
+[Email](docs/channels/email.md), [Signal](docs/channels/signal.md),
+[Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md),
+[Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md),
+[Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md),
+[Lark](docs/channels/lark.md), [ntfy](docs/channels/ntfy.md) and the
 [generic webhook](docs/channels/webhook.md).
 For self-hosted chat and phone push there are also
 [Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
@@ -412,6 +479,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 
 # Slack:    {"webhook_url": "https://hooks.slack.com/services/..."}
 # Telegram: {"bot_token": "123:abc", "chat_id": "-1001234567890"}
+# ntfy:     {"topic": "sorobeacon-8f3a1c", "access_token": "tk_...", "priority": 4}
 # Email:    {"host": "smtp.example.com", "port": 587, "username": "u",
 #            "password": "p", "from": "beacon@example.com", "to": ["ops@example.com"]}
 # Webhook:  {"url": "https://example.com/hook", "secret": "shared-secret"}
@@ -455,6 +523,23 @@ curl -s localhost:8080/api/v1/alerts/7/deliveries     # delivery attempts for on
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
 ```
+
+### Maintenance windows
+
+Time-bounded silences that suppress **delivery**, not **detection**. Alerts
+raised inside a window are still stored and visible, marked suppressed with
+the window's reason. Scope a window globally, per monitor, or per contract ID;
+`end_at` is required and must follow `start_at`.
+
+```sh
+curl -s -X POST localhost:8080/api/v1/maintenance-windows -d '{
+  "reason": "planned upgrade", "scope": "global",
+  "start_at": "2026-09-23T22:00:00Z", "end_at": "2026-09-24T02:00:00Z"
+}'
+curl -s 'localhost:8080/api/v1/maintenance-windows?active=true'
+```
+
+See [Maintenance windows](docs/guides/maintenance-windows.md).
 
 #### Live alerts (Server-Sent Events)
 
@@ -549,10 +634,10 @@ internal/config     env config
 internal/telemetry  OpenTelemetry tracer setup (OTLP/HTTP; off by default)
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
 internal/store      Postgres (pgx) + embedded golang-migrate migrations
-internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
-                    token_event, frequency_threshold
-internal/notify     Notifier interface + 7 channels + retrying dispatcher
+internal/rules      RuleEvaluator interface + the built-in rule types
+internal/notify     Notifier interface + the built-in channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
+internal/lease      Postgres advisory-lock leader election for the poller
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
 internal/apiclient  HTTP client for the API, shared by the CLI
@@ -602,13 +687,15 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 ### Open contributor issues (by design)
 
 - More rule types (absence-of-event, aggregation windows)
-- More channels (ntfy, ...)
+- More channels (further chat, SMS and paging integrations)
 - A richer SPA dashboard (the current one is intentionally minimal)
 - Contract-spec-aware event decoding (named fields instead of raw topics)
 
-## License
-### Notification Channels
+## Notification Channels
 
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), and generic [Webhooks](docs/channels/webhook.md).
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [Lark](docs/channels/lark.md), and generic [Webhooks](docs/channels/webhook.md).
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), and generic [Webhooks](docs/channels/webhook.md).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), [ntfy](docs/channels/ntfy.md), and generic [Webhooks](docs/channels/webhook.md).
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
+
