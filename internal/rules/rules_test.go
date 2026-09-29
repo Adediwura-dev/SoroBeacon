@@ -263,7 +263,7 @@ func TestRegistry(t *testing.T) {
 	// rather than derived from the registry, so adding a rule type without
 	// noticing cannot pass unremarked — which does mean a PR that adds one
 	// has to extend this line.
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeSelfTransfer, TypeTimeWindow, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeNumericRange, TypeEventNameGlob, TypeContractAllowlist, TypeTokenSupplyChange}, r.Types())
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeSelfTransfer, TypeTimeWindow, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeNumericRange, TypeEventNameGlob, TypeContractAllowlist, TypeTokenSupplyChange, TypeComposite}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
