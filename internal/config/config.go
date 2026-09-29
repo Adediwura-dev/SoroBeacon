@@ -94,11 +94,15 @@ type Config struct {
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
@@ -215,6 +219,21 @@ type OTLPConfig struct {
 // the tests cannot drift apart.
 func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
 
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+}
+
+// PlaygroundEnabled reports whether the interactive playground is served.
+// The endpoint itself is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
+
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
 // wins over defaults so a checked-in config stays sane while emergency
@@ -273,12 +292,16 @@ func Load() (Config, error) {
 	}
 
 	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode)
 	}
 	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
+	}
+	cfg.HorizonURL = lookupConfigValue("HORIZON_URL", fileValues)
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
 	}
 
 	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
@@ -485,6 +508,36 @@ func Load() (Config, error) {
 		}
 		cfg.OTLP.SampleRate = r
 	}
+	// GraphQL configuration. Read through lookupConfigValue like every other
+	// setting, so CONFIG_FILE can supply these too.
+	cfg.GraphQL.EnablePlayground = false
+	if v := lookupConfigValue("GRAPHQL_PLAYGROUND", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			return cfg, fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v)
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := lookupConfigValue("GRAPHQL_MAX_DEPTH", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v)
+		}
+		cfg.GraphQL.MaxDepth = n
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := lookupConfigValue("GRAPHQL_MAX_COMPLEXITY", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v)
+		}
+		cfg.GraphQL.MaxComplexity = n
+	}
+
 	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
@@ -634,6 +687,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
 		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
+		// Redacted for the same reason as the others: a Horizon endpoint
+		// behind basic auth carries the credential in the URL.
+		slog.String("horizon_url", redactURLCredentials(c.HorizonURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
