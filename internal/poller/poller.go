@@ -86,9 +86,11 @@ type Poller struct {
 	// poll cycle becomes one trace: fetch, decode, rule evaluation, the
 	// alert write and each channel delivery hang off the same root span.
 	telemetry *telemetry.Provider
-	// scanned/matched accumulate per-cycle counts for metrics.
-	scanned int
-	matched int
+	// scanned/matched/evaluations accumulate per-cycle counts for metrics.
+	// They are only touched from the single Run goroutine.
+	scanned     int
+	matched     int
+	evaluations int
 	// pos is the last successful poll snapshot, stored as Position.
 	// atomic.Value so HTTP handlers can read it without a mutex.
 	pos atomic.Value
@@ -197,11 +199,10 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 
-		p.scanned, p.matched = 0, 0
+		p.scanned, p.matched, p.evaluations = 0, 0, 0
 		start := time.Now()
 		err := p.Poll(ctx)
-		p.metrics.RecordPoll(err == nil, time.Since(start))
-		p.metrics.RecordEvents(p.scanned, p.matched)
+		p.recordCycle(err == nil, time.Since(start))
 		if err != nil {
 			if ctx.Err() != nil {
 				continue
@@ -214,6 +215,15 @@ func (p *Poller) Run(ctx context.Context) {
 		delay = p.interval
 		p.recordBackoff(false)
 	}
+}
+
+// recordCycle publishes the counters a completed cycle accumulated. Split out
+// from Run so the instrumentation can be asserted without driving the timing
+// loop, which is the only thing Run adds over Poll.
+func (p *Poller) recordCycle(ok bool, took time.Duration) {
+	p.metrics.RecordPoll(ok, took)
+	p.metrics.RecordEvents(p.scanned, p.matched)
+	p.metrics.RecordRuleEvaluations(p.evaluations)
 }
 
 // Poll runs one ingest cycle as a single trace. The root span
@@ -474,6 +484,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 		for _, rule := range ruleList {
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
+			p.evaluations++
 			ruleCtx := rules.WithRuleID(ctx, rule.ID)
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			if err != nil {
@@ -601,7 +612,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		CreatedAt: alert.CreatedAt,
 		// GroupCount is 1 for the first alert in a window (the one
 		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount: 1,
+		GroupCount:  1,
 		WindowStart: time.Time{},
 		WindowEnd:   time.Time{},
 	})

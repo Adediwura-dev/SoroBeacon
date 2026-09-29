@@ -28,6 +28,7 @@ const (
 	pollAgeName           = "sorobeacon_seconds_since_last_poll"
 	eventsScannedName     = "sorobeacon_events_scanned_total"
 	eventsMatchedName     = "sorobeacon_events_matched_total"
+	ruleEvaluationsName   = "sorobeacon_rule_evaluations_total"
 	alertsFiredName       = "sorobeacon_alerts_fired_total"
 	deliveriesName        = "sorobeacon_alert_deliveries_total"
 	priorityContractsName = "sorobeacon_poll_priority_contracts"
@@ -78,6 +79,26 @@ func TestRecordEventsCountsScannedAndMatched(t *testing.T) {
 
 	assert.Equal(t, float64(9), m.sampleValue(t, eventsScannedName, nil))
 	assert.Equal(t, float64(3), m.sampleValue(t, eventsMatchedName, nil))
+}
+
+// Rule evaluations are counted separately from events so a monitor with many
+// rules is distinguishable from a busy contract: the same three events give a
+// different evaluation count depending on how many rules they are checked
+// against.
+func TestRecordRuleEvaluationsCountsEvaluations(t *testing.T) {
+	m := New()
+
+	m.RecordEvents(3, 1)
+	m.RecordRuleEvaluations(9)
+
+	assert.Equal(t, float64(3), m.sampleValue(t, eventsScannedName, nil))
+	assert.Equal(t, float64(9), m.sampleValue(t, ruleEvaluationsName, nil))
+}
+
+func TestRecordRuleEvaluationsIsNilSafe(t *testing.T) {
+	var m *Metrics
+
+	assert.NotPanics(t, func() { m.RecordRuleEvaluations(5) })
 }
 
 func TestRecordAlertCountsAlerts(t *testing.T) {

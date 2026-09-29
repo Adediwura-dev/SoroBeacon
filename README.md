@@ -165,8 +165,10 @@ implementing two methods. See
 
 `/metrics` serves Prometheus instrumentation: poll outcomes and duration,
 poll lag behind the chain tip, seconds since the last poll, the
-events-scanned → events-matched → alerts-fired funnel, deliveries by
-channel and outcome, and HTTP request duration by route pattern.
+events-scanned → rule-evaluations → events-matched → alerts-fired funnel,
+deliveries by channel and outcome, and HTTP request duration by route
+pattern. The [metrics reference](docs/reference/metrics.md) lists every
+metric with its labels, meaning and cardinality rules.
 `/api/v1/livez` and `/api/v1/readyz` are orchestration probes (liveness
 checks nothing; readiness checks the database and the event source with
 per-dependency detail). `/api/v1/version` reports the version, commit and
