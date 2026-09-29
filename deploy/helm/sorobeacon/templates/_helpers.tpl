@@ -115,6 +115,7 @@ POLL_INTERVAL: {{ .Values.config.pollInterval | quote }}
 LOG_LEVEL: {{ .Values.config.logLevel | quote }}
 MONITOR_SILENT_AFTER: {{ .Values.config.monitorSilentAfter | quote }}
 READYZ_LAG_THRESHOLD: {{ .Values.config.readyzLagThreshold | int64 | quote }}
+CHANNEL_DISABLE_AFTER_FAILURES: {{ .Values.config.channelDisableAfterFailures | int64 | quote }}
 RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
 RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}
 RATE_LIMIT_TRUST_FORWARDED: {{ .Values.config.rateLimitTrustForwarded | toString | quote }}
