@@ -114,6 +114,10 @@ func NewRegistry() *Registry {
 	r.Register(TypeSelfTransfer, SelfTransfer{})
 	r.Register(TypeTimeWindow, TimeWindow{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
+	// The composite is registered last because it resolves child types
+	// through this registry; passing r to itself lets it see every leaf above
+	// and any type registered on this registry later.
+	r.Register(TypeComposite, NewComposite(r))
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	r.Register(TypeTopicPosition, TopicPosition{})

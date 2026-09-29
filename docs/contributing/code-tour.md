@@ -100,6 +100,8 @@ The built-ins, one file each:
 | `value_threshold` | `internal/rules/value_threshold.go` |
 | `token_event` | `internal/rules/token_event.go` |
 | `frequency_threshold` | `internal/rules/frequency_threshold.go` |
+| `composite` | `internal/rules/composite.go` |
+| `topic_regex` | `internal/rules/topic_regex.go` |
 | `topic_regex` | `internal/rules/topic_regex.go` |
 | `topic_position` | `internal/rules/topic_position.go` |
 | `address_watchlist` | `internal/rules/address_watchlist.go` |

@@ -145,6 +145,13 @@ func (*TopicRegex) ParamSchema() []FieldSchema {
 	}
 }
 
+func (*Composite) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "op", Type: "select", Required: true, Description: "How the child results combine", Options: []string{opAnd, opOr, opNot}, Default: opAnd},
+		{Name: "rules", Type: "object", Required: true, Description: "Child rules as a JSON array of {\"type\": ..., \"params\": {...}}; exactly one for \"not\", at least one otherwise"},
+	}
+}
+
 func (SelfTransfer) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "min_amount", Type: "string", Description: "Only match self-transfers of at least this amount (decimal integer string)"},
