@@ -102,6 +102,17 @@ config:
   sourceMode: "rpc"
   # SoroTrail indexer base URL. Required when sourceMode is sorotrail.
   sorotrailUrl: ""
+  # Horizon REST base URL. Required when sourceMode is horizon, which reads
+  # events from Horizon's transaction history rather than the RPC.
+  horizonUrl: ""
+  # Serve the interactive GraphQL playground at /graphql/playground. Off by
+  # default: the endpoint itself is always available, and the playground is
+  # an extra surface you probably do not want on a public deployment.
+  graphqlPlayground: false
+  # Query depth and complexity ceilings for the GraphQL endpoint. Empty keeps
+  # the application's defaults.
+  graphqlMaxDepth: ""
+  graphqlMaxComplexity: ""
   # API + dashboard listen address. Must match service.targetPort.
   httpAddr: ":8080"
   # Maximum request body size for API write endpoints (POST/PATCH/PUT), in

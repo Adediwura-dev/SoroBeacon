@@ -1,8 +1,9 @@
 module github.com/sorotrail/sorobeacon
 
-go 1.25.11
+go 1.26
 
 require (
+	github.com/99designs/gqlgen v0.17.95
 	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
 	github.com/aws/aws-sdk-go-v2/service/sns v1.47.2
@@ -13,6 +14,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/stellar/go-stellar-sdk v0.7.3
 	github.com/stretchr/testify v1.12.1
+	github.com/vektah/gqlparser/v2 v2.5.58
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0

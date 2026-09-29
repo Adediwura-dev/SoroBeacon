@@ -105,6 +105,10 @@ RPC_URL: {{ .Values.config.rpcUrl | quote }}
 NETWORK_PASSPHRASE: {{ .Values.config.networkPassphrase | quote }}
 SOURCE_MODE: {{ .Values.config.sourceMode | quote }}
 SOROTRAIL_URL: {{ .Values.config.sorotrailUrl | quote }}
+HORIZON_URL: {{ .Values.config.horizonUrl | quote }}
+GRAPHQL_PLAYGROUND: {{ .Values.config.graphqlPlayground | toString | quote }}
+GRAPHQL_MAX_DEPTH: {{ .Values.config.graphqlMaxDepth | quote }}
+GRAPHQL_MAX_COMPLEXITY: {{ .Values.config.graphqlMaxComplexity | quote }}
 HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
 HTTP_MAX_BODY_BYTES: {{ .Values.config.httpMaxBodyBytes | int64 | quote }}
 POLL_INTERVAL: {{ .Values.config.pollInterval | quote }}
