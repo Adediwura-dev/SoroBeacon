@@ -1,12 +1,24 @@
 # Architecture
 
-One Go process, three pipeline stages, Postgres for state:
+One Go process, three pipeline stages, one database for state. The database is
+selected by the `DATABASE_URL` scheme: Postgres (pgx) for a team deployment, or
+a single SQLite file for a node that should not run a database server.
 
 ```
 EventSource ──page──▶ poller ─▶ rules engine ─▶ alerts ─▶ dispatcher ─▶ channels
  (RPC or SoroTrail)        │                              │                   │
-                           └── ingest_state ── Postgres ──┴── delivery_attempts ─┘
+                           └── ingest_state ────── Postgres or SQLite ───────┴── delivery_attempts ─┘
 ```
+
+Only the instance holding the poller lease (`internal/lease`) runs the ingest
+loop, while every instance serves the API and dashboard.
+
+The two backends share one `store.Store` interface, one behavioural
+conformance suite (`internal/store/conformance_test.go`), and one
+channel-config encryption envelope. They differ in DDL (parallel migration
+sets) and in how the alert cooldown serialises: Postgres locks the rule row
+with `SELECT ... FOR UPDATE`, SQLite holds its single write lock through a
+`BEGIN IMMEDIATE` transaction. Both yield one alert per window.
 
 ## Event sources (`internal/poller`, `internal/sorotrail`)
 
@@ -36,11 +48,33 @@ line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 * In `rpc` mode the poller verifies the RPC's network passphrase at startup
   against the configured one and refuses to start on mismatch.
 
+## Leader election (`internal/lease`)
+
+Every instance serves the API and the dashboard; exactly one polls. Instances
+compete for a Postgres session-level advisory lock (`pg_try_advisory_lock`,
+key `0x534F4245434F4E`), so the election needs no table, no migration and no
+coordinator process — and it is Postgres-only, which is why a `sqlite://`
+deployment uses `lease.SingleNode`: no election, the instance is the poller.
+
+The holder runs `poller.Run` (and the retention pruner); the losers run nothing
+but their HTTP servers. The lock belongs to the session that took it, which is
+what makes failover prompt rather than timer-driven: a leader that exits
+releases it explicitly, and a leader that dies frees it when its session goes.
+
+`Lease.Run(ctx, job)` runs `job` in its own goroutine for exactly as long as
+the lock is held, renewing every three seconds. A renewal that fails — the
+session died, the connection was cut, the lock was released elsewhere — cancels
+`job` and waits for it to return *before* the lock is given up, so the next
+leader never starts polling while this one is mid-cycle. That ordering is the
+split-brain guard: the failure it prevents is two instances ingesting the same
+events and delivering every alert twice.
+
 ## Observability (`internal/metrics`, `internal/reqid`, `internal/buildinfo`)
 
 * `/metrics` — Prometheus: poll outcomes/duration, lag behind the tip,
-  seconds since last poll, the scanned→matched→alerted funnel, deliveries
-  per channel and outcome, HTTP duration by route pattern.
+  seconds since last poll, the scanned→evaluated→matched→alerted funnel,
+  deliveries per channel and outcome, HTTP duration by route pattern. The
+  full list is in the [metrics reference](metrics.md).
 * `/api/v1/livez`, `/api/v1/readyz` — liveness checks nothing (restart
   loops otherwise); readiness checks the database and the event source
   concurrently, bounded per check, with per-dependency detail.
@@ -74,7 +108,11 @@ The dispatcher fans each new alert out to the monitor's enabled channels. Per ch
 | `delivery_attempts` | Every delivery try with status and response snippet |
 | `ingest_state` | Single-row poller checkpoint (last ledger, cursor) |
 
-Migrations are embedded in the binary and applied automatically at startup (golang-migrate).
+Migrations are embedded in the binary and applied automatically at startup
+(golang-migrate). Postgres and SQLite each have their own embedded set —
+`internal/store/migrations/` and `internal/store/migrations/sqlite/` — because
+Postgres DDL (JSONB, TIMESTAMPTZ, `generate_series`) does not run unmodified on
+SQLite.
 
 ## Trust boundaries
 

@@ -17,6 +17,7 @@ func TestLoadDefaults(t *testing.T) {
 	// environment cannot masquerade as the unset path.
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("RPC_URL", "")
+	t.Setenv("RPC_URLS", "")
 	t.Setenv("NETWORK", "")
 	t.Setenv("NETWORK_PASSPHRASE", "")
 	t.Setenv("POLL_INTERVAL", "")
@@ -53,6 +54,11 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
+	// Tracing defaults to entirely off.
+	assert.Empty(t, cfg.OTLP.Endpoint)
+	assert.Empty(t, cfg.OTLP.ServiceName)
+	assert.Equal(t, DefaultOTLPSampleRate, cfg.OTLP.SampleRate)
+	assert.False(t, cfg.OTLP.Enabled())
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -68,6 +74,59 @@ func TestLoadRequiresSoroTrailURL(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "SOROTRAIL_URL")
+}
+
+func TestLoadOTLPOffByDefault(t *testing.T) {
+	// Clear optional vars so a leaked environment cannot turn tracing on.
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "")
+	t.Setenv("OTLP_SERVICE_NAME", "")
+	t.Setenv("OTLP_SAMPLE_RATE", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.OTLP.Endpoint, "tracing must be off unless OTLP_ENDPOINT is set")
+	assert.False(t, cfg.OTLP.Enabled())
+}
+
+func TestLoadOTLPConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	t.Setenv("OTLP_SERVICE_NAME", "sorobeacon-staging")
+	t.Setenv("OTLP_SAMPLE_RATE", "0.25")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:4318", cfg.OTLP.Endpoint)
+	assert.True(t, cfg.OTLP.Enabled())
+	assert.Equal(t, "sorobeacon-staging", cfg.OTLP.ServiceName)
+	assert.Equal(t, 0.25, cfg.OTLP.SampleRate)
+}
+
+func TestLoadOTLPEndpointValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	for _, bad := range []string{"localhost:4318", "ftp://collector", "http://"} {
+		t.Setenv("OTLP_ENDPOINT", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_ENDPOINT", "endpoint %q must be rejected", bad)
+	}
+}
+
+func TestLoadOTLPSampleRateValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	for _, bad := range []string{"-0.1", "1.1", "abc", "NaN", "Inf"} {
+		t.Setenv("OTLP_SAMPLE_RATE", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_SAMPLE_RATE", "rate %q must be rejected", bad)
+	}
+
+	// The bounds themselves are valid.
+	for _, good := range []string{"0", "1"} {
+		t.Setenv("OTLP_SAMPLE_RATE", good)
+		_, err := Load()
+		assert.NoError(t, err, "rate %q must be accepted", good)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -136,13 +195,56 @@ func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
 		t.Run(rpcURL, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "postgres://x")
 			t.Setenv("RPC_URL", rpcURL)
+			t.Setenv("RPC_URLS", "")
 
 			cfg, err := Load()
 
 			require.NoError(t, err)
 			assert.Equal(t, rpcURL, cfg.RPCURL)
+			// A lone RPC_URL is the single-entry case of the same list, so
+			// downstream code always has a failover set to work with.
+			assert.Equal(t, []string{rpcURL}, cfg.RPCURLs)
 		})
 	}
+}
+
+func TestLoadRPCURLs(t *testing.T) {
+	t.Run("RPC_URLS takes priority over RPC_URL", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("RPC_URL", "https://ignored.example")
+		t.Setenv("RPC_URLS", "https://primary.example, https://fallback.example")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Equal(t, "https://primary.example", cfg.RPCURL)
+		assert.Equal(t, []string{"https://primary.example", "https://fallback.example"}, cfg.RPCURLs)
+	})
+
+	t.Run("RPC_URLS alone satisfies a custom network", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("NETWORK", "custom")
+		t.Setenv("NETWORK_PASSPHRASE", "Standalone Network ; September 2026")
+		t.Setenv("RPC_URL", "")
+		t.Setenv("RPC_URLS", "https://only.example")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"https://only.example"}, cfg.RPCURLs)
+	})
+
+	t.Run("an invalid entry fails at load", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("RPC_URL", "")
+		t.Setenv("RPC_URLS", "https://primary.example,not-a-url")
+
+		_, err := Load()
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "RPC_URLS")
+		assert.ErrorContains(t, err, "not-a-url")
+	})
 }
 
 func TestLoadRejectsInvalidRPCURL(t *testing.T) {
@@ -172,6 +274,7 @@ func TestLoadRejectsInvalidRPCURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "postgres://x")
 			t.Setenv("RPC_URL", tt.rpcURL)
+			t.Setenv("RPC_URLS", "")
 
 			_, err := Load()
 
@@ -389,6 +492,46 @@ func TestRedactDatabaseURLUnparseable(t *testing.T) {
 	assert.Equal(t, "", redactDatabaseURL(""))
 	assert.Equal(t, redacted, redactDatabaseURL("not a url"))
 	assert.Equal(t, redacted, redactDatabaseURL("http://["))
+	// A sqlite URL with a Windows drive path does not parse as a URL, but it
+	// carries no credentials, so the operator is still shown the file. Without
+	// this the whole startup line said "[redacted]" on Windows.
+	assert.Equal(t, `sqlite://C:\srv\sorobeacon.db`, redactDatabaseURL(`sqlite://C:\srv\sorobeacon.db`))
+}
+
+// TestLogAttrsRedactsURLCredentials covers the other two URLs in the startup
+// line. An RPC provider or a SoroTrail deployment behind basic auth puts the
+// key in the URL, and LogAttrs is the one place configuration is printed.
+func TestLogAttrsRedactsURLCredentials(t *testing.T) {
+	attrs := func(c Config) (map[string]string, string) {
+		got := map[string]string{}
+		var dump strings.Builder
+		for _, a := range c.LogAttrs() {
+			got[a.Key] = a.Value.String()
+			dump.WriteString(a.Key + "=" + a.Value.String() + "\n")
+		}
+		return got, dump.String()
+	}
+
+	got, blob := attrs(Config{
+		RPCURL:       "https://rpcuser:rpc-api-key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:trail-token@trail.example.com",
+		DatabaseURL:  "postgres://u:p@db.example:5432/beacon",
+	})
+	assert.Equal(t, "https://rpc.example.com/v1", got["rpc_url"])
+	assert.Equal(t, "https://trail.example.com", got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc-api-key")
+	assert.NotContains(t, blob, "trail-token")
+
+	// Fail closed: a valid password containing "%" defeats url.Parse, and the
+	// unparseable value must not fall through to the log verbatim.
+	got, blob = attrs(Config{
+		RPCURL:       "https://rpcuser:rpc%key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:tok en@trail.example.com",
+	})
+	assert.Equal(t, redacted, got["rpc_url"])
+	assert.Equal(t, redacted, got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc%key")
+	assert.NotContains(t, blob, "tok en")
 }
 
 func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
@@ -405,16 +548,30 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 	}
 	assert.Equal(t, []string{
 		"database_url",
+		"replica_database_url",
 		"http_addr",
 		"source_mode",
 		"poll_interval",
 		"log_level",
 		"network",
 		"rpc_url",
+		"rpc_endpoint_count",
 		"sorotrail_url",
+		"horizon_url",
 		"cors_allowed_origins",
 		"config_encryption_enabled",
+		"secrets_provider",
+		"secrets_cache_ttl",
+		"vault_token_configured",
+		"reorg_tracking_window",
+		"reorg_confirmation_depth",
 		"api_token_count",
+		"otlp_tracing_enabled",
+		"otlp_service_name",
+		"otlp_sample_rate",
+		"graphql_playground_enabled",
+		"graphql_max_depth",
+		"graphql_max_complexity",
 	}, keys)
 }
 
@@ -664,6 +821,157 @@ func TestLoadAcceptsValidDatabaseURL(t *testing.T) {
 	}
 }
 
+// DATABASE_URL=sqlite://... must load: it is the backend that lets a
+// single-node deployment run without Postgres at all.
+func TestLoadAcceptsSQLiteDatabaseURL(t *testing.T) {
+	const url = "sqlite:///var/lib/sorobeacon/sorobeacon.db"
+	t.Setenv("DATABASE_URL", url)
+	t.Setenv("DATABASE_MAX_CONNS", "")
+	t.Setenv("DATABASE_MIN_CONNS", "")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "")
+	t.Setenv("DATABASE_MAX_CONN_IDLE_TIME", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, url, cfg.DatabaseURL)
+}
+
+func TestValidateDatabaseURLSQLite(t *testing.T) {
+	for _, raw := range []string{
+		"sqlite:///var/lib/sorobeacon/sorobeacon.db",
+		"sqlite://relative.db",
+		"sqlite:./data/sorobeacon.db",
+	} {
+		require.NoError(t, validateDatabaseURL(raw), raw)
+	}
+	err := validateDatabaseURL("sqlite://")
+	require.Error(t, err, "a sqlite URL with no file path cannot work")
+	assert.ErrorContains(t, err, "file path")
+}
+
+// The pool knobs tune the Postgres connection pool. Carrying them into a
+// SQLite deployment would silently do nothing, so Load fails loudly instead.
+func TestLoadRejectsPostgresPoolSettingsWithSQLite(t *testing.T) {
+	t.Setenv("DATABASE_URL", "sqlite:///tmp/sorobeacon.db")
+	t.Setenv("DATABASE_MAX_CONNS", "4")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONNS")
+	assert.ErrorContains(t, err, "sqlite")
+}
+
+// Read-replica routing is off unless REPLICA_DATABASE_URL says otherwise, and
+// the URL it carries is the value the store is handed.
+func TestLoadReplicaDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("REPLICA_DATABASE_URL", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.ReplicaDatabaseURL, "no replica URL means every read stays on the primary")
+
+	t.Setenv("REPLICA_DATABASE_URL", "  postgres://replica:5432/sorobeacon  ")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "postgres://replica:5432/sorobeacon", cfg.ReplicaDatabaseURL, "surrounding space is trimmed")
+}
+
+// A replica URL has to be a Postgres URL, and it has to be a different one
+// from the primary: pointing both at the same string looks like routing is on
+// in every log line and metric while every read still lands on the primary.
+// Both are startup errors rather than warnings.
+func TestLoadRejectsInvalidReplicaDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+
+	tests := []struct {
+		name    string
+		replica string
+		want    []string
+	}{
+		{
+			name:    "unsupported scheme",
+			replica: "mysql://user:" + secret + "@localhost:3306/db",
+			want:    []string{"REPLICA_DATABASE_URL", "mysql", "Postgres"},
+		},
+		{
+			name:    "not a URL",
+			replica: "replica-host:5432",
+			want:    []string{"REPLICA_DATABASE_URL", "parseable"},
+		},
+		{
+			name:    "missing host",
+			replica: "postgres:///sorobeacon",
+			want:    []string{"REPLICA_DATABASE_URL", "parseable"},
+		},
+		{
+			name:    "identical to the primary",
+			replica: "postgres://x",
+			want:    []string{"REPLICA_DATABASE_URL", "identical", "DATABASE_URL"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("REPLICA_DATABASE_URL", tt.replica)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			for _, want := range tt.want {
+				assert.ErrorContains(t, err, want)
+			}
+			assert.NotContains(t, err.Error(), secret, "a credential must not reach the error text")
+		})
+	}
+}
+
+// SQLite serves reads and writes from one file handle, so there is no replica
+// to route to. Carrying the variable into a SQLite deployment would silently
+// do nothing, so Load fails loudly instead — matching the pool knobs above.
+func TestLoadRejectsReplicaDatabaseURLWithSQLite(t *testing.T) {
+	t.Setenv("DATABASE_URL", "sqlite:///tmp/sorobeacon.db")
+	t.Setenv("REPLICA_DATABASE_URL", "postgres://replica:5432/sorobeacon")
+
+	_, err := Load()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "REPLICA_DATABASE_URL")
+	assert.ErrorContains(t, err, "sqlite")
+}
+
+// The replica URL carries its own credentials, so the startup log line gets
+// the same treatment as DATABASE_URL: scheme, host and database name only.
+func TestLogAttrsRedactsReplicaDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+	cfg := Config{
+		DatabaseURL:        "postgres://user:" + secret + "@primary:5432/sorobeacon",
+		ReplicaDatabaseURL: "postgres://user:" + secret + "@replica:5432/sorobeacon",
+	}
+
+	var dump strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		dump.WriteString(a.Key)
+		dump.WriteByte('=')
+		dump.WriteString(a.Value.String())
+		dump.WriteByte('\n')
+	}
+	blob := dump.String()
+
+	assert.NotContains(t, blob, secret, "a replica credential must not reach the log line")
+	assert.Contains(t, blob, "replica_database_url=postgres://replica:5432/sorobeacon")
+}
+
+// A SQLite URL holds no credentials, so the log line keeps the file path
+// rather than replacing the whole URL with [redacted].
+func TestRedactDatabaseURLSQLiteKeepsPath(t *testing.T) {
+	assert.Equal(t, "sqlite:///var/lib/sorobeacon/sorobeacon.db",
+		redactDatabaseURL("sqlite:///var/lib/sorobeacon/sorobeacon.db"))
+	assert.Equal(t, "sqlite://relative.db", redactDatabaseURL("sqlite://relative.db?cache=shared"))
+}
+
 func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 	const secret = "s3cret-password"
 	tests := []struct {
@@ -687,5 +995,57 @@ func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 				assert.ErrorContains(t, err, s)
 			}
 		})
+	}
+}
+
+func TestLoadSecretsProvider(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Disabled by default: references stay literals.
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SecretsProvider)
+
+	t.Setenv("SECRETS_PROVIDER", "env")
+	t.Setenv("SECRETS_CACHE_TTL", "90s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "env", cfg.SecretsProvider)
+	assert.Equal(t, 90*time.Second, cfg.SecretsCacheTTL)
+
+	// A disabled cache is allowed.
+	t.Setenv("SECRETS_CACHE_TTL", "0s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.SecretsCacheTTL)
+}
+
+func TestLoadRejectsBadSecretsConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("SECRETS_PROVIDER", "aws")
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_PROVIDER")
+
+	t.Setenv("SECRETS_PROVIDER", "")
+	t.Setenv("SECRETS_CACHE_TTL", "-1s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_CACHE_TTL")
+
+	t.Setenv("SECRETS_CACHE_TTL", "")
+	t.Setenv("SECRETS_PROVIDER", "vault")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "VAULT_ADDR")
+
+	// The token is a credential and must never reach LogAttrs.
+	t.Setenv("VAULT_ADDR", "https://vault.example:8200")
+	t.Setenv("VAULT_TOKEN", "hvs.super-secret")
+	cfg, err := Load()
+	require.NoError(t, err)
+	for _, a := range cfg.LogAttrs() {
+		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
 	}
 }

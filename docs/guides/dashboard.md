@@ -8,9 +8,9 @@ SoroBeacon ships a server-rendered dashboard (Go `html/template` + htmx — no b
 | --- | --- |
 | **Overview** (`/`) | Stats at a glance — monitors, rules, channels, alerts in the last 24h, last ingested ledger — plus a 30-day UTC daily alert chart (inline SVG, no JS charting library) and the most recent alerts. Quiet days are explicit zeroes; an instance with no alerts shows an empty state rather than a flat axis. |
 | **Monitors** (`/monitors`) | List, create (name + contract IDs), enable/disable, delete. Click through to a monitor for its rules and channel wiring. |
-| **Monitor detail** (`/monitors/{id}`) | Add/delete rules (type + params JSON), attach/detach notification channels with checkboxes. |
+| **Monitor detail** (`/monitors/{id}`) | Add/delete rules (type + params JSON), attach/detach notification channels with checkboxes, and see whether the monitor is doing anything: an **Activity** panel (alert totals, last 24h and 7d, delivery successes and failures, and a per-rule match count that lists rules that have never fired) and a **Recent alerts** panel with the last few rows and a link to the filtered alerts page. A monitor that has never matched says so instead of showing an empty table. |
 | **Channels** (`/channels`) | List, create (type + config JSON), delete — and a **Send test** button that fires a synthetic alert through the real channel and shows the result inline. |
-| **Alerts** (`/alerts`) | Paged history with monitor, rule, contract and newest/oldest sort; expand any row to see the full decoded event payload, or **Export CSV** for the whole filtered set. |
+| **Alerts** (`/alerts`) | Paged history with text search (`q`, the same substring search the API runs over the event id and the alert payload), monitor, rule, contract, severity, newest/oldest sort and a from/to date range; expand any row to see the full decoded event payload, or **Export CSV** for the whole filtered set. The range is whole UTC calendar days, inclusive at both ends, and it survives the **Older** paging link. |
 
 {% hint style="info" %}
 Channel config is write-only in the UI, same as the API: you paste secrets in when creating a channel, and they are never displayed again.
