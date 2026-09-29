@@ -32,15 +32,15 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
-// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
-// keeps for reorg detection. 128 ledgers is roughly ten minutes on
-// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
-// to cover the practical reorg depth.
-DefaultReorgTrackingWindow uint32 = 128
-// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
-// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
-DefaultGraphQLMaxDepth     = 10
-DefaultGraphQLMaxComplexity = 1000
+	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
+	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
+	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
+	// to cover the practical reorg depth.
+	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+	DefaultGraphQLMaxDepth      = 10
+	DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -149,6 +149,13 @@ type Config struct {
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
 	GRPCAddr string
+	// ChannelDisableAfterFailures is how many consecutive permanent channel
+	// failures (401/403/404 — a revoked bot token, a deleted webhook) take a
+	// channel out of rotation. Zero, the default when the variable is unset,
+	// never auto-disables: silently switching off someone's alerting is a
+	// worse outcome than the failure it would fix, so opting in is the
+	// operator's call.
+	ChannelDisableAfterFailures int
 	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
 	// and re-checks each cycle for reorg detection
 	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
@@ -372,6 +379,14 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
+	if v := lookupConfigValue("CHANNEL_DISABLE_AFTER_FAILURES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return cfg, fmt.Errorf("invalid CHANNEL_DISABLE_AFTER_FAILURES %q (want a non-negative integer)", v)
+		}
+		cfg.ChannelDisableAfterFailures = n
+	}
+
 	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -707,6 +722,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
 		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
 		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }
 
