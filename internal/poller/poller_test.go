@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +95,10 @@ type fakeStore struct {
 	groupStates map[string]int64
 	// inhibitions backs the inhibition rules for the DispatchStore interface.
 	inhibitions []store.Inhibition
+	// absence holds the absence rules' last-seen clocks, keyed like the
+	// table's primary key. It lives on the store, not the poller, so a test
+	// can throw the poller away and prove the clock survived "a restart".
+	absence map[string]time.Time
 }
 
 func newFakeStore() *fakeStore {
@@ -106,6 +112,7 @@ func newFakeStore() *fakeStore {
 		ledgerHashes: map[uint32]string{},
 		groupStates:  map[string]int64{},
 		inhibitions:  []store.Inhibition{},
+		absence:      map[string]time.Time{},
 	}
 }
 
@@ -121,6 +128,39 @@ func (f *fakeStore) ListChannelsForMonitor(_ context.Context, monitorID int64) (
 		}
 	}
 	return out, nil
+}
+
+func absenceKey(ruleID int64, eventName string) string {
+	return fmt.Sprintf("%d/%s", ruleID, eventName)
+}
+
+func (f *fakeStore) ListAbsenceState(context.Context) ([]store.AbsenceState, error) {
+	out := make([]store.AbsenceState, 0, len(f.absence))
+	for key, at := range f.absence {
+		// The key is "<ruleID>/<eventName>", and only the rule id can contain
+		// no "/", so splitting at the first one splits the rule id off the
+		// event name even when the name itself contains one.
+		ruleID, eventName, ok := strings.Cut(key, "/")
+		if !ok {
+			return nil, fmt.Errorf("malformed absence key %q", key)
+		}
+		id, err := strconv.ParseInt(ruleID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("absent rule id in absence key %q: %w", key, err)
+		}
+		out = append(out, store.AbsenceState{RuleID: id, EventName: eventName, LastSeen: at})
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RecordAbsenceSeen(_ context.Context, ruleID int64, eventName string, at time.Time) error {
+	key := absenceKey(ruleID, eventName)
+	// Monotonic, like the SQL GREATEST: an older instant is a no-op.
+	if prev, ok := f.absence[key]; ok && prev.After(at.UTC()) {
+		return nil
+	}
+	f.absence[key] = at.UTC()
+	return nil
 }
 
 func (f *fakeStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {

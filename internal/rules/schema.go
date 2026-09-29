@@ -23,8 +23,14 @@ type SchemaProvider interface {
 // ParamSchema returns the schema for a rule type, or nil when the evaluator
 // does not declare one (the builder falls back to the JSON textarea).
 func (r *Registry) ParamSchema(ruleType string) []FieldSchema {
-	e, ok := r.evaluators[ruleType]
-	if !ok {
+	// Absence rule types are registered separately but describe their params
+	// the same way, so the builder renders a form for them too.
+	var e any
+	if ev, ok := r.evaluators[ruleType]; ok {
+		e = ev
+	} else if ab, ok := r.absences[ruleType]; ok {
+		e = ab
+	} else {
 		return nil
 	}
 	provider, ok := e.(SchemaProvider)
@@ -36,9 +42,14 @@ func (r *Registry) ParamSchema(ruleType string) []FieldSchema {
 
 // AllSchemas returns schemas keyed by rule type name, for the builder endpoint.
 func (r *Registry) AllSchemas() map[string][]FieldSchema {
-	out := make(map[string][]FieldSchema, len(r.evaluators))
+	out := make(map[string][]FieldSchema, len(r.evaluators)+len(r.absences))
 	for name, e := range r.evaluators {
 		if sp, ok := e.(SchemaProvider); ok {
+			out[name] = sp.ParamSchema()
+		}
+	}
+	for name, a := range r.absences {
+		if sp, ok := a.(SchemaProvider); ok {
 			out[name] = sp.ParamSchema()
 		}
 	}
@@ -172,5 +183,12 @@ func (*AddressWatchlist) ParamSchema() []FieldSchema {
 		{Name: "addresses", Type: "object", Required: true, Description: "Watchlist of Stellar addresses (JSON array)"},
 		{Name: "match", Type: "select", Description: "Which address slot(s) to watch", Options: []string{"from", "to", "either"}, Default: "either"},
 		{Name: "event", Type: "select", Description: "Restrict to one SEP-41 event", Options: []string{"transfer", "mint", "burn", "clawback", "set_admin", "*"}},
+	}
+}
+
+func (Absence) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "event_name", Type: "string", Required: true, Description: "The event whose absence fires the rule (matched on the first topic)"},
+		{Name: "window", Type: "string", Required: true, Description: "How long silence is tolerated before alerting (Go duration, e.g. 30m)"},
 	}
 }
