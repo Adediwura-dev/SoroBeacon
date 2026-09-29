@@ -73,6 +73,21 @@ func (EventEmitted) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event_name", Type: "string", Description: "Event name to match (first topic)"},
 		{Name: "topic_equals", Type: "object", Description: "Topic index to expected value map (JSON)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
+	}
+}
+
+func (*ContractAllowlist) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "contract_ids", Type: "object", Required: true, Description: "Allowlisted contract IDs (JSON array); most useful AND-combined with a payload rule inside a composite rule"},
+		{Name: "exclude", Type: "select", Description: "Invert into a denylist (default false)", Options: []string{"true", "false"}, Default: "false"},
+	}
+}
+
+func (TokenSupplyChange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "direction", Type: "select", Description: "Supply direction to match (default any)", Options: []string{"mint", "burn", "any"}, Default: "any"},
+		{Name: "min_amount", Type: "string", Description: "Minimum amount (decimal integer string)"},
 	}
 }
 
@@ -82,6 +97,24 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 		{Name: "value_path", Type: "string", Description: "Dot path into the event value"},
 		{Name: "comparison", Type: "select", Required: true, Description: "Comparison operator", Options: []string{"gt", "gte", "lt", "lte", "eq", "neq"}},
 		{Name: "threshold", Type: "number", Required: true, Description: "Threshold value (number or numeric string for >53-bit)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
+	}
+}
+
+func (EventNameGlob) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "patterns", Type: "object", Required: true, Description: "Glob patterns matched against the whole event name (JSON array, e.g. [\"swap_*\"])"},
+	}
+}
+
+func (NumericRange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min", Type: "string", Description: "Inclusive lower bound (decimal integer string); at least one of min/max required"},
+		{Name: "max", Type: "string", Description: "Inclusive upper bound (decimal integer string); at least one of min/max required"},
+		{Name: "inclusive", Type: "select", Description: "Boundary values match (default true)", Options: []string{"true", "false"}, Default: "true"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the range (default false)", Options: []string{"true", "false"}, Default: "false"},
+		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
+		{Name: "value_path", Type: "string", Description: "Dot path into the event value"},
 	}
 }
 
@@ -92,6 +125,7 @@ func (TokenEvent) ParamSchema() []FieldSchema {
 		{Name: "to", Type: "string", Description: "Exact address in the to slot"},
 		{Name: "min_amount", Type: "string", Description: "Minimum amount (decimal integer string)"},
 		{Name: "max_amount", Type: "string", Description: "Maximum amount (decimal integer string)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
 	}
 }
 
@@ -100,6 +134,7 @@ func (*FrequencyThreshold) ParamSchema() []FieldSchema {
 		{Name: "event_name", Type: "string", Description: "Only count events with this name"},
 		{Name: "count", Type: "number", Required: true, Description: "Fire at this many matches"},
 		{Name: "window", Type: "string", Required: true, Description: "Rolling window duration (e.g. 5m, 1h)"},
+		{Name: CooldownParam, Type: "string", Description: "Suppress repeat alerts for this duration"},
 	}
 }
 
@@ -107,6 +142,28 @@ func (*TopicRegex) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "pattern", Type: "string", Required: true, Description: "Regular expression matched against a topic (e.g. ^swap_)"},
 		{Name: "position", Type: "number", Description: "Topic position to match (0 is the event name); omitted matches any topic"},
+	}
+}
+
+func (*Composite) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "op", Type: "select", Required: true, Description: "How the child results combine", Options: []string{opAnd, opOr, opNot}, Default: opAnd},
+		{Name: "rules", Type: "object", Required: true, Description: "Child rules as a JSON array of {\"type\": ..., \"params\": {...}}; exactly one for \"not\", at least one otherwise"},
+	}
+}
+
+func (SelfTransfer) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min_amount", Type: "string", Description: "Only match self-transfers of at least this amount (decimal integer string)"},
+	}
+}
+
+func (TimeWindow) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "start", Type: "string", Required: true, Description: "Window start in UTC (HH:MM, e.g. 09:00)"},
+		{Name: "end", Type: "string", Required: true, Description: "Window end in UTC (HH:MM); earlier than start crosses midnight"},
+		{Name: "days", Type: "object", Description: "Days to match (JSON array of mon|tue|wed|thu|fri|sat|sun); omit to match every day"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the window (default false)", Options: []string{"true", "false"}, Default: "false"},
 	}
 }
 

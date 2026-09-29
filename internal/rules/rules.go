@@ -22,6 +22,10 @@ import (
 const (
 	TypeEventEmitted       = "event_emitted"
 	TypeValueThreshold     = "value_threshold"
+	TypeContractAllowlist  = "contract_allowlist"
+	TypeEventNameGlob      = "event_name_glob"
+	TypeNumericRange       = "numeric_range"
+	TypeTokenSupplyChange  = "token_supply_change"
 	TypeFrequencyThreshold = "frequency_threshold"
 	TypeTopicRegex         = "topic_regex"
 	TypeAddressWatchlist   = "address_watchlist"
@@ -102,8 +106,18 @@ func NewRegistry() *Registry {
 	r := &Registry{evaluators: map[string]RuleEvaluator{}}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
+	r.Register(TypeContractAllowlist, &ContractAllowlist{})
+	r.Register(TypeEventNameGlob, EventNameGlob{})
+	r.Register(TypeNumericRange, NumericRange{})
+	r.Register(TypeTokenSupplyChange, TokenSupplyChange{})
 	r.Register(TypeTokenEvent, TokenEvent{})
+	r.Register(TypeSelfTransfer, SelfTransfer{})
+	r.Register(TypeTimeWindow, TimeWindow{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
+	// The composite is registered last because it resolves child types
+	// through this registry; passing r to itself lets it see every leaf above
+	// and any type registered on this registry later.
+	r.Register(TypeComposite, NewComposite(r))
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	r.Register(TypeTopicPosition, TopicPosition{})

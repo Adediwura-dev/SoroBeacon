@@ -41,6 +41,7 @@ func (s *SQLite) resetConformance(ctx context.Context) error {
 		 DELETE FROM audit_log;
 		 DELETE FROM pending_digests;
 		 DELETE FROM alerts;
+		 DELETE FROM maintenance_windows;
 		 DELETE FROM monitor_channels;
 		 DELETE FROM rules;
 		 DELETE FROM channels;

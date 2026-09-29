@@ -32,6 +32,7 @@ type Alert struct {
 	RuleID      int64           `json:"rule_id"`
 	EventID     string          `json:"event_id"`
 	Payload     json.RawMessage `json:"payload"`
+	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 }
 

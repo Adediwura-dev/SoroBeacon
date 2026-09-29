@@ -1,4 +1,5 @@
-// Package config loads SoroBeacon configuration from environment variables.
+// Package config loads SoroBeacon configuration from the environment and an
+// optional config file.
 package config
 
 import (
@@ -8,7 +9,6 @@ import (
 	"math"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -32,11 +32,15 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
-	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
-	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
-	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
-	// to cover the practical reorg depth.
-	DefaultReorgTrackingWindow uint32 = 128
+// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
+// keeps for reorg detection. 128 ledgers is roughly ten minutes on
+// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
+// to cover the practical reorg depth.
+DefaultReorgTrackingWindow uint32 = 128
+// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+DefaultGraphQLMaxDepth     = 10
+DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -69,6 +73,11 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
+	// ReplicaDatabaseURL is a second Postgres connection string serving the
+	// read-only queries the store routes (REPLICA_DATABASE_URL). Empty means
+	// no replica: every read stays on DatabaseURL, which is how every
+	// deployment behaved before replica routing existed.
+	ReplicaDatabaseURL string
 	// ConfigEncryptionKey is the decoded AES-GCM key used to encrypt
 	// channels.config at rest (CONFIG_ENCRYPTION_KEY, base64). Nil means
 	// encryption is disabled and configs stay plaintext, preserving the
@@ -85,11 +94,15 @@ type Config struct {
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
@@ -120,6 +133,10 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
+	AlertEnrichmentURL      string
+	AlertEnrichmentTimeout  time.Duration
+	AlertEnrichmentCacheTTL time.Duration
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
@@ -166,6 +183,9 @@ type Config struct {
 	// validates it when the pruner is built.
 	ArchiveURL string
 
+	// GraphQL is the GraphQL endpoint configuration.
+	GraphQL GraphQLConfig
+
 	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
 	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
 	NotifyRateLimitSlackRPS float64
@@ -199,28 +219,48 @@ type OTLPConfig struct {
 // the tests cannot drift apart.
 func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
 
-// Load reads configuration from the environment. DATABASE_URL is the only
-// required variable; everything else has a sensible default.
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+}
+
+// PlaygroundEnabled reports whether the interactive playground is served.
+// The endpoint itself is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
+
+// Load reads configuration from the environment and, optionally, a YAML file
+// pointed to by CONFIG_FILE. Environment values win over the file, and the file
+// wins over defaults so a checked-in config stays sane while emergency
+// overrides still work.
 func Load() (Config, error) {
-	net, err := ParseNetwork(os.Getenv)
+	fileValues, err := loadFileValues()
+	if err != nil {
+		return Config{}, err
+	}
+
+	net, err := ParseNetwork(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
 	if err != nil {
 		return Config{}, err
 	}
 
 	cfg := Config{
-		Network:                     net,
-		RPCURL:                      net.RPCURL,
-		RPCURLs:                     net.RPCURLs,
-		DatabaseURL:                 os.Getenv("DATABASE_URL"),
-		PollInterval:                DefaultPollInterval,
-		HTTPAddr:                    getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:            DefaultHTTPMaxBodyBytes,
-		LogLevel:                    slog.LevelInfo,
-		MonitorSilentAfter:          DefaultMonitorSilentAfter,
-		NotifyRateLimitSlackRPS:     1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
-		NotifyRateLimitTelegramRPS:  30.0, // Telegram Bot API limit ~30 rps
-		NotifyRateLimitPagerDutyRPS: 2.0,  // PagerDuty Events API v2 rate limit ~2 rps
-		NotifyRateLimitDefaultRPS:   5.0,  // General default rps
+		Network:            net,
+		RPCURL:             net.RPCURL,
+		RPCURLs:            net.RPCURLs,
+		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
+		PollInterval:       DefaultPollInterval,
+		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
+		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
+		LogLevel:           slog.LevelInfo,
+		MonitorSilentAfter: DefaultMonitorSilentAfter,
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -251,16 +291,20 @@ func Load() (Config, error) {
 		)
 	}
 
-	cfg.SourceMode = getenv("SOURCE_MODE", "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode)
 	}
-	cfg.SoroTrailURL = os.Getenv("SOROTRAIL_URL")
+	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
 	}
+	cfg.HorizonURL = lookupConfigValue("HORIZON_URL", fileValues)
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
+	}
 
-	if v := os.Getenv("POLL_INTERVAL"); v != "" {
+	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid POLL_INTERVAL %q: %w", v, err)
@@ -271,7 +315,7 @@ func Load() (Config, error) {
 		cfg.PollInterval = d
 	}
 
-	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+	if v := lookupConfigValue("CORS_ALLOWED_ORIGINS", fileValues); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
 				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
@@ -279,13 +323,13 @@ func Load() (Config, error) {
 		}
 	}
 
-	tokens, err := parseAPITokens(os.Getenv("API_TOKEN"))
+	tokens, err := parseAPITokens(lookupConfigValue("API_TOKEN", fileValues))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
 
-	if v := os.Getenv("HTTP_MAX_BODY_BYTES"); v != "" {
+	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
 			return cfg, fmt.Errorf("invalid HTTP_MAX_BODY_BYTES %q: must be a positive integer (bytes)", v)
@@ -293,7 +337,7 @@ func Load() (Config, error) {
 		cfg.HTTPMaxBodyBytes = n
 	}
 
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
+	if v := lookupConfigValue("LOG_LEVEL", fileValues); v != "" {
 		lvl, err := parseLevel(v)
 		if err != nil {
 			return cfg, err
@@ -301,21 +345,21 @@ func Load() (Config, error) {
 		cfg.LogLevel = lvl
 	}
 
-	if v := os.Getenv("READYZ_LAG_THRESHOLD"); v != "" {
+	if v := lookupConfigValue("READYZ_LAG_THRESHOLD", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err)
 		}
 		cfg.ReadyzLagThreshold = uint32(n)
 	}
-	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_RPS %q (want a non-negative number)", v)
 		}
 		cfg.RateLimitRPS = rps
 	}
-	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_BURST", fileValues); v != "" {
 		burst, err := strconv.Atoi(v)
 		if err != nil || burst < 0 {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_BURST %q (want a non-negative integer)", v)
@@ -328,7 +372,7 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
-	if v := os.Getenv("MONITOR_SILENT_AFTER"); v != "" {
+	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid MONITOR_SILENT_AFTER %q: %w", v, err)
@@ -339,7 +383,7 @@ func Load() (Config, error) {
 		cfg.MonitorSilentAfter = d
 	}
 
-	if v := os.Getenv("RATE_LIMIT_TRUST_FORWARDED"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_TRUST_FORWARDED", fileValues); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "yes", "on":
 			cfg.RateLimitTrustForwarded = true
@@ -349,19 +393,19 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_TRUST_FORWARDED %q (want true|false)", v)
 		}
 	}
-	maxConns, err := parseInt32Env("DATABASE_MAX_CONNS")
+	maxConns, err := parseInt32EnvWithFile("DATABASE_MAX_CONNS", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	minConns, err := parseInt32Env("DATABASE_MIN_CONNS")
+	minConns, err := parseInt32EnvWithFile("DATABASE_MIN_CONNS", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	maxLifetime, err := parseDurationEnv("DATABASE_MAX_CONN_LIFETIME")
+	maxLifetime, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_LIFETIME", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	maxIdle, err := parseDurationEnv("DATABASE_MAX_CONN_IDLE_TIME")
+	maxIdle, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_IDLE_TIME", fileValues)
 	if err != nil {
 		return cfg, err
 	}
@@ -375,43 +419,76 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
-	key, err := parseEncryptionKey(os.Getenv("CONFIG_ENCRYPTION_KEY"))
+
+	// Read-replica routing is Postgres-only and off unless asked for. Both
+	// failures below are startup errors rather than warnings: an operator who
+	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
+	// deployment that silently serves everything from the primary while
+	// claiming otherwise is worse than one that refuses to boot.
+	replicaURL := strings.TrimSpace(lookupConfigValue("REPLICA_DATABASE_URL", fileValues))
+	if sqliteBackend && replicaURL != "" {
+		return cfg, fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres")
+	}
+	if replicaURL != "" {
+		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+			return cfg, err
+		}
+	}
+	cfg.ReplicaDatabaseURL = replicaURL
+	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ConfigEncryptionKey = key
-	cfg.GRPCAddr = os.Getenv("GRPC_ADDR")
+	cfg.GRPCAddr = lookupConfigValue("GRPC_ADDR", fileValues)
 	if cfg.GRPCAddr != "" {
 		if err := validateHTTPAddr(cfg.GRPCAddr); err != nil {
 			return cfg, fmt.Errorf("invalid GRPC_ADDR: %w", err)
 		}
 	}
 
-	if v := os.Getenv("ALERT_RETENTION"); v != "" {
+	if v := lookupConfigValue("ALERT_RETENTION", fileValues); v != "" {
 		d, err := ParseRetention(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
 		}
 		cfg.AlertRetention = d
 	}
-	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
+	cfg.AlertEnrichmentTimeout = 2 * time.Second
+	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
+	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_TIMEOUT %q", v)
+		}
+		cfg.AlertEnrichmentTimeout = d
+	}
+	if v := lookupConfigValue("ALERT_ENRICHMENT_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_CACHE_TTL %q", v)
+		}
+		cfg.AlertEnrichmentCacheTTL = d
+	}
+	if v := lookupConfigValue("REORG_TRACKING_WINDOW", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v)
 		}
 		cfg.ReorgTrackingWindow = uint32(n)
 	}
-	if v := os.Getenv("REORG_CONFIRMATION_DEPTH"); v != "" {
+	if v := lookupConfigValue("REORG_CONFIRMATION_DEPTH", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v)
 		}
 		cfg.ReorgConfirmationDepth = uint32(n)
 	}
-	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
+	cfg.ArchiveURL = strings.TrimSpace(lookupConfigValue("ARCHIVE_URL", fileValues))
 
 	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
-	cfg.OTLP.Endpoint = os.Getenv("OTLP_ENDPOINT")
+	cfg.OTLP.Endpoint = lookupConfigValue("OTLP_ENDPOINT", fileValues)
 	if cfg.OTLP.Endpoint != "" {
 		u, err := url.Parse(cfg.OTLP.Endpoint)
 		if err != nil || !u.IsAbs() || u.Host == "" ||
@@ -422,37 +499,67 @@ func Load() (Config, error) {
 			)
 		}
 	}
-	cfg.OTLP.ServiceName = os.Getenv("OTLP_SERVICE_NAME")
+	cfg.OTLP.ServiceName = lookupConfigValue("OTLP_SERVICE_NAME", fileValues)
 	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
-	if v := os.Getenv("OTLP_SAMPLE_RATE"); v != "" {
+	if v := lookupConfigValue("OTLP_SAMPLE_RATE", fileValues); v != "" {
 		r, err := strconv.ParseFloat(v, 64)
 		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
 			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
 		}
 		cfg.OTLP.SampleRate = r
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+	// GraphQL configuration. Read through lookupConfigValue like every other
+	// setting, so CONFIG_FILE can supply these too.
+	cfg.GraphQL.EnablePlayground = false
+	if v := lookupConfigValue("GRAPHQL_PLAYGROUND", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			return cfg, fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v)
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := lookupConfigValue("GRAPHQL_MAX_DEPTH", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v)
+		}
+		cfg.GraphQL.MaxDepth = n
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := lookupConfigValue("GRAPHQL_MAX_COMPLEXITY", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v)
+		}
+		cfg.GraphQL.MaxComplexity = n
+	}
+
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitSlackRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitTelegramRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
 		}
 		cfg.NotifyRateLimitPagerDutyRPS = rps
 	}
-	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_DEFAULT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
@@ -460,7 +567,7 @@ func Load() (Config, error) {
 		cfg.NotifyRateLimitDefaultRPS = rps
 	}
 
-	if err := loadSecrets(&cfg); err != nil {
+	if err := loadSecrets(&cfg, fileValues); err != nil {
 		return cfg, err
 	}
 
@@ -470,8 +577,11 @@ func Load() (Config, error) {
 // loadSecrets reads the external-secret provider configuration. The active
 // provider is validated here so a typo or a missing Vault address fails
 // startup rather than the first alert that references a secret.
-func loadSecrets(cfg *Config) error {
-	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(os.Getenv("SECRETS_PROVIDER")))
+//
+// It takes fileValues so these settings resolve the same way as every other
+// one: environment first, config file as the fallback.
+func loadSecrets(cfg *Config, fileValues map[string]string) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
 	switch cfg.SecretsProvider {
 	case "", "env", "vault":
 	default:
@@ -479,7 +589,7 @@ func loadSecrets(cfg *Config) error {
 	}
 
 	cfg.SecretsCacheTTL = secrets.DefaultTTL
-	if v := os.Getenv("SECRETS_CACHE_TTL"); v != "" {
+	if v := lookupConfigValue("SECRETS_CACHE_TTL", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
@@ -490,13 +600,50 @@ func loadSecrets(cfg *Config) error {
 		cfg.SecretsCacheTTL = d
 	}
 
-	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(os.Getenv("VAULT_ADDR")), "/")
-	cfg.VaultToken = os.Getenv("VAULT_TOKEN")
-	cfg.VaultNamespace = strings.TrimSpace(os.Getenv("VAULT_NAMESPACE"))
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
+	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
+	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
 	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
 		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
 	}
 	return nil
+}
+
+func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
+	if v := lookupConfigValue(key, fileValues); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func parseInt32EnvWithFile(key string, fileValues map[string]string) (int32, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s %d is negative", key, n)
+	}
+	return int32(n), nil
+}
+
+func parseDurationEnvWithFile(key string, fileValues map[string]string) (time.Duration, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s %q is negative", key, v)
+	}
+	return d, nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -526,6 +673,9 @@ const redacted = "[redacted]"
 func (c Config) LogAttrs() []slog.Attr {
 	return []slog.Attr{
 		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		// Redacted the same way: the replica URL carries its own credentials,
+		// and the redaction keeps only scheme, host and database name.
+		slog.String("replica_database_url", redactDatabaseURL(c.ReplicaDatabaseURL)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
@@ -537,6 +687,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
 		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
+		// Redacted for the same reason as the others: a Horizon endpoint
+		// behind basic auth carries the credential in the URL.
+		slog.String("horizon_url", redactURLCredentials(c.HorizonURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
@@ -551,6 +704,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
 		slog.String("otlp_service_name", c.OTLP.ServiceName),
 		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
+		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
+		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
+		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
 	}
 }
 
@@ -693,6 +849,30 @@ func validateDatabaseURL(raw string) error {
 	}
 }
 
+// validateReplicaDatabaseURL checks REPLICA_DATABASE_URL. The replica must be
+// a Postgres URL — there is no replica concept for SQLite, which
+// Load rejects before calling this — and it must not be the primary itself.
+// Pointing both at the same string is almost always a half-finished edit, and
+// it is worth failing on: it looks like routing is on in every log line and
+// every metric label, while every "replica" read lands on the primary. An
+// operator who genuinely wants one database behind two pools should say so
+// with two URLs.
+func validateReplicaDatabaseURL(replicaURL, primaryURL string) error {
+	u, err := url.Parse(replicaURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("REPLICA_DATABASE_URL is not a parseable URL (want a postgres connection string, e.g. postgres://user:pass@replica-host:5432/sorobeacon)")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fmt.Errorf("REPLICA_DATABASE_URL scheme %q is not supported: reads can only be routed to a Postgres replica", u.Scheme)
+	}
+	if replicaURL == primaryURL {
+		return fmt.Errorf("REPLICA_DATABASE_URL is identical to DATABASE_URL; unset it to read from the primary, or point it at the replica")
+	}
+	return nil
+}
+
 // isSQLiteURL reports whether raw selects the SQLite backend. It is a
 // best-effort parse: an unparseable value has already been rejected by
 // validateDatabaseURL, so a false here simply means "not sqlite".
@@ -722,48 +902,6 @@ func parseAPITokens(raw string) ([]string, error) {
 		return nil, fmt.Errorf("invalid API_TOKEN: set but contains no tokens (use comma-separated values, or unset it to leave authentication off)")
 	}
 	return tokens, nil
-}
-
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// parseInt32Env reads an optional int32. Unset or empty is 0 (driver
-// default). Negative values are rejected so a typo cannot shrink the
-// pool below pgx's floor.
-func parseInt32Env(key string) (int32, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("%s %d is negative", key, n)
-	}
-	return int32(n), nil
-}
-
-// parseDurationEnv reads an optional duration. Unset or empty is 0
-// (driver default). Negative durations are rejected.
-func parseDurationEnv(key string) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("%s %q is negative", key, v)
-	}
-	return d, nil
 }
 
 func parseLevel(s string) (slog.Level, error) {

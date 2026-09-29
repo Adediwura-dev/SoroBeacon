@@ -34,6 +34,10 @@ func (m *mockNotifier) Send(_ context.Context, a Alert) error {
 type fakeDispatchStore struct {
 	channels []store.Channel
 	attempts []store.DeliveryAttempt
+	// window, when set, is returned by ActiveMaintenanceWindow.
+	window *store.MaintenanceWindow
+	// suppressed records the alert ID and reason of each suppression.
+	suppressed []string
 	// inhibitions feeds the inhibition check; firing answers RuleFiredWithin.
 	inhibitions []store.Inhibition
 	firing      map[int64]bool
@@ -51,6 +55,15 @@ func (f *fakeDispatchStore) ListChannelsForMonitor(_ context.Context, _ int64) (
 
 func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
 	f.attempts = append(f.attempts, *d)
+	return nil
+}
+
+func (f *fakeDispatchStore) ActiveMaintenanceWindow(_ context.Context, _ int64, _ string, _ time.Time) (*store.MaintenanceWindow, error) {
+	return f.window, nil
+}
+
+func (f *fakeDispatchStore) SetAlertSuppressed(_ context.Context, _ int64, reason string) error {
+	f.suppressed = append(f.suppressed, reason)
 	return nil
 }
 
@@ -193,6 +206,21 @@ func TestGateRetry(t *testing.T) {
 	assert.NoError(t, GateRetry([]store.DeliveryAttempt{recent}, 3, ch, now, 0), "zero cooldown disables the bound")
 }
 
+func TestDispatchSuppressedByMaintenanceWindow(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		window:   &store.MaintenanceWindow{ID: 9, Reason: "upgrade", Scope: store.MaintenanceScopeGlobal},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
+
+	assert.Equal(t, 0, n.calls, "a suppressed alert must not be delivered")
+	assert.Empty(t, st.attempts, "no delivery attempt should be recorded")
+	require.Equal(t, []string{"upgrade"}, st.suppressed, "the alert is marked with the window reason")
+}
+
 func TestDispatchBadConfigRecordsFailure(t *testing.T) {
 	st := &fakeDispatchStore{channels: []store.Channel{
 		{ID: 5, Type: "nope", Config: json.RawMessage(`{}`), Enabled: true},
@@ -241,4 +269,61 @@ func TestDispatchQuietSourceDelivers(t *testing.T) {
 
 	assert.Equal(t, 1, n.calls, "a quiet source must not suppress delivery")
 	assert.Empty(t, st.inhibited)
+}
+
+// timeoutNotifier captures the context deadline it was called with.
+type timeoutNotifier struct {
+	gotDeadline time.Time
+	hasDeadline bool
+}
+
+func (n *timeoutNotifier) Send(ctx context.Context, _ Alert) error {
+	dl, ok := ctx.Deadline()
+	n.hasDeadline = ok
+	n.gotDeadline = dl
+	return nil
+}
+
+func TestDispatchAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 5 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(5*time.Second), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestDispatchAppliesDefaultTimeoutWhenUnset(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 0 // unset
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	d.Dispatch(context.Background(), Alert{ID: 16, MonitorID: 2})
+
+	require.True(t, n.hasDeadline, "Send must receive a context with deadline")
+	assert.WithinDuration(t, before.Add(DefaultTimeout), n.gotDeadline, 500*time.Millisecond)
+}
+
+func TestRetryAppliesPerChannelTimeout(t *testing.T) {
+	ch := mockChannel(1)
+	ch.Timeout = 8 * time.Second
+	st := &fakeDispatchStore{channels: []store.Channel{ch}}
+	n := &timeoutNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	before := time.Now()
+	da := d.Retry(context.Background(), Alert{ID: 17, MonitorID: 2}, ch)
+
+	require.NotNil(t, da)
+	assert.Equal(t, "success", da.Status)
+	require.True(t, n.hasDeadline, "Retry must apply channel timeout to ctx")
+	assert.WithinDuration(t, before.Add(8*time.Second), n.gotDeadline, 500*time.Millisecond)
 }

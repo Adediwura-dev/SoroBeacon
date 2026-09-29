@@ -13,6 +13,7 @@
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
 * [The life of an alert](guides/alert-lifecycle.md)
+* [Maintenance windows](guides/maintenance-windows.md)
 * [The dashboard](guides/dashboard.md)
 * [Monitoring a token contract](guides/monitoring-a-token.md)
 * [Choosing and combining rule types](guides/writing-rules.md)
@@ -25,6 +26,8 @@
 * [token_event](rules/token-event.md)
 * [frequency_threshold](rules/frequency-threshold.md)
 * [Rule cooldown](rules/cooldown.md)
+* [self_transfer](rules/self-transfer.md)
+* [time_window](rules/time-window.md)
 
 ## 📣 Channel reference
 
@@ -32,10 +35,15 @@
 * [Discord](channels/discord.md)
 * [Slack](channels/slack.md)
 * [Telegram](channels/telegram.md)
+* [ntfy](channels/ntfy.md)
 * [Email (SMTP)](channels/email.md)
 * [Generic webhook](channels/webhook.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
+* [Mattermost](channels/mattermost.md)
+* [Rocket.Chat](channels/rocketchat.md)
+* [Zulip](channels/zulip.md)
+* [Pushover](channels/pushover.md)
 * [Message templates](channels/templates.md)
 * [External secrets](channels/secrets.md)
 * [Digest mode](channels/digest.md)
