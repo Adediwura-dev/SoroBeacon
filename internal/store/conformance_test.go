@@ -50,19 +50,25 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
+	t.Run("ChannelTimeout", func(t *testing.T) { testChannelTimeout(t, newStore) })
 	t.Run("MonitorLastMatchedAt", func(t *testing.T) { testMonitorLastMatchedAt(t, newStore) })
 	t.Run("AlertDedupAndListing", func(t *testing.T) { testAlertDedupAndListing(t, newStore) })
 	t.Run("CreateAlertCooldown", func(t *testing.T) { testCreateAlertCooldown(t, newStore) })
 	t.Run("CreateAlertCooldownConcurrent", func(t *testing.T) { testCreateAlertCooldownConcurrent(t, newStore) })
 	t.Run("ListAlertsSearchFilterSort", func(t *testing.T) { testListAlertsSearchFilterSort(t, newStore) })
+	t.Run("ListAlertsTextSearch", func(t *testing.T) { testListAlertsTextSearch(t, newStore) })
 	t.Run("DeliveryAttempts", func(t *testing.T) { testDeliveryAttempts(t, newStore) })
 	t.Run("DeleteExpiredAlertsKeepsRecentAndCascades", func(t *testing.T) { testDeleteExpiredAlertsCascade(t, newStore) })
 	t.Run("DeleteExpiredAlertsBatches", func(t *testing.T) { testDeleteExpiredAlertsBatches(t, newStore) })
 	t.Run("IngestStateRoundTrip", func(t *testing.T) { testIngestState(t, newStore) })
+	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
+	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
+	t.Run("SavedSearchesCRUDAndSingleDefault", func(t *testing.T) { testSavedSearches(t, newStore) })
+	t.Run("MonitorTemplatesCRUD", func(t *testing.T) { testMonitorTemplates(t, newStore) })
 	t.Run("ChannelConfigNoKeyStaysPlaintext", func(t *testing.T) { testChannelConfigNoKey(t, newStore) })
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
@@ -76,8 +82,108 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("UpdateChannelReenableClearsHealth", func(t *testing.T) { testUpdateChannelReenableClearsHealth(t, newStore) })
 	t.Run("UpdateChannelRenameKeepsHealth", func(t *testing.T) { testUpdateChannelRenameKeepsHealth(t, newStore) })
 	t.Run("ChannelHealthUnknownChannelIgnored", func(t *testing.T) { testChannelHealthUnknownChannelIsIgnored(t, newStore) })
-	t.Run("SavedSearchCRUDAndSingleDefault", func(t *testing.T) { testSavedSearchCRUD(t, newStore) })
-	t.Run("MonitorTemplateCRUD", func(t *testing.T) { testMonitorTemplateCRUD(t, newStore) })
+	t.Run("AuditLogAppendOnlyFiltersAndNoSecrets", func(t *testing.T) { testAuditLog(t, newStore) })
+	t.Run("ChannelDigestSettingsAndQueue", func(t *testing.T) { testChannelDigest(t, newStore) })
+}
+
+// testChannelDigest pins the digest settings round trip and the pending
+// queue, including that rows cascade when their channel is deleted.
+func testChannelDigest(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{
+		Name: "digest", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true,
+		DigestMode: DigestModeWindow, DigestWindowSeconds: 300,
+	}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	got, err := st.GetChannel(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DigestModeWindow, got.DigestMode)
+	assert.Equal(t, int64(300), got.DigestWindowSeconds)
+
+	got.DigestMode = DigestModeOff
+	got.DigestWindowSeconds = 0
+	require.NoError(t, st.UpdateChannel(ctx, got))
+	got, err = st.GetChannel(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DigestModeOff, got.DigestMode)
+	assert.Zero(t, got.DigestWindowSeconds)
+
+	require.NoError(t, st.PushDigestAlert(ctx, ch.ID, json.RawMessage(`{"id":1}`)))
+	require.NoError(t, st.PushDigestAlert(ctx, ch.ID, json.RawMessage(`{"id":2}`)))
+	rows, err := st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.JSONEq(t, `{"id":1}`, string(rows[0].Payload))
+
+	require.NoError(t, st.DeleteDigestAlerts(ctx, ch.ID, []int64{rows[0].ID}))
+	rows, err = st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+
+	// Deleting the channel cascades to its pending rows.
+	require.NoError(t, st.DeleteChannel(ctx, ch.ID))
+	rows, err = st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
+// testAuditLog proves the audit table is append-only, filters correctly, and
+// never carries the secret values a channel config holds.
+func testAuditLog(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{
+		Name:    "audit channel",
+		Type:    "slack",
+		Config:  json.RawMessage(`{"webhook_url":"https://hooks.example/SECRET-TOKEN"}`),
+		Enabled: true,
+	}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	// The middleware records field names, never values; this mirrors what it
+	// writes so the store contract (and the absence of the secret) is pinned.
+	entries := []*AuditEntry{
+		{Actor: "req-1", Action: AuditActionCreate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config","name"]}`)},
+		{Actor: "req-2", Action: AuditActionUpdate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config"]}`)},
+		{Actor: "req-3", Action: AuditActionDelete, TargetType: "monitor", TargetID: 42},
+	}
+	for _, e := range entries {
+		require.NoError(t, st.CreateAuditEntry(ctx, e))
+		assert.NotZero(t, e.ID)
+		assert.False(t, e.CreatedAt.IsZero())
+	}
+
+	// Append-only: all three survive, newest first.
+	list, err := st.ListAuditEntries(ctx, AuditFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 3)
+	assert.Equal(t, entries[2].ID, list[0].ID)
+	for _, e := range list {
+		assert.NotContains(t, string(e.Diff), "SECRET-TOKEN")
+	}
+	// An entry with no diff is stored as an empty JSON object, never NULL.
+	assert.JSONEq(t, `{}`, string(list[0].Diff))
+
+	byType, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel"})
+	require.NoError(t, err)
+	require.Len(t, byType, 2)
+
+	byTarget, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel", TargetID: ch.ID})
+	require.NoError(t, err)
+	require.Len(t, byTarget, 2)
+
+	limited, err := st.ListAuditEntries(ctx, AuditFilter{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+
+	// A time window that excludes everything returns nothing.
+	none, err := st.ListAuditEntries(ctx, AuditFilter{From: time.Now().Add(time.Hour)})
+	require.NoError(t, err)
+	assert.Empty(t, none)
 }
 
 // TestClampAlertSeriesDays pins the overview-chart window bounds. It is pure
@@ -471,6 +577,53 @@ func testListChannelsFilters(t *testing.T, newStore conformanceFactory) {
 	assert.Empty(t, unknown, "unknown types return an empty list, not an error")
 }
 
+func testChannelTimeout(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	// Default timeout when unset (0 duration)
+	cDefault := &Channel{Name: "default-timeout", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, cDefault))
+	got, err := st.GetChannel(ctx, cDefault.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultChannelTimeout, got.Timeout)
+
+	// Explicit custom timeout
+	cCustom := &Channel{Name: "custom-timeout", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true, Timeout: 30 * time.Second}
+	require.NoError(t, st.CreateChannel(ctx, cCustom))
+	got, err = st.GetChannel(ctx, cCustom.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, got.Timeout)
+
+	// Update timeout
+	got.Timeout = 45 * time.Second
+	require.NoError(t, st.UpdateChannel(ctx, got))
+	gotAfterUpdate, err := st.GetChannel(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, gotAfterUpdate.Timeout)
+
+	// Verify ListChannels returns timeout
+	list, err := st.ListChannels(ctx, false)
+	require.NoError(t, err)
+	for _, c := range list {
+		switch c.ID {
+		case cCustom.ID:
+			assert.Equal(t, 45*time.Second, c.Timeout)
+		case cDefault.ID:
+			assert.Equal(t, DefaultChannelTimeout, c.Timeout)
+		}
+	}
+
+	// Verify ListChannelsForMonitor returns timeout
+	m := &Monitor{Name: "m-timeout", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	require.NoError(t, st.SetMonitorChannels(ctx, m.ID, []int64{cCustom.ID}))
+	attached, err := st.ListChannelsForMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.Len(t, attached, 1)
+	assert.Equal(t, 45*time.Second, attached[0].Timeout)
+}
+
 func testMonitorLastMatchedAt(t *testing.T, newStore conformanceFactory) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -770,6 +923,88 @@ func testListAlertsSearchFilterSort(t *testing.T, newStore conformanceFactory) {
 	assert.Equal(t, desc[len(desc)-1], asc[0])
 }
 
+// testListAlertsTextSearch pins what AlertFilter.Query matches: the source
+// event id and the payload's full text, which is where contract_id and
+// event_name live. The cases that are easy to get wrong are the ones asserted
+// — a term that is blank after trimming means "no filter" rather than "match
+// nothing", the term's own wildcards stay literal, and the search composes
+// with the monitor filter and with a cursor so paging cannot lose it.
+func testListAlertsTextSearch(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"CABC"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	other := &Monitor{Name: "other", ContractIDs: []string{"CABC"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, other))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+	rOther := &Rule{MonitorID: other.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, rOther))
+
+	// event ids and payloads are distinct enough that each row is found by one
+	// field only: a search that silently widened to monitor names would still
+	// pass a test where every row matches everything.
+	rows := []struct {
+		monitor, rule  int64
+		event, payload string
+	}{
+		{m.ID, r.ID, "led-1001-transfer", `{"contract_id":"CABC","event_name":"transfer","amount":"10"}`},
+		{m.ID, r.ID, "led-1002-approve", `{"contract_id":"CABC","event_name":"approve"}`},
+		{m.ID, r.ID, "led-1003-mint", `{"contract_id":"CA_XY","event_name":"mint"}`},
+		{other.ID, rOther.ID, "led-1004-transfer", `{"contract_id":"CDEF","event_name":"transfer"}`},
+	}
+	for _, row := range rows {
+		a := &Alert{MonitorID: row.monitor, RuleID: row.rule, EventID: row.event, Payload: json.RawMessage(row.payload)}
+		_, err := st.CreateAlert(ctx, a)
+		require.NoError(t, err)
+	}
+
+	ids := func(f AlertFilter) []string {
+		t.Helper()
+		out, err := st.ListAlerts(ctx, f)
+		require.NoError(t, err)
+		events := make([]string, 0, len(out))
+		for _, a := range out {
+			events = append(events, a.EventID)
+		}
+		return events
+	}
+
+	// By payload field, case-insensitively, matching only the two rows whose
+	// payload carries that event name. Every term below appears verbatim in
+	// the stored JSON on both backends: Postgres re-renders a jsonb value as
+	// text with its own spacing and key order, so a term that depends on the
+	// exact serialized shape would pass on one backend and fail on the other.
+	assert.ElementsMatch(t, []string{"led-1001-transfer", "led-1004-transfer"}, ids(AlertFilter{Query: "transfer", Limit: 50}))
+	assert.ElementsMatch(t, []string{"led-1001-transfer"}, ids(AlertFilter{Query: "amount", Limit: 50}))
+	assert.Equal(t, []string{"led-1003-mint"}, ids(AlertFilter{Query: "MINT", Limit: 50}))
+	// By the event id, which no payload field repeats.
+	assert.Equal(t, []string{"led-1002-approve"}, ids(AlertFilter{Query: "1002", Limit: 50}))
+
+	// Wildcards in the term are literal: "CA_XY" is one contract id, and a
+	// bare "_" must not become "match every row".
+	assert.Equal(t, []string{"led-1003-mint"}, ids(AlertFilter{Query: "CA_XY", Limit: 50}))
+	assert.Empty(t, ids(AlertFilter{Query: "%", Limit: 50}))
+
+	// A blank or whitespace-only term is no term at all.
+	require.Len(t, ids(AlertFilter{Query: "   ", Limit: 50}), len(rows))
+	require.Len(t, ids(AlertFilter{Limit: 50}), len(rows))
+
+	// Composes with the monitor filter, and survives a cursor: paging a
+	// searched set must not drop the search on the second page.
+	assert.Equal(t, []string{"led-1001-transfer"}, ids(AlertFilter{Query: "transfer", MonitorID: m.ID, Limit: 50}))
+	page1 := ids(AlertFilter{Query: "led-100", Limit: 2, Sort: "created_at_asc"})
+	require.Len(t, page1, 2)
+	first, err := st.ListAlerts(ctx, AlertFilter{Query: "led-100", Limit: 2, Sort: "created_at_asc"})
+	require.NoError(t, err)
+	page2 := ids(AlertFilter{Query: "led-100", Limit: 2, Sort: "created_at_asc", AfterID: first[len(first)-1].ID})
+	assert.ElementsMatch(t, []string{"led-1003-mint", "led-1004-transfer"}, page2)
+
+	// A term that matches nothing is an empty result, not an error.
+	assert.Empty(t, ids(AlertFilter{Query: "no-such-anything", Limit: 50}))
+}
+
 func testDeliveryAttempts(t *testing.T, newStore conformanceFactory) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -920,6 +1155,78 @@ func testGetStats(t *testing.T, newStore conformanceFactory) {
 	assert.Equal(t, int64(1), stats.AlertsLast24)
 }
 
+// testGetMonitorStats pins the per-monitor aggregate: windows computed in SQL
+// rather than counted in Go, every rule of the monitor present with its own
+// count including zeroes, another monitor's rows left out of every number, and
+// ErrNotFound for a monitor that does not exist — which is what lets the API
+// tell "quiet monitor" apart from "no such monitor".
+func testGetMonitorStats(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	fired := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, fired))
+	quiet := &Rule{MonitorID: m.ID, Type: "value_threshold", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, quiet))
+	elsewhere := &Monitor{Name: "elsewhere", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, elsewhere))
+	otherRule := &Rule{MonitorID: elsewhere.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, otherRule))
+
+	c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, c))
+
+	newAlert := func(rule *Rule, event string) *Alert {
+		a := &Alert{MonitorID: m.ID, RuleID: rule.ID, EventID: event, Payload: json.RawMessage(`{}`)}
+		_, err := st.CreateAlert(ctx, a)
+		require.NoError(t, err)
+		return a
+	}
+	today := newAlert(fired, "e-1")
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, &DeliveryAttempt{AlertID: today.ID, ChannelID: c.ID, Status: DeliveryStatusSuccess}))
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, &DeliveryAttempt{AlertID: today.ID, ChannelID: c.ID, Status: DeliveryStatusFailed}))
+
+	older := newAlert(fired, "e-2")
+	_, err := st.CreateAlert(ctx, &Alert{MonitorID: elsewhere.ID, RuleID: otherRule.ID, EventID: "e-9"})
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+	require.NoError(t, st.setAlertCreatedAt(ctx, older.ID, now.Add(-36*time.Hour)))
+	weekOld := newAlert(fired, "e-3")
+	require.NoError(t, st.setAlertCreatedAt(ctx, weekOld.ID, now.Add(-8*24*time.Hour)))
+
+	stats, err := st.GetMonitorStats(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, m.ID, stats.MonitorID)
+	assert.Equal(t, int64(3), stats.Alerts)
+	assert.Equal(t, int64(1), stats.AlertsLast24h, "only the alert from the last day counts")
+	assert.Equal(t, int64(2), stats.AlertsLast7d, "the eight-day-old alert is outside the week but inside all time")
+	require.NotNil(t, stats.LastAlertAt)
+	assert.WithinDuration(t, now, *stats.LastAlertAt, time.Minute, "the newest alert on this monitor")
+	assert.Equal(t, int64(1), stats.DeliveriesOK)
+	assert.Equal(t, int64(1), stats.DeliveriesFail)
+
+	require.Len(t, stats.Rules, 2, "both of this monitor's rules, matched or not")
+	assert.Equal(t, fired.ID, stats.Rules[0].RuleID)
+	assert.Equal(t, "event_emitted", stats.Rules[0].Type)
+	assert.Equal(t, int64(3), stats.Rules[0].Alerts)
+	assert.Equal(t, quiet.ID, stats.Rules[1].RuleID)
+	assert.Equal(t, int64(0), stats.Rules[1].Alerts, "a rule that never fired is an explicit zero, not a missing row")
+
+	// A monitor with rules and alerts of its own reports nothing about the
+	// other monitor's rows.
+	quiet2 := &Monitor{Name: "quiet", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, quiet2))
+	blank, err := st.GetMonitorStats(ctx, quiet2.ID)
+	require.NoError(t, err)
+	assert.Equal(t, MonitorStats{MonitorID: quiet2.ID}, blank, "no alerts, no deliveries, no rules, no last alert")
+
+	_, err = st.GetMonitorStats(ctx, m.ID+9999)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
 func testAlertCountsByDay(t *testing.T, newStore conformanceFactory) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -1026,6 +1333,178 @@ func testDuplicateMonitor(t *testing.T, newStore conformanceFactory) {
 
 	_, err = st.DuplicateMonitor(ctx, 999999)
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// testSavedSearches covers the named alert filters: CRUD, the name ordering
+// the sidebar relies on, the structured filter round-trip, and the "at most one
+// default" rule. Postgres enforces that rule with a partial unique index and
+// SQLite with a filtered one plus a single clear-then-set transaction; both
+// must leave exactly the same rows behind.
+func testSavedSearches(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	zeta := &SavedSearch{
+		Name:   "zeta treasury",
+		Filter: SavedSearchFilter{ContractID: "CAAA", Sort: "created_at_desc"},
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, zeta))
+	assert.NotZero(t, zeta.ID)
+	assert.False(t, zeta.CreatedAt.IsZero())
+	assert.False(t, zeta.IsDefault, "a search is not the default unless it asks to be")
+
+	alpha := &SavedSearch{
+		Name:      "alpha defaults",
+		Filter:    SavedSearchFilter{MonitorID: 7, RuleID: 9},
+		IsDefault: true,
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, alpha))
+
+	list, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha defaults", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta treasury", list[1].Name)
+
+	got, err := st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha defaults", got.Name)
+	assert.True(t, got.IsDefault)
+	assert.EqualValues(t, 7, got.Filter.MonitorID)
+	assert.EqualValues(t, 9, got.Filter.RuleID)
+
+	got, err = st.GetSavedSearch(ctx, zeta.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "CAAA", got.Filter.ContractID)
+	assert.Equal(t, "created_at_desc", got.Filter.Sort)
+
+	// Creating a second default must clear the first, not fail on the unique
+	// index and not leave two defaults behind.
+	beta := &SavedSearch{Name: "beta", IsDefault: true}
+	require.NoError(t, st.CreateSavedSearch(ctx, beta))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault, "a new default clears the previous one")
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Moving the default back is the same operation from the other side.
+	require.NoError(t, st.SetDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Clearing leaves no default at all.
+	require.NoError(t, st.ClearDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+
+	// Unknown ids are ErrNotFound, never a silent success: a stale bookmark
+	// or a deleted search must be reported to the caller.
+	assert.ErrorIs(t, st.SetDefaultSearch(ctx, 999999), ErrNotFound)
+	assert.ErrorIs(t, st.ClearDefaultSearch(ctx, 999999), ErrNotFound)
+	_, err = st.GetSavedSearch(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteSavedSearch(ctx, beta.ID))
+	_, err = st.GetSavedSearch(ctx, beta.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteSavedSearch(ctx, beta.ID), ErrNotFound)
+}
+
+// testMonitorTemplates covers template CRUD. Instantiation copies a template
+// rather than referencing it, so this only pins storage: every field, including
+// the rules and their params, must survive a write and a read on both backends.
+func testMonitorTemplates(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	tmpl := &MonitorTemplate{
+		Name:        "zeta usdc",
+		Description: "watch a USDC contract",
+		Rules: []MonitorTemplateRule{
+			{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`)},
+			{Type: "value_threshold", Params: json.RawMessage(`{"comparison":"gt","threshold":1000}`)},
+		},
+		ChannelIDs: []int64{3, 5},
+		Parameters: []TemplateParameter{
+			{Name: "contract_id", Description: "the contract to watch", Required: true},
+			{Name: "threshold", Default: "1000"},
+		},
+	}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, tmpl))
+	assert.NotZero(t, tmpl.ID)
+	assert.False(t, tmpl.CreatedAt.IsZero())
+
+	// A template with no channels attached is legal: the operator picks them
+	// when instantiating. The ids are an explicit empty slice because the API
+	// layer normalises an absent channel_ids to one before calling the store.
+	plain := &MonitorTemplate{Name: "alpha basic", ChannelIDs: []int64{}}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, plain))
+
+	got, err := st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc", got.Name)
+	assert.Equal(t, "watch a USDC contract", got.Description)
+	require.Len(t, got.Rules, 2)
+	assert.Equal(t, "event_emitted", got.Rules[0].Type)
+	assert.JSONEq(t, `{"event_name":"transfer"}`, string(got.Rules[0].Params))
+	assert.Equal(t, "value_threshold", got.Rules[1].Type)
+	assert.JSONEq(t, `{"comparison":"gt","threshold":1000}`, string(got.Rules[1].Params))
+	assert.Equal(t, []int64{3, 5}, got.ChannelIDs)
+	require.Len(t, got.Parameters, 2)
+	assert.Equal(t, "contract_id", got.Parameters[0].Name)
+	assert.Equal(t, "the contract to watch", got.Parameters[0].Description)
+	assert.True(t, got.Parameters[0].Required)
+	assert.Equal(t, "1000", got.Parameters[1].Default)
+
+	got, err = st.GetMonitorTemplate(ctx, plain.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.ChannelIDs, "no attached channels reads as an empty slice, not an error")
+	assert.Empty(t, got.Rules)
+
+	list, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha basic", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta usdc", list[1].Name)
+	assert.Equal(t, []int64{3, 5}, list[1].ChannelIDs)
+
+	tmpl.Name = "zeta usdc v2"
+	tmpl.Description = "renamed"
+	tmpl.ChannelIDs = []int64{5}
+	tmpl.Rules = tmpl.Rules[:1]
+	require.NoError(t, st.UpdateMonitorTemplate(ctx, tmpl))
+	got, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc v2", got.Name)
+	assert.Equal(t, "renamed", got.Description)
+	assert.Equal(t, []int64{5}, got.ChannelIDs)
+	require.Len(t, got.Rules, 1)
+	assert.Equal(t, tmpl.CreatedAt, got.CreatedAt, "updating must not restamp created_at")
+
+	ghost := &MonitorTemplate{ID: 999999, Name: "ghost"}
+	assert.ErrorIs(t, st.UpdateMonitorTemplate(ctx, ghost), ErrNotFound)
+	_, err = st.GetMonitorTemplate(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteMonitorTemplate(ctx, tmpl.ID))
+	_, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteMonitorTemplate(ctx, tmpl.ID), ErrNotFound)
 }
 
 // testLedgerHashesAndRetraction pins the reorg-detection state across both
@@ -1241,124 +1720,61 @@ func testChannelConfigDecryptFailure(t *testing.T, newStore conformanceFactory) 
 	assert.Contains(t, err.Error(), "pager")
 }
 
-func testSavedSearchCRUD(t *testing.T, newStore conformanceFactory) {
+// testAbsenceState covers the clock absence-of-event rules measure silence
+// against. It is a conformance test rather than a Postgres one because the
+// monotonic upsert is written differently per backend — GREATEST on Postgres,
+// MAX on SQLite — and the two must not disagree about which write wins.
+func testAbsenceState(t *testing.T, newStore conformanceFactory) {
 	st := newStore(t)
 	ctx := context.Background()
 
-	first := &SavedSearch{Name: "alpha", Filter: SavedSearchFilter{ContractID: "CAAA", Sort: "created_at"}}
-	require.NoError(t, st.CreateSavedSearch(ctx, first))
-	assert.NotZero(t, first.ID)
-	assert.False(t, first.CreatedAt.IsZero())
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "absence_of_event",
+		Params: json.RawMessage(`{"event_name":"heartbeat","window":"30m"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
 
-	got, err := st.GetSavedSearch(ctx, first.ID)
+	// No clock exists until a sweep arms one.
+	states, err := st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, "alpha", got.Name)
-	assert.Equal(t, SavedSearchFilter{ContractID: "CAAA", Sort: "created_at"}, got.Filter, "the filter must survive the round trip")
-	assert.False(t, got.IsDefault)
+	assert.Empty(t, states)
 
-	// Listing is ordered by name, not by insertion order.
-	second := &SavedSearch{Name: "beta", Filter: SavedSearchFilter{MonitorID: 7}, IsDefault: true}
-	require.NoError(t, st.CreateSavedSearch(ctx, second))
-	list, err := st.ListSavedSearches(ctx)
+	armed := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed))
+
+	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	require.Len(t, list, 2)
-	assert.Equal(t, []string{"alpha", "beta"}, []string{list[0].Name, list[1].Name})
+	require.Len(t, states, 1)
+	assert.Equal(t, r.ID, states[0].RuleID)
+	assert.Equal(t, "heartbeat", states[0].EventName)
+	assert.True(t, states[0].LastSeen.Equal(armed), "got %s, want %s", states[0].LastSeen, armed)
 
-	// At most one search is the default at a time, and promoting one demotes
-	// the other rather than failing on a unique index.
-	require.NoError(t, st.SetDefaultSearch(ctx, first.ID))
-	first, err = st.GetSavedSearch(ctx, first.ID)
+	// The clock is monotonic: a replayed or out-of-order observation is a
+	// no-op rather than a way to make a rule look fresher than it is.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed.Add(-time.Hour)))
+	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	second, err = st.GetSavedSearch(ctx, second.ID)
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(armed), "an older instant must not move the clock back")
+
+	later := armed.Add(5 * time.Minute)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", later))
+	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	assert.True(t, first.IsDefault)
-	assert.False(t, second.IsDefault, "promoting a search must demote the previous default")
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(later), "a newer observation advances the clock")
 
-	require.NoError(t, st.ClearDefaultSearch(ctx, first.ID))
-	first, err = st.GetSavedSearch(ctx, first.ID)
+	// Awaiting a different event starts a second clock instead of reusing the
+	// old one: this is what stops an edit from measuring one event's silence
+	// from another's last appearance.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "ping", later))
+	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	assert.False(t, first.IsDefault)
+	assert.Len(t, states, 2, "one row per (rule, awaited event)")
 
-	// A default inserted while another is set must take over, not collide.
-	third := &SavedSearch{Name: "gamma", IsDefault: true}
-	require.NoError(t, st.SetDefaultSearch(ctx, second.ID))
-	require.NoError(t, st.CreateSavedSearch(ctx, third))
-	third, err = st.GetSavedSearch(ctx, third.ID)
+	// Deleting the rule takes its clocks with it.
+	require.NoError(t, st.DeleteMonitor(ctx, m.ID))
+	states, err = st.ListAbsenceState(ctx)
 	require.NoError(t, err)
-	second, err = st.GetSavedSearch(ctx, second.ID)
-	require.NoError(t, err)
-	assert.True(t, third.IsDefault)
-	assert.False(t, second.IsDefault)
-
-	require.NoError(t, st.DeleteSavedSearch(ctx, third.ID))
-	_, err = st.GetSavedSearch(ctx, third.ID)
-	assert.ErrorIs(t, err, ErrNotFound)
-	assert.ErrorIs(t, st.DeleteSavedSearch(ctx, third.ID), ErrNotFound)
-	assert.ErrorIs(t, st.SetDefaultSearch(ctx, 99999), ErrNotFound)
-	assert.ErrorIs(t, st.ClearDefaultSearch(ctx, 99999), ErrNotFound)
-}
-
-// assertJSONEqual compares two values by their JSON rendering. Both backends
-// store JSON as text, but Postgres normalises it: a JSONB column rewrites
-// whitespace and key order, so only the parsed values are comparable.
-func assertJSONEqual(t *testing.T, want, got any, msgAndArgs ...any) {
-	t.Helper()
-	wantJSON, err := json.Marshal(want)
-	require.NoError(t, err)
-	gotJSON, err := json.Marshal(got)
-	require.NoError(t, err)
-	assert.JSONEq(t, string(wantJSON), string(gotJSON), msgAndArgs...)
-}
-
-func testMonitorTemplateCRUD(t *testing.T, newStore conformanceFactory) {
-	st := newStore(t)
-	ctx := context.Background()
-
-	tpl := &MonitorTemplate{
-		Name:        "standard",
-		Description: "the usual handful of rules",
-		Rules: []MonitorTemplateRule{
-			{Type: "contract_event", Params: json.RawMessage(`{"topic":"transfer"}`)},
-			{Type: "frequency_threshold", Params: json.RawMessage(`{"count":5}`)},
-		},
-		ChannelIDs: []int64{3, 1},
-		Parameters: []TemplateParameter{{Name: "contract", Description: "contract id", Required: true}},
-	}
-	require.NoError(t, st.CreateMonitorTemplate(ctx, tpl))
-	assert.NotZero(t, tpl.ID)
-	assert.False(t, tpl.CreatedAt.IsZero())
-
-	got, err := st.GetMonitorTemplate(ctx, tpl.ID)
-	require.NoError(t, err)
-	assert.Equal(t, "standard", got.Name)
-	assert.Equal(t, "the usual handful of rules", got.Description)
-	// Compared as JSON, not bytes: Postgres stores rules in a JSONB column,
-	// which re-renders them ({"a":1} comes back as {"a": 1}), so a byte
-	// comparison would fail on Postgres and pass on SQLite. The values are
-	// what must match.
-	assertJSONEqual(t, tpl.Rules, got.Rules, "rules must survive the round trip")
-	assert.Equal(t, []int64{3, 1}, got.ChannelIDs, "channel ids must keep their order")
-	assert.Equal(t, tpl.Parameters, got.Parameters)
-
-	got.Name = "renamed"
-	got.ChannelIDs = nil
-	require.NoError(t, st.UpdateMonitorTemplate(ctx, got))
-	reread, err := st.GetMonitorTemplate(ctx, tpl.ID)
-	require.NoError(t, err)
-	assert.Equal(t, "renamed", reread.Name)
-	assert.Equal(t, []int64{}, reread.ChannelIDs, "no channels reads back as empty, never nil")
-
-	// A second template is listed alongside the first, ordered by name.
-	other := &MonitorTemplate{Name: "aaa", Rules: []MonitorTemplateRule{}, ChannelIDs: []int64{}, Parameters: []TemplateParameter{}}
-	require.NoError(t, st.CreateMonitorTemplate(ctx, other))
-	list, err := st.ListMonitorTemplates(ctx)
-	require.NoError(t, err)
-	require.Len(t, list, 2)
-	assert.Equal(t, []string{"aaa", "renamed"}, []string{list[0].Name, list[1].Name})
-
-	require.NoError(t, st.DeleteMonitorTemplate(ctx, other.ID))
-	_, err = st.GetMonitorTemplate(ctx, other.ID)
-	assert.ErrorIs(t, err, ErrNotFound)
-	assert.ErrorIs(t, st.DeleteMonitorTemplate(ctx, other.ID), ErrNotFound)
-	assert.ErrorIs(t, st.UpdateMonitorTemplate(ctx, &MonitorTemplate{ID: 99999}), ErrNotFound)
+	assert.Empty(t, states)
 }

@@ -48,13 +48,17 @@ func IsPermanent(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Both status-carrying error types have to be recognised: the shared
+	// request helpers in http.go return *StatusError, while the channels
+	// that build their own requests return *HTTPStatusError. Matching only
+	// one of them would leave auto-disable inert for half the channel types.
 	var httpErr *HTTPStatusError
 	if errors.As(err, &httpErr) {
-		switch httpErr.StatusCode {
-		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
-			return true
-		}
-		return false
+		return permanentStatus(httpErr.StatusCode)
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		return permanentStatus(statusErr.Code)
 	}
 	// A rotated SMTP password or a rejected sender fails the email channel
 	// the same way a revoked token fails a webhook, and net/smtp reports it
@@ -62,6 +66,18 @@ func IsPermanent(err error) bool {
 	var smtpErr *textproto.Error
 	if errors.As(err, &smtpErr) {
 		return smtpErr.Code >= 500
+	}
+	return false
+}
+
+// permanentStatus reports whether an HTTP status means the channel will not
+// recover on its own: a revoked credential (401), a destination that refuses
+// this sender (403), or a webhook that no longer exists (404). Everything
+// else — 5xx, 429, a timeout — is the provider having a bad day.
+func permanentStatus(code int) bool {
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
 	}
 	return false
 }

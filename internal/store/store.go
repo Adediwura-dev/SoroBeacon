@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -68,6 +70,58 @@ func (p Priority) Rank() int {
 	}
 }
 
+// Severity is the alert severity level. It is a small closed set with a
+// fixed order so the API, store, and dispatcher all agree on the vocabulary
+// and ordering.
+type Severity string
+
+const (
+	// SeverityInfo is informational: routine matches that do not require
+	// immediate attention.
+	SeverityInfo Severity = "info"
+	// SeverityWarning is the default: notable events that should be seen
+	// but do not warrant paging.
+	SeverityWarning Severity = "warning"
+	// SeverityCritical is for high-impact events that require immediate
+	// response (e.g., treasury movements, contract upgrades).
+	SeverityCritical Severity = "critical"
+)
+
+// ParseSeverity validates a severity string. The empty string maps to
+// SeverityWarning so a caller that never sets one gets today's behaviour,
+// and any other unknown value is rejected rather than silently downgraded.
+func ParseSeverity(s string) (Severity, bool) {
+	switch Severity(s) {
+	case "":
+		return SeverityWarning, true
+	case SeverityInfo, SeverityWarning, SeverityCritical:
+		return Severity(s), true
+	default:
+		return "", false
+	}
+}
+
+// Rank orders the severities for routing: higher ranks are more severe.
+func (s Severity) Rank() int {
+	switch s {
+	case SeverityCritical:
+		return 2
+	case SeverityInfo:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// MeetsThreshold reports whether this severity meets or exceeds the given
+// minimum severity. An empty minimum means no filter (always true).
+func (s Severity) MeetsThreshold(min Severity) bool {
+	if min == "" {
+		return true
+	}
+	return s.Rank() >= min.Rank()
+}
+
 // Monitor watches one or more Soroban contracts.
 type Monitor struct {
 	ID          int64     `json:"id"`
@@ -95,7 +149,23 @@ type Rule struct {
 	Type      string          `json:"type"`
 	Params    json.RawMessage `json:"params"`
 	Enabled   bool            `json:"enabled"`
+	// Severity is the alert severity this rule produces. Empty means
+	// SeverityWarning, so rules created before the field existed keep
+	// today's behaviour. It is validated at the API boundary.
+	Severity Severity `json:"severity"`
 }
+
+// DefaultChannelTimeout is the timeout applied to channels when unset (15s),
+// matching the previous package-level HTTP client timeout.
+const DefaultChannelTimeout = 15 * time.Second
+
+// MinChannelTimeout bounds how short a channel timeout can be: anything less
+// is practically guaranteed to fail spuriously over real networks.
+const MinChannelTimeout = 1 * time.Second
+
+// MaxChannelTimeout is the ceiling on a channel's HTTP timeout: an operator
+// setting a ten-minute timeout will wedge delivery workers.
+const MaxChannelTimeout = 60 * time.Second
 
 // Channel is a configured notification destination. Config holds
 // channel-specific settings including secrets (webhook URLs, bot tokens,
@@ -103,15 +173,30 @@ type Rule struct {
 // When a ConfigCipher is configured, Config is encrypted at rest and the
 // store returns it decrypted (see crypto.go).
 type Channel struct {
-	ID        int64           `json:"id"`
-	Name      string          `json:"name"`
-	Type      string          `json:"type"`
-	Config    json.RawMessage `json:"-"`
-	Enabled   bool            `json:"enabled"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID     int64           `json:"id"`
+	Name   string          `json:"name"`
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"-"`
+	// Enabled controls whether the channel receives alerts at all.
+	Enabled bool `json:"enabled"`
+	// DigestMode selects batched delivery: "" (the default) sends every
+	// alert immediately, exactly as before digesting existed; "window"
+	// accumulates alerts and sends one summary per DigestWindowSeconds.
+	DigestMode string `json:"digest_mode"`
+	// DigestWindowSeconds is the accumulation window when DigestMode is
+	// "window". Zero leaves digesting off even when a mode is set, so a
+	// half-filled form cannot silently batch forever.
+	DigestWindowSeconds int64 `json:"digest_window_seconds"`
+	// MinSeverity is the minimum alert severity this channel will receive.
+	// Empty means no filter (receive all severities), so channels created
+	// before the field existed keep today's behaviour. It is validated at
+	// the API boundary.
+	MinSeverity Severity      `json:"min_severity"`
+	CreatedAt   time.Time     `json:"created_at"`
+	Timeout     time.Duration `json:"timeout"`
 
 	// The fields below are delivery health, derived from outcomes rather than
-	// configured (see RecordChannelHealth and migration 0009). They answer
+	// configured (see RecordChannelHealth and migration 0025). They answer
 	// "is this channel still working?", which delivery_attempts could only
 	// answer one alert at a time.
 	//
@@ -134,6 +219,33 @@ type Channel struct {
 	// then. It is what makes the dashboard say "auto-disabled" rather than
 	// "disabled", and it is cleared by an explicit re-enable.
 	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+}
+
+// TimeoutDuration returns the channel's timeout, falling back to
+// DefaultChannelTimeout when zero or negative.
+func (c Channel) TimeoutDuration() time.Duration {
+	if c.Timeout <= 0 {
+		return DefaultChannelTimeout
+	}
+	return c.Timeout
+}
+
+// TimeoutSeconds returns the channel's timeout as an integer number of seconds.
+func (c Channel) TimeoutSeconds() int {
+	return int(c.TimeoutDuration() / time.Second)
+}
+
+// MarshalJSON serializes the channel, outputting Timeout as integer seconds
+// rather than time.Duration's default nanosecond integer.
+func (c Channel) MarshalJSON() ([]byte, error) {
+	type Alias Channel
+	return json.Marshal(&struct {
+		Alias
+		Timeout int `json:"timeout"`
+	}{
+		Alias:   Alias(c),
+		Timeout: c.TimeoutSeconds(),
+	})
 }
 
 // AutoDisabled reports whether health tracking, rather than an operator,
@@ -181,21 +293,97 @@ type ChannelHealthUpdate struct {
 	At time.Time
 }
 
+// UnmarshalJSON deserializes a channel, parsing Timeout from integer seconds
+// or a Go duration string.
+func (c *Channel) UnmarshalJSON(data []byte) error {
+	type Alias Channel
+	var aux struct {
+		Alias
+		Timeout *json.RawMessage `json:"timeout"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*c = Channel(aux.Alias)
+	if aux.Timeout != nil && len(*aux.Timeout) > 0 && string(*aux.Timeout) != "null" {
+		d, err := ParseTimeout(*aux.Timeout)
+		if err != nil {
+			return err
+		}
+		c.Timeout = d
+	}
+	return nil
+}
+
+// ParseTimeout parses and bounds a channel timeout value. It accepts integer
+// seconds (e.g. 15) or a Go duration string (e.g. "15s"). Values outside
+// [MinChannelTimeout, MaxChannelTimeout] are rejected.
+func ParseTimeout(raw []byte) (time.Duration, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return DefaultChannelTimeout, nil
+	}
+	// Try parsing as integer number of seconds first (e.g. 15).
+	var sec int
+	if err := json.Unmarshal(raw, &sec); err == nil {
+		d := time.Duration(sec) * time.Second
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	// Try parsing as a string (e.g. "15s", "30s", "1m", or "15").
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return DefaultChannelTimeout, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			if sec, errAtoi := strconv.Atoi(s); errAtoi == nil {
+				d = time.Duration(sec) * time.Second
+			} else {
+				return 0, fmt.Errorf("invalid duration %q (want a Go duration such as \"15s\" or integer seconds)", s)
+			}
+		}
+		if d < MinChannelTimeout || d > MaxChannelTimeout {
+			return 0, fmt.Errorf("must be between %s and %s", MinChannelTimeout, MaxChannelTimeout)
+		}
+		return d, nil
+	}
+	return 0, fmt.Errorf("must be integer seconds or duration string such as \"15s\"")
+}
+
 // Alert records one rule match on one event. EventID is the source event's
 // TOID-based id; (RuleID, EventID) is unique so the same match can never
 // fire twice.
 type Alert struct {
-	ID        int64           `json:"id"`
-	MonitorID int64           `json:"monitor_id"`
-	RuleID    int64           `json:"rule_id"`
-	EventID   string          `json:"event_id"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID         int64           `json:"id"`
+	MonitorID  int64           `json:"monitor_id"`
+	RuleID     int64           `json:"rule_id"`
+	EventID    string          `json:"event_id"`
+	Payload    json.RawMessage `json:"payload"`
+	Enrichment json.RawMessage `json:"enrichment,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+	// InhibitedByRuleID is set when an inhibition rule suppressed this
+	// alert's delivery. Nil means delivered (or never subjected to
+	// inhibition); the alert row itself is always stored.
+	InhibitedByRuleID *int64 `json:"inhibited_by_rule_id,omitempty"`
+	// Severity is the alert severity copied from the rule at creation time.
+	// It is stored so changing a rule's severity later does not rewrite
+	// history.
+	Severity Severity `json:"severity"`
 	// LedgerClosedAt is the matching event's ledger close time. CreateAlert
 	// uses it to stamp monitors.last_matched_at; it is not stored on the
 	// alert row. Zero skips the stamp so callers that only persist an
 	// alert (tests, retries) do not invent a wall-clock match time.
 	LedgerClosedAt time.Time `json:"-"`
+	// Suppressed is true when a maintenance window was active when the
+	// alert was dispatched. Detection still happened and the row is still
+	// persisted; SuppressionReason carries the window's reason.
+	Suppressed        bool   `json:"suppressed"`
+	SuppressionReason string `json:"suppression_reason,omitempty"`
 	// Ledger is the sequence of the ledger the matching event came from. It
 	// is stored so retention and reorg handling can address alerts by ledger
 	// without parsing the payload. Zero for alerts persisted without one.
@@ -214,6 +402,52 @@ type Alert struct {
 	// previous alert. CreateAlert also folds it into Payload so the stored
 	// alert and the dispatched notification both report it.
 	SuppressedSinceLast int64 `json:"-"`
+	// Backfilled marks an alert produced by a historical replay (see
+	// internal/backfill) rather than live ingestion. It is persisted so an
+	// operator can tell a replayed match from a real-time one.
+	Backfilled bool `json:"backfilled"`
+}
+
+// Maintenance window scopes. A window suppresses matching alerts for its
+// scope only: global (everything), monitor (one monitor), contract (one
+// contract ID across monitors).
+const (
+	MaintenanceScopeGlobal   = "global"
+	MaintenanceScopeMonitor  = "monitor"
+	MaintenanceScopeContract = "contract"
+)
+
+// ValidMaintenanceScope reports whether s names a scope the store accepts.
+func ValidMaintenanceScope(s string) bool {
+	return s == MaintenanceScopeGlobal || s == MaintenanceScopeMonitor || s == MaintenanceScopeContract
+}
+
+// MaintenanceWindow is a time-bounded silence. Alerts raised inside
+// [StartAt, EndAt) for its scope are persisted but not delivered.
+// MonitorID and ContractID are set only when the scope calls for them.
+type MaintenanceWindow struct {
+	ID         int64     `json:"id"`
+	Reason     string    `json:"reason"`
+	Scope      string    `json:"scope"`
+	MonitorID  *int64    `json:"monitor_id,omitempty"`
+	ContractID *string   `json:"contract_id,omitempty"`
+	StartAt    time.Time `json:"start_at"`
+	EndAt      time.Time `json:"end_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// MaintenanceWindowFilter narrows ListMaintenanceWindows. Zero values mean
+// "no constraint".
+//
+// Active, when true, restricts the listing to windows whose [start, end)
+// interval contains At (defaulting to now when At is zero). Upcoming, when
+// true, restricts it to windows that start after At. Both false lists every
+// window.
+type MaintenanceWindowFilter struct {
+	Active   bool
+	Upcoming bool
+	At       time.Time
+	Limit    int
 }
 
 // AlertOutcome reports what CreateAlert did with a match.
@@ -254,11 +488,45 @@ type DeliveryAttempt struct {
 	AttemptedAt     time.Time `json:"attempted_at"`
 }
 
+// AbsenceState is the last time a rule saw the event it is waiting for.
+// Absence-of-event rules are driven by a periodic sweep rather than by event
+// arrival, so the sweep needs one of these per (rule, awaited pattern); there
+// is no event to compare against, only a clock.
+//
+// LastSeen is the wall-clock instant the process saw the awaited event, or —
+// for a rule that has never seen it — the instant the rule was first observed
+// by a sweep. Either way it is persisted, so a restart resumes measuring
+// silence instead of resetting the clock.
+type AbsenceState struct {
+	RuleID    int64     `json:"rule_id"`
+	EventName string    `json:"event_name"`
+	LastSeen  time.Time `json:"last_seen_at"`
+}
+
 // IngestState is the poller's checkpoint: the last fully processed ledger
 // and, mid-page, the last getEvents cursor.
 type IngestState struct {
 	LastLedger uint32    `json:"last_ledger"`
 	LastCursor string    `json:"last_cursor"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// Backfill is the persisted progress of a historical replay for one monitor.
+// A monitor has at most one row: an interrupted run resumes from
+// NextLedger/Cursor instead of starting over. Complete marks a finished run,
+// which a later backfill of the same monitor replaces.
+type Backfill struct {
+	MonitorID int64 `json:"monitor_id"`
+	// FromLedger and ToLedger are the inclusive range the run covers, kept so
+	// a resumed run reports the window it actually replayed.
+	FromLedger uint32 `json:"from_ledger"`
+	ToLedger   uint32 `json:"to_ledger"`
+	// NextLedger is the ledger to (re)request when a run restarts; Cursor is
+	// the source's opaque resume token from the last completed page.
+	NextLedger uint32    `json:"next_ledger"`
+	Cursor     string    `json:"cursor"`
+	Deliver    bool      `json:"deliver"`
+	Complete   bool      `json:"complete"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
@@ -297,14 +565,21 @@ type AlertFilter struct {
 	RuleID    int64
 	// ContractID matches payload->>'contract_id'. Empty means no contract filter.
 	ContractID string
-	From       time.Time
-	To         time.Time
-	Limit      int
+	// Query is the free-text alert search: a case-insensitive substring of
+	// either the source event id or the payload's full text, which carries
+	// contract_id, event_name and every other field the API returns. Empty
+	// (or whitespace-only, see NormalizeAlertSearch) means no search filter.
+	Query string
+	From  time.Time
+	To    time.Time
+	Limit int
 	// AfterID is the keyset cursor (the last id of the previous page). The
 	// comparison flips with Sort: created_at_desc uses (created_at, id) <
 	// the cursor row; created_at_asc uses >. Comparing only on id would
 	// repeat or skip rows once sort is not newest-id.
 	AfterID int64
+	// Severity filters alerts by minimum severity. Empty means no filter.
+	Severity Severity
 	// Type filters channels by their notifier type ("slack", "discord",
 	// ...). Empty means no type filter. Only meaningful for channels.
 	Type string
@@ -312,6 +587,71 @@ type AlertFilter struct {
 	// "created_at_asc". Unknown values are treated as the default in the
 	// store; the API rejects them with 400. Never interpolate this into SQL.
 	Sort string
+}
+
+// MaxAlertSearchLen caps a ?q= search term. The term is always bound as a
+// parameter so a longer one could not corrupt the statement, but an
+// unbounded term turns the search into a full table scan of a text match
+// against every payload — the cap keeps one keystroke-worth of query from
+// becoming the most expensive read the instance performs.
+const MaxAlertSearchLen = 256
+
+// NormalizeAlertSearch maps a caller-supplied search term onto the term the
+// store matches. A blank or whitespace-only term is "no filter", not "match
+// nothing": an emptied search box that clears itself is what the operator
+// expects, and the alternative would render an empty list for a filter that
+// is no longer there.
+func NormalizeAlertSearch(q string) string { return strings.TrimSpace(q) }
+
+// AlertSearchPattern builds the LIKE pattern for AlertFilter.Query. Escaping
+// the term's own wildcards is what makes the search literal: an operator
+// looking for a contract id containing "_" must not get every row, and a
+// term taken from a URL is not in on the joke. The ESCAPE character is
+// declared by every backend that uses this, so the pattern and the clause
+// cannot disagree about whether a backslash is special.
+func AlertSearchPattern(q string) string {
+	q = NormalizeAlertSearch(q)
+	if q == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("%")
+	for _, r := range q {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString("%")
+	return b.String()
+}
+
+// MonitorStats answers "is this monitor actually doing anything" for one
+// monitor: the counts a caller checks before deleting it or debugging why it
+// never fires. Every field is an explicit zero rather than a null when the
+// monitor has no history, because "no alerts yet" is the common case and a
+// client should not have to special-case it.
+type MonitorStats struct {
+	MonitorID      int64            `json:"monitor_id"`
+	Alerts         int64            `json:"alerts"`
+	AlertsLast24h  int64            `json:"alerts_last_24h"`
+	AlertsLast7d   int64            `json:"alerts_last_7d"`
+	LastAlertAt    *time.Time       `json:"last_alert_at,omitempty"`
+	DeliveriesOK   int64            `json:"deliveries_succeeded"`
+	DeliveriesFail int64            `json:"deliveries_failed"`
+	Rules          []RuleMatchCount `json:"rules"`
+}
+
+// RuleMatchCount is one rule's share of a monitor's alerts. Rules are listed
+// whether or not they have matched, so a rule that never fires is visible as
+// a zero instead of being absent — the absence of a row and a rule that does
+// not match are the same thing to a client only if the client can tell them
+// apart, and this lets it.
+type RuleMatchCount struct {
+	RuleID int64  `json:"rule_id"`
+	Type   string `json:"type"`
+	Alerts int64  `json:"alerts"`
 }
 
 // ListFilter pages monitors or channels. Zero values mean "no constraint"
@@ -437,6 +777,9 @@ type Channels interface {
 	ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
+	// ListMonitorsForChannel returns monitors attached to a channel, including
+	// every attachment so callers can identify monitors left without a channel.
+	ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error)
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error)
 	// RecordChannelHealth folds one delivery outcome into a channel's health
@@ -459,6 +802,10 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
+	// row. f.Limit caps the total rows, not the page size, so an export
+	// streams with bounded memory. See streamAlerts for the guarantees.
+	ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	// ListDeliveryAttempts returns attempts for one alert, oldest first.
 	// status empty means no filter; otherwise it is applied in SQL.
@@ -473,10 +820,49 @@ type Alerts interface {
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
+// MaintenanceWindows persists alert-silencing windows and marks suppressed
+// alerts. ActiveMaintenanceWindow is the one check on the delivery path.
+type MaintenanceWindows interface {
+	CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error)
+	ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error)
+	UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	DeleteMaintenanceWindow(ctx context.Context, id int64) error
+	// ActiveMaintenanceWindow returns the most specific window covering
+	// (monitorID, contractID) at time at, or nil when none is active.
+	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error)
+	// SetAlertSuppressed marks a persisted alert as silenced, recording
+	// the reason so the operator can see why it was not delivered.
+	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
+}
+
 // Ingest persists the poller checkpoint.
 type Ingest interface {
 	GetIngestState(ctx context.Context) (IngestState, error)
 	SetIngestState(ctx context.Context, s IngestState) error
+}
+
+// Absence persists the last-seen clocks that absence-of-event rules measure
+// silence against.
+type Absence interface {
+	// ListAbsenceState returns every stored clock. The sweep reads them all
+	// in one query: the table holds at most one row per absence rule, and a
+	// per-rule lookup would mean a query per rule on every tick.
+	ListAbsenceState(ctx context.Context) ([]AbsenceState, error)
+	// RecordAbsenceSeen advances the clock for (ruleID, eventName) to at.
+	// It never moves the clock backwards: a replayed or out-of-order event
+	// must not make a rule look fresher than it is, and the sweep's initial
+	// baseline write must not undo a real observation. Writing an older
+	// instant is therefore a no-op rather than an error.
+	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
+}
+
+// Backfills persists historical replay progress, so an interrupted backfill
+// resumes where it stopped instead of replaying the whole range. GetBackfill
+// returns ErrNotFound when the monitor has never been backfilled.
+type Backfills interface {
+	GetBackfill(ctx context.Context, monitorID int64) (Backfill, error)
+	UpsertBackfill(ctx context.Context, b *Backfill) error
 }
 
 // SavedSearch is a named, reusable alert filter combination.
@@ -505,6 +891,81 @@ type SavedSearches interface {
 	DeleteSavedSearch(ctx context.Context, id int64) error
 	SetDefaultSearch(ctx context.Context, id int64) error
 	ClearDefaultSearch(ctx context.Context, id int64) error
+}
+
+// Audit actions persisted on audit_log.action. A small closed set so the
+// API can filter on it and clients can branch on a stable token.
+const (
+	AuditActionCreate = "create"
+	AuditActionUpdate = "update"
+	AuditActionDelete = "delete"
+)
+
+// AuditEntry is one append-only record of a mutating operation on a monitor,
+// rule or channel. Diff records which fields were sent — never their values:
+// channel config holds webhook URLs, bot tokens and SMTP credentials, so only
+// the fact that a field changed is stored, never what it changed to.
+// Actor is the request ID today and will carry the authenticated principal
+// once auth identifies one; the column is a plain string so that needs no
+// migration.
+type AuditEntry struct {
+	ID         int64           `json:"id"`
+	Actor      string          `json:"actor"`
+	Action     string          `json:"action"`
+	TargetType string          `json:"target_type"`
+	TargetID   int64           `json:"target_id"`
+	Diff       json.RawMessage `json:"diff,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+// AuditFilter narrows ListAuditEntries. Zero values mean "no constraint".
+type AuditFilter struct {
+	TargetType string
+	TargetID   int64
+	From       time.Time
+	To         time.Time
+	Limit      int
+}
+
+// Digest modes persisted on channels.digest_mode. The empty string means
+// immediate delivery.
+const (
+	DigestModeOff    = ""
+	DigestModeWindow = "window"
+)
+
+// DigestAlert is one alert waiting to be summarised into a channel digest.
+// Payload is the serialised notify.Alert; the store keeps it opaque so the
+// store package does not depend on the notification layer.
+type DigestAlert struct {
+	ID        int64           `json:"id"`
+	ChannelID int64           `json:"channel_id"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+// DigestQueue persists alerts awaiting a channel's digest flush so a restart
+// does not silently drop a partial window. Rows are owned by the channel and
+// cascade when it is deleted.
+type DigestQueue interface {
+	// PushDigestAlert appends one serialised alert to a channel's window.
+	PushDigestAlert(ctx context.Context, channelID int64, payload json.RawMessage) error
+	// ListDigestAlerts returns a channel's pending alerts oldest first.
+	ListDigestAlerts(ctx context.Context, channelID int64) ([]DigestAlert, error)
+	// DeleteDigestAlerts removes the flushed rows by id. Deleting by id
+	// rather than draining the channel keeps an alert that arrived during
+	// the flush from being dropped.
+	DeleteDigestAlerts(ctx context.Context, channelID int64, ids []int64) error
+}
+
+// Audits is append-only by design: there is deliberately no Update or Delete
+// method, so nothing can rewrite or erase the log through the store.
+type Audits interface {
+	// CreateAuditEntry appends one entry and fills in its ID and CreatedAt.
+	CreateAuditEntry(ctx context.Context, e *AuditEntry) error
+	// ListAuditEntries returns entries newest first, at most f.Limit of
+	// them (default and cap applied by the store).
+	ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error)
 }
 
 // MonitorTemplate defines a reusable monitor shape. Monitors created from
@@ -554,21 +1015,54 @@ type MonitorTemplates interface {
 	DeleteMonitorTemplate(ctx context.Context, id int64) error
 }
 
+// BackupChannel is a Channel with its Config included for configuration
+// export. The normal Channel tags Config with json:"-" to prevent leaks
+// through the API; the backup path needs the decrypted config and controls
+// its own output.
+type BackupChannel struct {
+	ID        int64           `json:"id"`
+	Name      string          `json:"name"`
+	Type      string          `json:"type"`
+	Config    json.RawMessage `json:"config"`
+	Enabled   bool            `json:"enabled"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
 // Store is everything the application needs from persistence.
 type Store interface {
 	Monitors
 	Rules
 	Channels
 	Alerts
+	MaintenanceWindows
+	Inhibitions
 	Ingest
+	Absence
+	Backfills
 	Ledgers
 	SavedSearches
 	MonitorTemplates
+	Audits
+	DigestQueue
 	GetStats(ctx context.Context) (Stats, error)
+	// GetMonitorStats returns one monitor's alert, delivery and per-rule
+	// counts, or ErrNotFound when the monitor does not exist. It exists
+	// because GetStats answers "how big is this instance" and says nothing
+	// about whether a particular monitor is doing any work.
+	GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.
 	AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error)
+	// GroupAlerts creates or increments the alert group for key
+	// with windowStart and returns whether the alert should be
+	// delivered immediately (first alert in the window) and the
+	// current group count. Grouping is off when window duration is
+	// zero, which callers enforce before invoking this method.
+	GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error)
+	// CreateAlertGroup creates or increments the alert group row
+	// identified by key and windowStart. Returns the new count.
+	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close()
 }

@@ -1,7 +1,10 @@
+-- Parity with the Postgres 0007. JSONB becomes TEXT (the Go layer marshals
+-- the filter, exactly as it does for monitors.contract_ids), TIMESTAMPTZ
+-- becomes TEXT in the fixed 'YYYY-MM-DDTHH:MM:SS.mmmZ' format so lexicographic
+-- order equals chronological order, and BOOLEAN becomes INTEGER 0/1. The
+-- partial unique index keeps at most one default row, mirroring the Postgres
+-- index, so "set this one default" stays a two-statement operation.
 -- SQLite equivalent of the Postgres 0007_saved_searches. JSONB becomes TEXT
--- (read back with json_extract) and the partial unique index spells TRUE as 1,
--- but the guarantee is identical: at most one saved search is the default, so
--- the dashboard always has exactly one landing filter.
 -- (queried with json_extract), timestamps use the fixed strftime format, and
 -- BOOLEAN becomes INTEGER 0/1. The partial unique index on the default row is
 -- supported by SQLite and keeps "exactly one default" true on both backends.
