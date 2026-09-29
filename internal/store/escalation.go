@@ -139,8 +139,12 @@ func (p *Postgres) DeleteEscalationPolicy(ctx context.Context, monitorID int64) 
 func (p *Postgres) ScheduleEscalation(ctx context.Context, alertID, policyID int64, snapshot json.RawMessage, nextStep int, nextDue time.Time) error {
 	var id int64
 	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO alert_escalations (alert_id, policy_id, alert_snapshot, next_step, next_due_at)
-		 VALUES ($1, $2, $3, $4, $5)
+		// alert_created_at is read from the alert rather than passed in: the
+		// composite foreign key needs it, and taking it from the row means a
+		// caller cannot supply one that does not match. A missing alert
+		// selects no rows and comes back as ErrNotFound.
+		`INSERT INTO alert_escalations (alert_id, alert_created_at, policy_id, alert_snapshot, next_step, next_due_at)
+		 SELECT a.id, a.created_at, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1
 		 ON CONFLICT (alert_id) DO UPDATE SET
 		     policy_id      = EXCLUDED.policy_id,
 		     alert_snapshot = EXCLUDED.alert_snapshot,

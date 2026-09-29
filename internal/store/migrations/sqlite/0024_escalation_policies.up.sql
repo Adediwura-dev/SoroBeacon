@@ -27,9 +27,13 @@ CREATE TABLE escalation_step_channels (
     PRIMARY KEY (step_id, channel_id)
 );
 
+-- alert_created_at mirrors the Postgres table, where alerts is partitioned by
+-- created_at and the reference has to be composite. SQLite does not partition,
+-- but carrying the column keeps one set of statements for both backends.
 CREATE TABLE alert_escalations (
-    alert_id       INTEGER PRIMARY KEY REFERENCES alerts (id) ON DELETE CASCADE,
-    policy_id      INTEGER NOT NULL REFERENCES escalation_policies (id) ON DELETE CASCADE,
+    alert_id         INTEGER PRIMARY KEY REFERENCES alerts (id) ON DELETE CASCADE,
+    alert_created_at TEXT    NOT NULL,
+    policy_id        INTEGER NOT NULL REFERENCES escalation_policies (id) ON DELETE CASCADE,
     alert_snapshot TEXT    NOT NULL DEFAULT '{}',
     next_step      INTEGER NOT NULL,
     next_due_at    TEXT    NOT NULL,

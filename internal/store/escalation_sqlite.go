@@ -160,9 +160,11 @@ func (s *SQLite) DeleteEscalationPolicy(ctx context.Context, monitorID int64) er
 // the primary key, so re-dispatching the same alert replaces its pending
 // schedule instead of stacking a second one.
 func (s *SQLite) ScheduleEscalation(ctx context.Context, alertID, policyID int64, snapshot json.RawMessage, nextStep int, nextDue time.Time) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO alert_escalations (alert_id, policy_id, alert_snapshot, next_step, next_due_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+	// alert_created_at is read from the alert rather than passed in, matching
+	// the Postgres statement, where the composite foreign key needs it.
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO alert_escalations (alert_id, alert_created_at, policy_id, alert_snapshot, next_step, next_due_at, updated_at)
+		 SELECT a.id, a.created_at, ?, ?, ?, ?, ? FROM alerts a WHERE a.id = ?
 		 ON CONFLICT (alert_id) DO UPDATE SET
 		     policy_id      = excluded.policy_id,
 		     alert_snapshot = excluded.alert_snapshot,
@@ -170,9 +172,19 @@ func (s *SQLite) ScheduleEscalation(ctx context.Context, alertID, policyID int64
 		     next_due_at    = excluded.next_due_at,
 		     completed_at   = NULL,
 		     updated_at     = excluded.updated_at`,
-		alertID, policyID, string(jsonOrEmpty(snapshot)), nextStep,
-		sqliteTimeString(nextDue), sqliteTimeString(time.Now()))
-	return mapSQLiteErr(err)
+		policyID, string(jsonOrEmpty(snapshot)), nextStep,
+		sqliteTimeString(nextDue), sqliteTimeString(time.Now()), alertID)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DueEscalations returns escalations whose next step is due. Acknowledged

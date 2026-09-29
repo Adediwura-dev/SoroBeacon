@@ -30,14 +30,20 @@ CREATE TABLE escalation_step_channels (
 -- resumes from its next-due step instead of restarting or being dropped. The
 -- alert snapshot lets a later step be delivered without rebuilding the
 -- notification payload from scratch.
+-- alerts is partitioned by created_at (0011), so its primary key is
+-- (id, created_at) and a foreign key on id alone has no unique constraint to
+-- point at. alert_created_at rides along and the reference is composite, the
+-- same shape delivery_attempts took in 0011, which is what keeps the cascade.
 CREATE TABLE alert_escalations (
-    alert_id       BIGINT      PRIMARY KEY REFERENCES alerts (id) ON DELETE CASCADE,
-    policy_id      BIGINT      NOT NULL REFERENCES escalation_policies (id) ON DELETE CASCADE,
+    alert_id         BIGINT      PRIMARY KEY,
+    alert_created_at TIMESTAMPTZ NOT NULL,
+    policy_id        BIGINT      NOT NULL REFERENCES escalation_policies (id) ON DELETE CASCADE,
     alert_snapshot JSONB       NOT NULL DEFAULT '{}',
     next_step      INTEGER     NOT NULL,
     next_due_at    TIMESTAMPTZ NOT NULL,
     completed_at   TIMESTAMPTZ,
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (alert_id, alert_created_at) REFERENCES alerts (id, created_at) ON DELETE CASCADE
 );
 
 -- The scheduler scans for due, unfinished escalations; a partial index keeps
