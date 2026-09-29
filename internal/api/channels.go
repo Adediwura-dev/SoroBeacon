@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
@@ -285,6 +286,12 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
+		// A channel referenced by an escalation step must be detached first;
+		// a 409 says so instead of leaving a dangling reference behind.
+		if errors.Is(err, store.ErrChannelInUse) {
+			writeErr(w, r, http.StatusConflict, err.Error())
+			return
+		}
 		s.fail(w, r, err)
 		return
 	}

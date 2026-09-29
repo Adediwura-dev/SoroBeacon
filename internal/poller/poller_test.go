@@ -905,3 +905,40 @@ func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
 func (f *fakeStore) RecordChannelHealth(context.Context, int64, store.ChannelHealthUpdate) error {
 	return nil
 }
+
+// The escalation half of notify.DispatchStore. The poller tests attach no
+// escalation policy, so every monitor takes the flat fan-out and the
+// scheduling calls are inert.
+func (f *fakeStore) ListChannelsByIDs(_ context.Context, ids []int64) ([]store.Channel, error) {
+	wanted := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	var out []store.Channel
+	for _, ch := range f.channels {
+		if wanted[ch.ID] && ch.Enabled {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) GetEscalationPolicyForMonitor(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) GetEscalationPolicy(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) ScheduleEscalation(context.Context, int64, int64, json.RawMessage, int, time.Time) error {
+	return nil
+}
+
+func (f *fakeStore) DueEscalations(context.Context, time.Time, int) ([]store.EscalationRun, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) AdvanceEscalation(context.Context, int64, int, time.Time) error { return nil }
+
+func (f *fakeStore) CompleteEscalation(context.Context, int64) error { return nil }

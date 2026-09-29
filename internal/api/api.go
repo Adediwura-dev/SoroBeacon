@@ -181,6 +181,9 @@ func (s *Server) Routes() chi.Router {
 			r.Post("/rules/bulk", s.createRulesBulk)
 			r.Patch("/rules/{ruleID}", s.updateRule)
 			r.Delete("/rules/{ruleID}", s.deleteRule)
+			r.Get("/escalation", s.getMonitorEscalation)
+			r.Put("/escalation", s.putMonitorEscalation)
+			r.Delete("/escalation", s.deleteMonitorEscalation)
 		})
 	})
 
@@ -230,6 +233,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/export", s.exportAlertsNDJSON)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	r.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
 	r.Get("/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)

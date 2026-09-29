@@ -398,6 +398,11 @@ func run() error {
 			go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
 		}
 		go dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
+		// Escalation steps are driven by their persisted next-due time, so
+		// this loop is also what resumes an escalation that was mid-flight at
+		// restart. Leader-gated for the same reason as the digest flusher:
+		// two instances stepping the same alert would page twice.
+		go dispatcher.RunEscalations(ctx)
 		p.Run(ctx)
 	}
 	leaderDone := make(chan struct{})

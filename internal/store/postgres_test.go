@@ -31,6 +31,13 @@ func newTestPostgres(t *testing.T) conformanceStore {
 	require.NoError(t, err)
 	t.Cleanup(st.Close)
 	require.NoError(t, st.resetConformance(context.Background()))
+
+	_, err = st.pool.Exec(context.Background(),
+		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts,
+		        escalation_policies, escalation_steps, escalation_step_channels, alert_escalations
+		 RESTART IDENTITY CASCADE;
+		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
+	require.NoError(t, err)
 	return st
 }
 

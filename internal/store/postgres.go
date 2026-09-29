@@ -730,7 +730,20 @@ func (p *Postgres) RecordChannelHealth(ctx context.Context, channelID int64, u C
 	return nil
 }
 
+// DeleteChannel removes a channel, refusing when an escalation policy step
+// still references it. The reference is checked explicitly so the caller gets
+// ErrChannelInUse (mapped to a 409) rather than a raw foreign-key error; the
+// migration's ON DELETE RESTRICT is the backstop for a concurrent policy write.
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
+	var inUse bool
+	if err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM escalation_step_channels WHERE channel_id = $1)`, id,
+	).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrChannelInUse
+	}
 	return p.deleteByID(ctx, "channels", id)
 }
 
@@ -769,6 +782,25 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = $1 AND c.enabled
 		 ORDER BY c.id`, monitorID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanChannel)
+}
+
+// ListChannelsByIDs returns the enabled channels among ids, ordered by id, so
+// an escalation step can resolve its channel set in one query. Disabled
+// channels are omitted rather than erroring, matching ListChannelsForMonitor:
+// a paused destination simply stops receiving alerts.
+func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at FROM channels
+		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -971,9 +1003,9 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	var ledger int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at
 		   FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason)
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1020,7 +1052,7 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
 func buildAlertQuery(f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -1084,7 +1116,7 @@ func buildAlertQuery(f AlertFilter) (string, []any) {
 func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var a Alert
 	var ledger int64
-	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason)
+	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt)
 	a.Ledger = uint32(ledger)
 	return a, err
 }
@@ -1099,7 +1131,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
