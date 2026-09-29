@@ -23,7 +23,7 @@ Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 | a notification channel  | `notify.Notifier`      | `DefaultFactory` in `internal/notify/notify.go`|
 | a rule type             | `rules.RuleEvaluator`  | `NewRegistry` in `internal/rules/rules.go`     |
 | a timer-driven rule type| `rules.AbsenceEvaluator` | `NewRegistry` via `RegisterAbsence`          |
-| a different event source| `stellar.Client`       | wiring in `cmd/sorobeacon/main.go`             |
+| a different event source| `poller.EventSource`   | wiring in `cmd/sorobeacon/main.go`             |
 | a decoder (e.g. spec-aware) | `stellar.Decoder`  | wiring in `cmd/sorobeacon/main.go`             |
 | another database        | `store.Store` (or a sub-interface) | wiring in `cmd/sorobeacon/main.go` |
 
@@ -41,7 +41,11 @@ The README has worked examples for channels and rules.
   tokens and SMTP credentials. Keep them out of log lines, error messages,
   API responses and delivery `response_snippet`s.
 - **Migrations** are sequential files in `internal/store/migrations`
-  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration.
+  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration. The
+  SQLite backend has a parallel set at the same version numbers under
+  `internal/store/migrations/sqlite/`, because Postgres DDL does not run
+  unmodified on SQLite. `make migrate-new name=...` scaffolds both; a
+  migration with no SQLite change keeps a comment-only pair there.
 - **Structured logging** via `log/slog` with lower_snake_case keys.
 
 ## Good first issues
