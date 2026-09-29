@@ -702,6 +702,47 @@ func (s *SQLite) DeleteRule(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "rules", id)
 }
 
+// --- absence-of-event state ---
+
+func (s *SQLite) ListAbsenceState(ctx context.Context) ([]AbsenceState, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT rule_id, event_name, last_seen_at FROM rule_absence_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []AbsenceState
+	for rows.Next() {
+		var st AbsenceState
+		var lastSeen string
+		if err := rows.Scan(&st.RuleID, &st.EventName, &lastSeen); err != nil {
+			return nil, err
+		}
+		if st.LastSeen, err = parseSQLiteTime(lastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error {
+	// MAX is SQLite's GREATEST, and it is what makes the clock monotonic in
+	// one statement: the sweep and the rearm path both write here, and
+	// neither may move a clock that a newer event already advanced. The
+	// comparison is lexicographic on the fixed timestamp layout, which for
+	// this format is the same ordering as chronological.
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO rule_absence_state (rule_id, event_name, last_seen_at, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT (rule_id, event_name) DO UPDATE
+		 SET last_seen_at = MAX(rule_absence_state.last_seen_at, excluded.last_seen_at),
+		     updated_at   = excluded.updated_at`,
+		ruleID, eventName, sqliteTimeString(at), sqliteTimeString(time.Now()))
+	return err
+}
+
 // --- channels ---
 
 func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {

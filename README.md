@@ -287,7 +287,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Five rule types ship:
+The built-in rule types:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -460,6 +460,25 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 See [docs/rules/topic-position.md](docs/rules/topic-position.md).
+
+**`absence_of_event`** — the inverse of `event_emitted`: fire when the event
+*stops* arriving. `window` is how long silence is tolerated. It is the one
+rule type driven by a timer rather than by an arriving event, so it is what
+catches a contract that has gone quiet. Each silence alerts once, not once
+per poll, and the clock lives in the database, so a restart cannot swallow a
+real outage:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "absence_of_event",
+  "params": {
+    "event_name": "heartbeat",
+    "window": "30m"
+  }
+}'
+```
+
+See [docs/rules/absence-of-event.md](docs/rules/absence-of-event.md).
 
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
