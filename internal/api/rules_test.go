@@ -523,13 +523,18 @@ func TestCreateRule_AllRegisteredTypes(t *testing.T) {
 
 func validParamsForType(t *testing.T, ruleType string) map[string]any {
 	t.Helper()
+	// Use valid contract IDs from contract_allowlist_test.go
+	const (
+		allowTreasury = "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"
+		allowOther    = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+	)
 	switch ruleType {
 	case rules.TypeEventEmitted:
 		return map[string]any{"event_name": "transfer"}
 	case rules.TypeValueThreshold:
 		return map[string]any{"comparison": "gt", "threshold": "1000000"}
 	case rules.TypeContractAllowlist:
-		return map[string]any{"contract_ids": []string{"CDLZFC3SYJYDZT7K67VZ75HPJVIEVLDT7JYKD4ZUO6M657MX2KZ7VZ"}}
+		return map[string]any{"contract_ids": []string{allowTreasury, allowOther}}
 	case rules.TypeEventNameGlob:
 		return map[string]any{"patterns": []string{"transfer*"}}
 	case rules.TypeNumericRange:
@@ -541,7 +546,8 @@ func validParamsForType(t *testing.T, ruleType string) map[string]any {
 	case rules.TypeTopicRegex:
 		return map[string]any{"topic_index": 1, "pattern": "^[A-Z]+$"}
 	case rules.TypeAddressWatchlist:
-		return map[string]any{"addresses": []string{"GABC1234567890123456789012345678901234"}}
+		// AddressWatchlist requires valid Stellar addresses (strkey starting with G)
+		return map[string]any{"addresses": []string{"GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"}}
 	case rules.TypeTopicPosition:
 		return map[string]any{"position": 1, "equals": "POOL_USDC_XLM"}
 	case rules.TypeComposite:

@@ -7,9 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
+	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/web"
 )
 
@@ -266,4 +269,65 @@ func TestWiring_ComponentConstructionFailureIsReturned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildWiring should succeed with valid config: %v", err)
 	}
+}
+
+// fakeHealthChecker is a minimal HealthChecker for testing.
+type fakeHealthChecker struct{}
+
+func (fakeHealthChecker) GetHealth(context.Context) (*stellar.Health, error) { return nil, nil }
+
+// buildWiring constructs the core components from config. It is a minimal,
+// additive extraction of the wiring logic from run() so tests can assert that
+// each config value reaches its component. It does not start servers, run
+// migrations, or connect to databases.
+func buildWiring(ctx context.Context, cfg config.Config, log *slog.Logger) (*wiring, error) {
+	// Minimal stubs for dependencies not under test.
+	st := &fakeStore{}
+	reg := rules.NewRegistry()
+	factory := notify.DefaultFactory()
+
+	// Poller interval
+	p := poller.New(nil, st, reg, nil, cfg.PollInterval, log)
+
+	// API server
+	apiSrv := api.New(st, reg, factory, &fakeHealthChecker{}, log).
+		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes).
+		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
+		WithRateLimit(api.RateLimitConfig{
+			RPS:            cfg.RateLimitRPS,
+			Burst:          cfg.RateLimitBurst,
+			TrustForwarded: cfg.RateLimitTrustForwarded,
+		})
+
+	// Web server
+	webSrv, err := web.New(st, reg, factory, log)
+	if err != nil {
+		return nil, err
+	}
+	webSrv = webSrv.WithSilentAfter(cfg.MonitorSilentAfter)
+
+	// Dispatcher
+	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+
+	// Poller options
+	p = p.WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
+
+	return &wiring{
+		poller:          p,
+		apiSrv:          apiSrv,
+		webSrv:          webSrv,
+		dispatcher:      dispatcher,
+		httpAddr:        cfg.HTTPAddr,
+		readyzThreshold: cfg.ReadyzLagThreshold,
+		rateLimit: api.RateLimitConfig{
+			RPS:            cfg.RateLimitRPS,
+			Burst:          cfg.RateLimitBurst,
+			TrustForwarded: cfg.RateLimitTrustForwarded,
+		},
+		maxBodyBytes: cfg.HTTPMaxBodyBytes,
+		silentAfter:  cfg.MonitorSilentAfter,
+		reorgWindow:  cfg.ReorgTrackingWindow,
+		reorgDepth:   cfg.ReorgConfirmationDepth,
+	}, nil
 }
