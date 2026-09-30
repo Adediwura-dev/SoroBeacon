@@ -18,15 +18,16 @@ import (
 // ruleStore is a test store that records calls and returns fixed data.
 type ruleStore struct {
 	store.Store
-	createdRules []*store.Rule
-	updatedRules []*store.Rule
-	deletedRules []int64
-	listRules    []store.Rule
-	getRule      *store.Rule
-	getRuleErr   error
-	createErr    error
-	updateErr    error
-	deleteErr    error
+	createdRules   []*store.Rule
+	updatedRules   []*store.Rule
+	deletedRules   []int64
+	listRules      []store.Rule
+	getRule        *store.Rule
+	getRuleErr     error
+	getMonitorErr  error
+	createErr      error
+	updateErr      error
+	deleteErr      error
 }
 
 func (s *ruleStore) CreateRule(ctx context.Context, r *store.Rule) error {
@@ -78,6 +79,9 @@ func (s *ruleStore) DeleteRule(ctx context.Context, id int64) error {
 }
 
 func (s *ruleStore) GetMonitor(ctx context.Context, id int64) (*store.Monitor, error) {
+	if s.getMonitorErr != nil {
+		return nil, s.getMonitorErr
+	}
 	if id == 0 {
 		return nil, store.ErrNotFound
 	}
@@ -225,7 +229,7 @@ func TestCreateRule_InvalidSeverity(t *testing.T) {
 
 	var body map[string]any
 	decodeBody(t, res, &body)
-	require.Contains(t, body["error"], "severity")
+	require.Contains(t, body["error"], "must be")
 }
 
 func TestCreateRule_MalformedJSON(t *testing.T) {
@@ -241,7 +245,7 @@ func TestCreateRule_MalformedJSON(t *testing.T) {
 
 func TestCreateRule_MonitorNotFound(t *testing.T) {
 	st := &ruleStore{}
-	st.getRuleErr = store.ErrNotFound
+	st.getMonitorErr = store.ErrNotFound
 	srv := testServer(t, st)
 	defer srv.Close()
 
@@ -462,7 +466,7 @@ func TestCreateRulesBulk_PartialFailure(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	// First valid, second invalid
+	// First valid, second invalid (missing threshold)
 	res := postJSONReq(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{
 		{"type": "event_emitted", "params": map[string]any{"event_name": "transfer"}},
 		{"type": "value_threshold", "params": map[string]any{"comparison": "invalid"}},
@@ -473,13 +477,14 @@ func TestCreateRulesBulk_PartialFailure(t *testing.T) {
 	decodeBody(t, res, &body)
 	require.Equal(t, "validation failed", body["error"])
 	details := body["details"].([]any)
-	require.Len(t, details, 1)
+	// Both comparison and threshold fail validation
+	require.Len(t, details, 2)
 	require.Contains(t, details[0].(map[string]any)["field"], "rules[1]")
 }
 
 func TestCreateRulesBulk_MonitorNotFound(t *testing.T) {
 	st := &ruleStore{}
-	st.getRuleErr = store.ErrNotFound
+	st.getMonitorErr = store.ErrNotFound
 	srv := testServer(t, st)
 	defer srv.Close()
 
