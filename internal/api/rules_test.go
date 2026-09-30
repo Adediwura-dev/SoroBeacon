@@ -529,27 +529,27 @@ func validParamsForType(t *testing.T, ruleType string) map[string]any {
 	case rules.TypeValueThreshold:
 		return map[string]any{"comparison": "gt", "threshold": "1000000"}
 	case rules.TypeContractAllowlist:
-		return map[string]any{"addresses": []string{"GABC123"}}
+		return map[string]any{"contract_ids": []string{"CDLZFC3SYJYDZT7K67VZ75HPJVIEVLDT7JYKD4ZUO6M657MX2KZ7VZ"}}
 	case rules.TypeEventNameGlob:
-		return map[string]any{"pattern": "transfer*"}
+		return map[string]any{"patterns": []string{"transfer*"}}
 	case rules.TypeNumericRange:
 		return map[string]any{"field": "amount", "min": "0", "max": "1000"}
 	case rules.TypeTokenSupplyChange:
 		return map[string]any{"asset": "native"}
 	case rules.TypeFrequencyThreshold:
-		return map[string]any{"window_seconds": 300, "threshold": 5}
+		return map[string]any{"count": 5, "window": "5m"}
 	case rules.TypeTopicRegex:
 		return map[string]any{"topic_index": 1, "pattern": "^[A-Z]+$"}
 	case rules.TypeAddressWatchlist:
-		return map[string]any{"addresses": []string{"GABC123"}, "topic_index": 0}
+		return map[string]any{"addresses": []string{"GABC1234567890123456789012345678901234"}}
 	case rules.TypeTopicPosition:
-		return map[string]any{"topic_index": 0, "position": 1}
+		return map[string]any{"position": 1, "equals": "POOL_USDC_XLM"}
 	case rules.TypeComposite:
-		return map[string]any{"operator": "and", "rules": []map[string]any{
+		return map[string]any{"op": "and", "rules": []map[string]any{
 			{"type": "event_emitted", "params": map[string]any{"event_name": "transfer"}},
 		}}
 	case rules.TypeAbsenceOfEvent:
-		return map[string]any{"event_name": "heartbeat", "window_seconds": 3600}
+		return map[string]any{"event_name": "heartbeat", "window": "30m"}
 	default:
 		t.Fatalf("unknown rule type: %s", ruleType)
 		return nil

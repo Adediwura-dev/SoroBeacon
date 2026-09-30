@@ -512,6 +512,11 @@ type wiring struct {
 	reorgDepth      uint32
 }
 
+// fakeHealthChecker is a minimal HealthChecker for testing.
+type fakeHealthChecker struct{}
+
+func (fakeHealthChecker) GetHealth(context.Context) (*stellar.Health, error) { return nil, nil }
+
 // buildWiring constructs the core components from config. It is a minimal,
 // additive extraction of the wiring logic from run() so tests can assert that
 // each config value reaches its component. It does not start servers, run
