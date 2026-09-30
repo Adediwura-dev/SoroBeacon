@@ -57,6 +57,7 @@
 * [Upgrading a running deployment](operations/upgrading.md)
 * [Capacity and scaling](operations/scaling.md)
 * [Poll priority, reorgs, retention and archiving](operations/retention-and-reorg.md)
+* [Diagnosing failed alert deliveries](operations/delivery-failures.md)
 
 ## 🛠️ Reference
 

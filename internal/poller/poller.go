@@ -126,6 +126,11 @@ func (p *Poller) Position() Position {
 	return Position{}
 }
 
+// Interval returns the configured poll interval. Exposed for tests.
+func (p *Poller) Interval() time.Duration {
+	return p.interval
+}
+
 func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 	p.pos.Store(Position{
 		LastProcessedLedger: processed,
