@@ -84,6 +84,11 @@ func (s *ruleStore) GetMonitor(ctx context.Context, id int64) (*store.Monitor, e
 	return &store.Monitor{ID: id, Name: "test-monitor", ContractIDs: []string{"CABC"}}, nil
 }
 
+// CreateAuditEntry is a stub for the Audits interface.
+func (s *ruleStore) CreateAuditEntry(ctx context.Context, e *store.AuditEntry) error {
+	return nil
+}
+
 func testServer(t *testing.T, st store.Store) *httptest.Server {
 	t.Helper()
 	reg := rules.NewRegistry()
