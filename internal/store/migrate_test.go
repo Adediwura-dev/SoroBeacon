@@ -2,7 +2,6 @@
 package store
 
 import (
-	"context"
 	"database/sql"
 	"os"
 	"testing"
@@ -25,7 +24,6 @@ func TestMigrate_RoundTrip(t *testing.T) {
 
 	// Use a dedicated database name to avoid leaving the shared database
 	// in an unusable state for other tests.
-	ctx := context.Background()
 
 	// Apply migrations up from empty database
 	require.NoError(t, Migrate(url))

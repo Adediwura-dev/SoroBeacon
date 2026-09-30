@@ -267,19 +267,3 @@ func TestWiring_ComponentConstructionFailureIsReturned(t *testing.T) {
 		t.Fatalf("buildWiring should succeed with valid config: %v", err)
 	}
 }
-
-// Poller needs an Interval() method for testing. We'll add a getter
-// by accessing the unexported field through a test helper.
-// Since we can't access unexported fields, we need to either:
-// 1. Add an Interval() method to Poller
-// 2. Use reflection
-// 3. Test via the position reader interface
-//
-// Let's add a test helper method to the Poller type.
-func (p *poller.Poller) Interval() time.Duration {
-	return p.interval
-}
-
-func (d *notify.Dispatcher) DisableAfterFailures() int {
-	return d.disableAfterFailures
-}

@@ -572,12 +572,6 @@ type fakeStore struct {
 	store.Store
 }
 
-type fakeHealthChecker struct{}
-
-func (f fakeHealthChecker) GetHealth(context.Context) (*stellar.Health, error) {
-	return nil, nil
-}
-
 // runBackfill implements `sorobeacon backfill`: an opt-in historical replay of
 // one monitor's recent ledger history. It shares the server's config, store and
 // event source, so a replay reads exactly what live monitoring reads.

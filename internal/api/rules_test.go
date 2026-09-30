@@ -92,7 +92,7 @@ func testServer(t *testing.T, st store.Store) *httptest.Server {
 	return httptest.NewServer(srv.Routes())
 }
 
-func postJSON(t *testing.T, url string, body any) *http.Response {
+func postJSONReq(t *testing.T, url string, body any) *http.Response {
 	t.Helper()
 	data, _ := json.Marshal(body)
 	res, err := http.Post(url, "application/json", bytes.NewReader(data))
@@ -136,7 +136,7 @@ func TestCreateRule_Success(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 		"type":   "event_emitted",
 		"params": map[string]any{"event_name": "transfer"},
 		"enabled": true,
@@ -156,7 +156,7 @@ func TestCreateRule_MissingType(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 		"params": map[string]any{},
 	})
 	require.Equal(t, http.StatusBadRequest, res.StatusCode)
@@ -174,7 +174,7 @@ func TestCreateRule_UnknownType(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 		"type": "nonexistent_type",
 		"params": map[string]any{},
 	})
@@ -191,7 +191,7 @@ func TestCreateRule_InvalidParams(t *testing.T) {
 	defer srv.Close()
 
 	// value_threshold requires comparison and threshold
-	res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 		"type": "value_threshold",
 		"params": map[string]any{
 			"comparison": "invalid",
@@ -211,7 +211,7 @@ func TestCreateRule_InvalidSeverity(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 		"type":     "event_emitted",
 		"params":   map[string]any{"event_name": "transfer"},
 		"severity": "invalid",
@@ -240,7 +240,7 @@ func TestCreateRule_MonitorNotFound(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/999/rules", map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/999/rules", map[string]any{
 		"type":   "event_emitted",
 		"params": map[string]any{"event_name": "transfer"},
 	})
@@ -404,12 +404,12 @@ func TestDeleteRule_WrongMonitor(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, res.StatusCode)
 }
 
-func TestCreateRulesBulk_Success(t *testing.T) {
+func TestCreateRulesBulk_Success_CreatesMultiple(t *testing.T) {
 	st := &ruleStore{}
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{
 		{"type": "event_emitted", "params": map[string]any{"event_name": "transfer"}},
 		{"type": "value_threshold", "params": map[string]any{"comparison": "gt", "threshold": 100}},
 	})
@@ -427,7 +427,7 @@ func TestCreateRulesBulk_Empty(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{})
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{})
 	require.Equal(t, http.StatusBadRequest, res.StatusCode)
 
 	var body map[string]any
@@ -444,7 +444,7 @@ func TestCreateRulesBulk_TooMany(t *testing.T) {
 	for i := range items {
 		items[i] = map[string]any{"type": "event_emitted", "params": map[string]any{"event_name": "e"}}
 	}
-	res := postJSON(t, srv.URL+"/monitors/1/rules/bulk", items)
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules/bulk", items)
 	require.Equal(t, http.StatusBadRequest, res.StatusCode)
 
 	var body map[string]any
@@ -458,7 +458,7 @@ func TestCreateRulesBulk_PartialFailure(t *testing.T) {
 	defer srv.Close()
 
 	// First valid, second invalid
-	res := postJSON(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/1/rules/bulk", []map[string]any{
 		{"type": "event_emitted", "params": map[string]any{"event_name": "transfer"}},
 		{"type": "value_threshold", "params": map[string]any{"comparison": "invalid"}},
 	})
@@ -478,7 +478,7 @@ func TestCreateRulesBulk_MonitorNotFound(t *testing.T) {
 	srv := testServer(t, st)
 	defer srv.Close()
 
-	res := postJSON(t, srv.URL+"/monitors/999/rules/bulk", []map[string]any{
+	res := postJSONReq(t, srv.URL+"/monitors/999/rules/bulk", []map[string]any{
 		{"type": "event_emitted", "params": map[string]any{"event_name": "transfer"}},
 	})
 	require.Equal(t, http.StatusNotFound, res.StatusCode)
@@ -508,7 +508,7 @@ func TestCreateRule_AllRegisteredTypes(t *testing.T) {
 			defer srv.Close()
 
 			params := validParamsForType(t, ruleType)
-			res := postJSON(t, srv.URL+"/monitors/1/rules", map[string]any{
+			res := postJSONReq(t, srv.URL+"/monitors/1/rules", map[string]any{
 				"type":   ruleType,
 				"params": params,
 			})
