@@ -271,10 +271,10 @@ func TestWiring_ComponentConstructionFailureIsReturned(t *testing.T) {
 	}
 }
 
-// fakeHealthChecker is a minimal HealthChecker for testing.
-type fakeHealthChecker struct{}
+// testHealthChecker is a minimal HealthChecker for testing.
+type testHealthChecker struct{}
 
-func (fakeHealthChecker) GetHealth(context.Context) (*stellar.Health, error) { return nil, nil }
+func (testHealthChecker) GetHealth(context.Context) (*stellar.Health, error) { return nil, nil }
 
 // buildWiring constructs the core components from config. It is a minimal,
 // additive extraction of the wiring logic from run() so tests can assert that
@@ -290,7 +290,7 @@ func buildWiring(ctx context.Context, cfg config.Config, log *slog.Logger) (*wir
 	p := poller.New(nil, st, reg, nil, cfg.PollInterval, log)
 
 	// API server
-	apiSrv := api.New(st, reg, factory, &fakeHealthChecker{}, log).
+	apiSrv := api.New(st, reg, factory, &testHealthChecker{}, log).
 		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes).
 		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
 		WithRateLimit(api.RateLimitConfig{
