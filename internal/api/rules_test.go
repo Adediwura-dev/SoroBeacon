@@ -484,24 +484,7 @@ func TestCreateRulesBulk_MonitorNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, res.StatusCode)
 }
 
-// Test rule types that are registered
-func TestCreateRule_AllRegisteredTypes(t *testing.T) {
-	registeredTypes := []string{
-		rules.TypeEventEmitted,
-		rules.TypeValueThreshold,
-		rules.TypeContractAllowlist,
-		rules.TypeEventNameGlob,
-		rules.TypeNumericRange,
-		rules.TypeTokenSupplyChange,
-		rules.TypeFrequencyThreshold,
-		rules.TypeTopicRegex,
-		rules.TypeAddressWatchlist,
-		rules.TypeTopicPosition,
-		rules.TypeComposite,
-		rules.TypeAbsenceOfEvent,
-	}
-
-	// TestCreateRule_AllRegisteredTypes tests that all registered rule types can be created
+// TestCreateRule_AllRegisteredTypes tests that all registered rule types can be created
 // with valid params. Some types (contract_allowlist, address_watchlist) require
 // valid strkeys and are tested separately.
 func TestCreateRule_AllRegisteredTypes(t *testing.T) {
