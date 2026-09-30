@@ -58,6 +58,34 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 	return nil
 }
 
+func (f *fakeDispatchStore) CreateDeadLetter(_ context.Context, _ *store.DeadLetter) error {
+	return nil
+}
+
+func (f *fakeDispatchStore) GetDeadLetter(_ context.Context, _ int64) (*store.DeadLetter, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeDispatchStore) ListDeadLetters(_ context.Context, _ store.DeadLetterFilter) ([]store.DeadLetter, error) {
+	return nil, nil
+}
+
+func (f *fakeDispatchStore) DeleteDeadLetter(_ context.Context, _ int64) error {
+	return nil
+}
+
+func (f *fakeDispatchStore) GetAlert(_ context.Context, _ int64) (*store.Alert, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeDispatchStore) GetChannel(_ context.Context, _ int64) (*store.Channel, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeDispatchStore) ListDeliveryAttempts(_ context.Context, _ int64, _ string) ([]store.DeliveryAttempt, error) {
+	return nil, nil
+}
+
 func (f *fakeDispatchStore) ActiveMaintenanceWindow(_ context.Context, _ int64, _ string, _ time.Time) (*store.MaintenanceWindow, error) {
 	return f.window, nil
 }

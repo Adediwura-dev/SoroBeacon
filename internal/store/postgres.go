@@ -917,6 +917,67 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 	return pgx.CollectRows(rows, scanAlert)
 }
 
+// CreateDeadLetter records a delivery that exhausted its retry budget.
+func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO dead_letters (alert_id, channel_id, last_error, attempt_count, last_status)
+		 VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
+	).Scan(&d.ID, &d.CreatedAt)
+}
+
+// GetDeadLetter returns one dead-letter record by id.
+func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
+	var d DeadLetter
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		 FROM dead_letters WHERE id = $1`, id,
+	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &d, nil
+}
+
+// ListDeadLetters returns dead-letter records in id order, applying the
+// optional channel, alert, and pagination filters.
+func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.ChannelID != 0 {
+		q += ` AND channel_id = ` + arg(f.ChannelID)
+	}
+	if f.AlertID != 0 {
+		q += ` AND alert_id = ` + arg(f.AlertID)
+	}
+	if f.AfterID != 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	q += ` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
+		var d DeadLetter
+		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+		return d, err
+	})
+}
+
+// DeleteDeadLetter removes a dead-letter record after a successful redrive.
+func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "dead_letters", id)
+}
+
 // buildAlertQuery builds the ListAlerts statement and its arguments. Both
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.

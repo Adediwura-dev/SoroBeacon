@@ -327,6 +327,24 @@ func (m *Metrics) SetDeadLetters(count int) {
 	m.deadLetters.Set(float64(count))
 }
 
+// RecordDeadLetter increments the number of dead letters awaiting review.
+func (m *Metrics) RecordDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Inc()
+}
+
+// ClearDeadLetter decrements the number of dead letters after a successful
+// redrive. Prometheus gauges clamp naturally at the store's authoritative
+// value when the next SetDeadLetters refresh runs.
+func (m *Metrics) ClearDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Dec()
+}
+
 // RecordThrottle counts one throttled delivery per channel type.
 func (m *Metrics) RecordThrottle(channelType string) {
 	if m == nil {

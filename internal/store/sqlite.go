@@ -1010,6 +1010,86 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	return &a, nil
 }
 
+// CreateDeadLetter records a delivery that exhausted its retry budget.
+func (s *SQLite) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
+	var created string
+	err := s.db.QueryRowContext(ctx,
+		`INSERT INTO dead_letters (alert_id, channel_id, last_error, attempt_count, last_status)
+		 VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
+		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
+	).Scan(&d.ID, &created)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	d.CreatedAt, err = parseSQLiteTime(created)
+	return err
+}
+
+// GetDeadLetter returns one dead-letter record by id.
+func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
+	var d DeadLetter
+	var created string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		 FROM dead_letters WHERE id = ?`, id,
+	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	d.CreatedAt, err = parseSQLiteTime(created)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// ListDeadLetters returns dead-letter records in id order, applying the
+// optional channel, alert, and pagination filters.
+func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE 1 = 1`
+	args := []any{}
+	if f.ChannelID != 0 {
+		q += ` AND channel_id = ?`
+		args = append(args, f.ChannelID)
+	}
+	if f.AlertID != 0 {
+		q += ` AND alert_id = ?`
+		args = append(args, f.AlertID)
+	}
+	if f.AfterID != 0 {
+		q += ` AND id > ?`
+		args = append(args, f.AfterID)
+	}
+	q += ` ORDER BY id ASC LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DeadLetter
+	for rows.Next() {
+		var d DeadLetter
+		var created string
+		if err := rows.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created); err != nil {
+			return nil, err
+		}
+		d.CreatedAt, err = parseSQLiteTime(created)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteDeadLetter removes a dead-letter record after a successful redrive.
+func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
+	return s.deleteByID(ctx, "dead_letters", id)
+}
+
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason FROM alerts WHERE 1 = 1`
 	args := []any{}

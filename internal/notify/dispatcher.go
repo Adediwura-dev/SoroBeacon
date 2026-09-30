@@ -589,6 +589,8 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 	d.record(ctx, alert.ID, ch.ID, "success", "")
 	if err := d.store.DeleteDeadLetter(ctx, deadLetterID); err != nil {
 		d.log.Error("delete dead letter after successful redrive", "dead_letter_id", deadLetterID, "err", err)
+	} else if d.metrics != nil {
+		d.metrics.ClearDeadLetter()
 	}
 	return nil
 }

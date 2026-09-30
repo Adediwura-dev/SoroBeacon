@@ -309,7 +309,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	r.Get("/alerts/{id}", s.alertDetail)
 
-	r.Get("/dead-letters", s.deadLetters)
+	r.Get("/dead-letters", s.listDeadLetters)
 	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
 
 	r.Get("/maintenance", s.maintenance)

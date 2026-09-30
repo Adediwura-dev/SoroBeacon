@@ -114,7 +114,9 @@ func (s *Server) redriveDeadLetter(w http.ResponseWriter, r *http.Request) {
 	snippet := ""
 	if err != nil {
 		attemptStatus = store.DeliveryStatusFailed
-		snippet = sanitizeDeliveryError(err).Error()
+		// Keep transport details out of the API response; notifier errors may
+		// contain credentials or webhook URLs.
+		snippet = "delivery failed"
 	}
 
 	_ = s.store.RecordDeliveryAttempt(ctx, &store.DeliveryAttempt{

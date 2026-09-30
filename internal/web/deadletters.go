@@ -3,7 +3,6 @@ package web
 import (
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/sorotrail/sorobeacon/internal/notify"
@@ -37,7 +36,9 @@ func (s *Server) listDeadLetters(w http.ResponseWriter, r *http.Request) {
 
 	letters, err := s.store.ListDeadLetters(r.Context(), filter)
 	if err != nil {
-		s.renderError(w, r, http.StatusInternalServerError, err.Error())
+		s.renderStatus(w, r, http.StatusInternalServerError, "error", map[string]any{
+			"Title": "Error", "Heading": "Something went wrong", "Message": "internal error",
+		})
 		return
 	}
 
@@ -68,43 +69,35 @@ func (s *Server) listDeadLetters(w http.ResponseWriter, r *http.Request) {
 func (s *Server) redriveDeadLetter(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
-		s.renderError(w, r, http.StatusBadRequest, "malformed dead letter id")
+		s.renderStatus(w, r, http.StatusBadRequest, "error", map[string]any{
+			"Title": "Bad request", "Heading": "Bad request", "Message": "malformed dead letter id",
+		})
 		return
 	}
 
 	dl, err := s.store.GetDeadLetter(r.Context(), id)
 	if err != nil {
-		s.renderError(w, r, http.StatusNotFound, "dead letter not found")
+		s.renderStatus(w, r, http.StatusNotFound, "error", map[string]any{
+			"Title": "Not found", "Heading": "Not found", "Message": "dead letter not found",
+		})
 		return
 	}
 
-	alert, err := s.store.GetAlert(r.Context(), dl.AlertID)
+	_, err = s.store.GetAlert(r.Context(), dl.AlertID)
 	if err != nil {
-		s.renderError(w, r, http.StatusNotFound, "alert not found")
-		return
-	}
-
-	ch, err := s.store.GetChannel(r.Context(), dl.ChannelID)
-	if err != nil {
-		s.renderError(w, r, http.StatusNotFound, "channel not found")
+		s.renderStatus(w, r, http.StatusNotFound, "error", map[string]any{
+			"Title": "Not found", "Heading": "Not found", "Message": "alert not found",
+		})
 		return
 	}
 
 	dispatcher := notify.NewDispatcher(s.store, s.factory, s.log)
-	notifyAlert := notifyAlertFromStore(r.Context(), s.store, *alert)
-
-	attempts, _ := s.store.ListDeliveryAttempts(r.Context(), alert.ID, "")
-	var lastTry time.Time
-	for _, att := range attempts {
-		if att.ChannelID == ch.ID && att.AttemptedAt.After(lastTry) {
-			lastTry = att.AttemptedAt
-		}
+	if err := dispatcher.RedriveDeadLetter(r.Context(), dl.ID, *dl); err != nil {
+		s.renderStatus(w, r, http.StatusBadGateway, "error", map[string]any{
+			"Title": "Redrive failed", "Heading": "Redrive failed", "Message": "delivery could not be redriven",
+		})
+		return
 	}
-
-	ctx := r.Context()
-	dispatcher.Dispatch(ctx, notifyAlert)
-
-	_ = s.store.DeleteDeadLetter(ctx, dl.ID)
 
 	http.Redirect(w, r, "/dead-letters", http.StatusSeeOther)
 }
