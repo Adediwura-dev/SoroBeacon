@@ -556,7 +556,6 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			// Shutting down mid-delivery, or the breaker tripped: the channel
 			// is not at fault for either, so this outcome leaves no mark on
 			// its health.
->>>>>>> upstream/main
 			return
 		}
 		select {
