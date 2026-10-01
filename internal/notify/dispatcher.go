@@ -40,9 +40,12 @@ const DefaultDigestFlushInterval = 30 * time.Second
 // enough that a real "the webhook is fixed, try again" is not blocked.
 const DefaultRetryCooldown = 30 * time.Second
 
-// DispatchStore is the slice of the store the dispatcher needs.
+// DispatchStore is everything the dispatcher needs: channel lookup and
+// delivery bookkeeping, plus the escalation policy and per-alert scheduling
+// state that keeps a tiered notification going across restarts.
 type DispatchStore interface {
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]store.Channel, error)
+	ListChannelsByIDs(ctx context.Context, ids []int64) ([]store.Channel, error)
 	RecordDeliveryAttempt(ctx context.Context, d *store.DeliveryAttempt) error
 	CreateDeadLetter(ctx context.Context, d *store.DeadLetter) error
 	GetAlert(ctx context.Context, id int64) (*store.Alert, error)
@@ -64,6 +67,13 @@ type DispatchStore interface {
 	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*store.MaintenanceWindow, error)
 	// SetAlertSuppressed records why an alert was not delivered.
 	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
+	RecordChannelHealth(ctx context.Context, channelID int64, u store.ChannelHealthUpdate) error
+	GetEscalationPolicyForMonitor(ctx context.Context, monitorID int64) (*store.EscalationPolicy, error)
+	GetEscalationPolicy(ctx context.Context, policyID int64) (*store.EscalationPolicy, error)
+	ScheduleEscalation(ctx context.Context, alertID, policyID int64, snapshot json.RawMessage, nextStep int, nextDue time.Time) error
+	DueEscalations(ctx context.Context, now time.Time, limit int) ([]store.EscalationRun, error)
+	AdvanceEscalation(ctx context.Context, alertID int64, nextStep int, nextDue time.Time) error
+	CompleteEscalation(ctx context.Context, alertID int64) error
 }
 
 // Dispatcher fans an alert out to its monitor's channels, retrying each
@@ -91,6 +101,17 @@ type Dispatcher struct {
 	// "window" accumulate alerts here and a summary is flushed once the
 	// window elapses.
 	digest store.DigestQueue
+	// disableAfterFailures is how many consecutive permanent failures
+	// auto-disable a channel. Zero — the default — never auto-disables:
+	// silently switching off someone's alerting because a webhook 404'd
+	// during an outage is a worse failure than the one it would fix, so an
+	// operator has to opt in with CHANNEL_DISABLE_AFTER_FAILURES.
+	disableAfterFailures int
+	// EscalationInterval is how often RunEscalations looks for due steps
+	// (default DefaultEscalationInterval). EscalationBatch bounds how many
+	// due escalations one pass processes.
+	EscalationInterval time.Duration
+	EscalationBatch    int
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
@@ -104,14 +125,31 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		"webhook":   5.0,
 	}
 	return &Dispatcher{
-		store:       s,
-		factory:     f,
-		log:         log,
-		registry:    NewBreakerRegistry(3, 30*time.Second),
-		MaxAttempts: 3,
-		BaseBackoff: time.Second,
-		rateLimiter: NewChannelRateLimiter(defaults),
+		store:              s,
+		factory:            f,
+		log:                log,
+		registry:           NewBreakerRegistry(3, 30*time.Second),
+		MaxAttempts:        3,
+		BaseBackoff:        time.Second,
+		rateLimiter:        NewChannelRateLimiter(defaults),
+		EscalationInterval: DefaultEscalationInterval,
+		EscalationBatch:    DefaultEscalationBatch,
 	}
+}
+
+// WithDisableAfterFailures sets how many consecutive permanent failures
+// auto-disable a channel. Non-positive values leave auto-disable off, which is
+// also the default.
+func (d *Dispatcher) WithDisableAfterFailures(n int) *Dispatcher {
+	if n > 0 {
+		d.disableAfterFailures = n
+	}
+	return d
+}
+
+// DisableAfterFailures returns the configured threshold. Exposed for tests.
+func (d *Dispatcher) DisableAfterFailures() int {
+	return d.disableAfterFailures
 }
 
 // WithMetrics attaches delivery instrumentation.
@@ -139,14 +177,19 @@ func digestEnabled(ch store.Channel) bool {
 	return ch.DigestMode == store.DigestModeWindow && ch.DigestWindowSeconds > 0
 }
 
-// Dispatch delivers one alert to every enabled channel attached to its
-// monitor. Channel failures are recorded and logged, never fatal: one bad
-// channel must not block the others or the poller.
+// Dispatch delivers one alert. Channel failures are recorded and logged,
+// never fatal: one bad channel must not block the others or the poller.
 //
 // Before delivering, the dispatcher consults the inhibition rules targeting
 // the alert's rule. An inhibited alert is recorded (MarkAlertInhibited, so
 // the dashboard can show why nothing was sent) and not delivered — but the
 // alert row itself is always kept.
+//
+// What happens after those checks depends on the monitor: one with no
+// escalation policy keeps the flat fan-out to every enabled channel, one
+// with a policy starts the tiered escalation instead. The suppression checks
+// come first either way, so a silenced alert never starts an escalation that
+// would page on its next step.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	if d.inhibited(ctx, a) {
 		return
@@ -157,6 +200,24 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	if d.suppressed(ctx, a) {
 		return
 	}
+
+	policy, err := d.store.GetEscalationPolicyForMonitor(ctx, a.MonitorID)
+	switch {
+	case errors.Is(err, store.ErrNotFound) || (err == nil && len(policy.Steps) == 0):
+		d.dispatchFlat(ctx, a)
+	case err != nil:
+		// A store hiccup must not swallow the alert, so fall back to the flat
+		// fan-out: a notification that is not escalated still beats silence.
+		d.log.Error("load escalation policy", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
+		d.dispatchFlat(ctx, a)
+	default:
+		d.startEscalation(ctx, a, policy)
+	}
+}
+
+// dispatchFlat is the pre-escalation behaviour: deliver to every enabled
+// channel attached to the monitor.
+func (d *Dispatcher) dispatchFlat(ctx context.Context, a Alert) {
 	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
 	if err != nil {
 		d.log.Error("list channels for alert", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
@@ -400,10 +461,14 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		// Bad config: record one failed attempt, no point retrying. The
-		// error is sanitized before it reaches the stored snippet, the log
-		// or the span, because a config error can quote the config.
+		// error is sanitized before it reaches the stored snippet, the log,
+		// the span or the channel's last_error, because a config error can
+		// quote the config. A channel whose config no longer builds a
+		// notifier will never deliver again until an operator edits it, so
+		// it counts as a permanent failure.
 		safeErr := sanitizeDeliveryError(err)
 		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
+		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: safeErr.Error(), Permanent: true})
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", safeErr)
 		telemetry.RecordError(span, safeErr)
 		cb.RecordFailure()
@@ -415,6 +480,8 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 
 	backoff := d.BaseBackoff
 	timeout := ch.TimeoutDuration()
+	var lastErr error
+	permanent := false
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		err = d.sendWithRecovery(attemptCtx, a, ch, notifier)
@@ -428,6 +495,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 				d.metrics.RecordDelivery(ch.Type, true)
 			}
 			d.record(ctx, a.ID, ch.ID, "success", "")
+			d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Success: true})
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
 			return
 		}
@@ -449,6 +517,15 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", safeErr)
 		telemetry.RecordError(span, safeErr)
 
+		// One delivery is several attempts, and health counts deliveries: a
+		// threshold of 3 must not park a channel because one alert was
+		// retried three times. The delivery is permanent if any attempt said
+		// so, because a revoked credential followed by an unrelated 5xx is
+		// still a revoked credential. The message stored is the sanitized
+		// one — last_error is read back by the dashboard.
+		lastErr = safeErr
+		permanent = permanent || IsPermanent(err)
+
 		// Honor Retry-After if present in error message or headers
 		if errStr := err.Error(); strings.Contains(errStr, "Retry-After") || strings.Contains(errStr, "429") {
 			if d.metrics != nil {
@@ -456,7 +533,8 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			}
 		}
 
-		if attempt >= d.MaxAttempts || ctx.Err() != nil || cb.State() == StateOpen {
+		if attempt >= d.MaxAttempts {
+			d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: lastErr.Error(), Permanent: permanent})
 			lastStatus := 0
 			if statusErr, ok := err.(*StatusError); ok {
 				lastStatus = statusErr.Code
@@ -473,6 +551,12 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			} else if d.metrics != nil {
 				d.metrics.RecordDeadLetter()
 			}
+		}
+		if ctx.Err() != nil || cb.State() == StateOpen {
+			// Shutting down mid-delivery, or the breaker tripped: the channel
+			// is not at fault for either, so this outcome leaves no mark on
+			// its health.
+>>>>>>> upstream/main
 			return
 		}
 		select {
@@ -512,6 +596,21 @@ func sanitizeDeliveryError(err error) error {
 func redactSecretText(s string) string {
 	secretPattern := regexp.MustCompile(`(?i)\b(?:token|secret|password|passwd|api[_-]?key|auth[_-]?token|access[_-]?token|bearer)\b(?:\s*[:=]\s*|\s+)[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+`)
 	return secretPattern.ReplaceAllString(s, "[redacted]")
+}
+
+// recordHealth folds one delivery outcome into the channel's health, which is
+// what lets a channel say it is broken without an operator reading delivery
+// attempts one alert at a time — and what takes a channel out of rotation once
+// its failures are conclusive.
+//
+// A store error is logged and swallowed: health is derived state, and failing
+// a delivery over a bookkeeping write would turn a reporting problem into a
+// delivery problem.
+func (d *Dispatcher) recordHealth(ctx context.Context, channelID int64, u store.ChannelHealthUpdate) {
+	u.DisableAfter = d.disableAfterFailures
+	if err := d.store.RecordChannelHealth(ctx, channelID, u); err != nil {
+		d.log.Error("record channel health", "channel_id", channelID, "err", err)
+	}
 }
 
 func (d *Dispatcher) record(ctx context.Context, alertID, channelID int64, status, snippet string) *store.DeliveryAttempt {
@@ -657,6 +756,7 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
+		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: err.Error(), Permanent: true})
 		return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 	}
 	timeout := ch.TimeoutDuration()
@@ -667,6 +767,7 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, true)
 		}
+		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Success: true})
 		d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry")
 		return d.record(ctx, a.ID, ch.ID, "success", "")
 	}
@@ -674,5 +775,9 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 		d.metrics.RecordDelivery(ch.Type, false)
 	}
 	d.log.Warn("alert delivery failed", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry", "err", err)
+	// A manual retry is a real delivery outcome, so it counts: an operator who
+	// fixes a channel and re-sends the alert should see the channel recover,
+	// and one that still fails should see the count continue to climb.
+	d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: err.Error(), Permanent: IsPermanent(err)})
 	return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 }

@@ -128,6 +128,10 @@ config:
   # Ledger lag at which /readyz fails. 0 disables the check, so a lagging
   # poller cannot take itself out of a load balancer without opting in.
   readyzLagThreshold: 0
+  # Consecutive permanent channel failures (401/403/404) after which a
+  # channel is taken out of rotation. 0 never auto-disables, which is the
+  # behaviour every release before channel health had.
+  channelDisableAfterFailures: 0
   # Per-client API token-bucket refill rate. 0 disables the limiter. Health
   # and readiness probes are always exempt.
   rateLimitRps: 0

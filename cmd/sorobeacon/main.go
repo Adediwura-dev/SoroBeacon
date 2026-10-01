@@ -263,7 +263,14 @@ func run() error {
 	if resolver := buildSecretResolver(cfg, log); resolver != nil {
 		factory.WithSecrets(resolver)
 	}
-	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m).WithDigestQueue(st)
+	// Channel health: delivery outcomes are folded into each channel so a
+	// revoked token surfaces as a broken channel instead of as silence. The
+	// threshold is off unless the operator sets it — auto-disabling a channel
+	// is a destructive answer to a temporary problem.
+	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithMetrics(m).
+		WithDigestQueue(st).
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
 		return err
@@ -391,6 +398,11 @@ func run() error {
 			go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
 		}
 		go dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
+		// Escalation steps are driven by their persisted next-due time, so
+		// this loop is also what resumes an escalation that was mid-flight at
+		// restart. Leader-gated for the same reason as the digest flusher:
+		// two instances stepping the same alert would page twice.
+		go dispatcher.RunEscalations(ctx)
 		p.Run(ctx)
 	}
 	leaderDone := make(chan struct{})
@@ -481,6 +493,29 @@ func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poll
 		decoder := stellar.NewSpecDecoder(stellar.DefaultDecoder{}, stellar.NewRPCSpecSource(rpc), log)
 		return poller.NewRPCSource(rpc, decoder), rpc, nil
 	}
+}
+
+// wiring holds the constructed components so tests can assert that config
+// values reach their destinations without starting servers or opening
+// databases.
+type wiring struct {
+	poller          *poller.Poller
+	apiSrv          *api.Server
+	webSrv          *web.Server
+	dispatcher      *notify.Dispatcher
+	httpAddr        string
+	readyzThreshold uint32
+	rateLimit       api.RateLimitConfig
+	maxBodyBytes    int64
+	silentAfter     time.Duration
+	reorgWindow     uint32
+	reorgDepth      uint32
+}
+
+// runBackfill implements `sorobeacon backfill`: an opt-in historical replay of
+
+type fakeStore struct {
+	store.Store
 }
 
 // runBackfill implements `sorobeacon backfill`: an opt-in historical replay of

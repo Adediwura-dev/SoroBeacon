@@ -107,6 +107,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `RATE_LIMIT_RPS` | `0` (off)                             | Per-client API requests per second           |
 | `RATE_LIMIT_BURST` | `ceil(RPS)` when enabled            | Per-client token-bucket size                 |
 | `RATE_LIMIT_TRUST_FORWARDED` | `false`                  | Key clients by `X-Forwarded-For` (proxy only) |
+| `CHANNEL_DISABLE_AFTER_FAILURES` | `0` (never)         | Consecutive permanent channel failures before auto-disable |
 
 ### Networks
 
@@ -165,6 +166,10 @@ implementing two methods. See
 
 `/metrics` serves Prometheus instrumentation: poll outcomes and duration,
 poll lag behind the chain tip, seconds since the last poll, the
+events-scanned → rule-evaluations → events-matched → alerts-fired funnel,
+deliveries by channel and outcome, and HTTP request duration by route
+pattern. The [metrics reference](docs/reference/metrics.md) lists every
+metric with its labels, meaning and cardinality rules.
 events-scanned → events-matched → alerts-fired funnel, deliveries by
 channel and outcome, and HTTP request duration by route pattern.
 `/api/v1/livez` and `/api/v1/readyz` are orchestration probes (liveness
@@ -207,6 +212,18 @@ Channel secrets (webhook URLs, bot tokens, SMTP credentials) live in each
 channel's `config` JSON in the database. They are never logged and never
 returned by the API. Set `CONFIG_ENCRYPTION_KEY` to encrypt them at rest;
 see the [configuration guide](docs/getting-started/configuration.md#encrypting-channel-config-at-rest).
+
+Every delivery folds its outcome into the channel, so a channel that has
+stopped working says so instead of going quiet — `GET /api/v1/channels`
+carries the consecutive failure count, the last error and the last success,
+and an auto-disabled channel is flagged on the dashboard with the error that
+parked it. Failures are split into permanent (`401`/`403`/`404`, a revoked
+token) and transient (`5xx`, timeouts), because only the permanent kind can
+tell you a channel will never recover on its own. Set
+`CHANNEL_DISABLE_AFTER_FAILURES` to park a channel automatically after that
+many permanent failures; it is **off by default**, and re-enabling is an
+explicit `PATCH {"enabled": true}`. See the
+[channel health reference](docs/configuration.md#channel-health).
 
 > ⚠️ With `API_TOKEN` unset the API and dashboard are **unauthenticated**.
 > Set it to require `Authorization: Bearer <token>` on `/api/v1` and a
@@ -285,7 +302,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Five rule types ship:
+The built-in rule types:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -331,6 +348,8 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   "params": {
     "event": "transfer",
     "from": "GDW6...SENDER",	"min_amount": "1000000000"
+    "from": "GDW6...SENDER",
+    "min_amount": "1000000000"
   }
 }'
 ```
@@ -458,6 +477,25 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 See [docs/rules/topic-position.md](docs/rules/topic-position.md).
+
+**`absence_of_event`** — the inverse of `event_emitted`: fire when the event
+*stops* arriving. `window` is how long silence is tolerated. It is the one
+rule type driven by a timer rather than by an arriving event, so it is what
+catches a contract that has gone quiet. Each silence alerts once, not once
+per poll, and the clock lives in the database, so a restart cannot swallow a
+real outage:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "absence_of_event",
+  "params": {
+    "event_name": "heartbeat",
+    "window": "30m"
+  }
+}'
+```
+
+See [docs/rules/absence-of-event.md](docs/rules/absence-of-event.md).
 
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
@@ -666,6 +704,17 @@ internal/apiclient  HTTP client for the API, shared by the CLI
 running instance only through `internal/apiclient`, so the CLI and the API
 cannot drift apart.
 
+cmd/sorobeacon      wiring + graceful shutdown
+internal/config     env config
+internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
+internal/store      Postgres (pgx) and SQLite backends + embedded
+                    golang-migrate migrations (parallel sets)
+internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
+                    token_event, frequency_threshold
+internal/notify     Notifier interface + 7 channels + retrying dispatcher
+internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
+internal/api        chi JSON API
+internal/web        html/template + htmx dashboard
 ```
 
 ### Adding a notification channel
@@ -717,4 +766,3 @@ Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/cha
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
-

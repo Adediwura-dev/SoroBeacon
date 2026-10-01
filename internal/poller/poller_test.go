@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -90,6 +95,10 @@ type fakeStore struct {
 	groupStates map[string]int64
 	// inhibitions backs the inhibition rules for the DispatchStore interface.
 	inhibitions []store.Inhibition
+	// absence holds the absence rules' last-seen clocks, keyed like the
+	// table's primary key. It lives on the store, not the poller, so a test
+	// can throw the poller away and prove the clock survived "a restart".
+	absence map[string]time.Time
 }
 
 func newFakeStore() *fakeStore {
@@ -103,6 +112,7 @@ func newFakeStore() *fakeStore {
 		ledgerHashes: map[uint32]string{},
 		groupStates:  map[string]int64{},
 		inhibitions:  []store.Inhibition{},
+		absence:      map[string]time.Time{},
 	}
 }
 
@@ -118,6 +128,39 @@ func (f *fakeStore) ListChannelsForMonitor(_ context.Context, monitorID int64) (
 		}
 	}
 	return out, nil
+}
+
+func absenceKey(ruleID int64, eventName string) string {
+	return fmt.Sprintf("%d/%s", ruleID, eventName)
+}
+
+func (f *fakeStore) ListAbsenceState(context.Context) ([]store.AbsenceState, error) {
+	out := make([]store.AbsenceState, 0, len(f.absence))
+	for key, at := range f.absence {
+		// The key is "<ruleID>/<eventName>", and only the rule id can contain
+		// no "/", so splitting at the first one splits the rule id off the
+		// event name even when the name itself contains one.
+		ruleID, eventName, ok := strings.Cut(key, "/")
+		if !ok {
+			return nil, fmt.Errorf("malformed absence key %q", key)
+		}
+		id, err := strconv.ParseInt(ruleID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("absent rule id in absence key %q: %w", key, err)
+		}
+		out = append(out, store.AbsenceState{RuleID: id, EventName: eventName, LastSeen: at})
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RecordAbsenceSeen(_ context.Context, ruleID int64, eventName string, at time.Time) error {
+	key := absenceKey(ruleID, eventName)
+	// Monotonic, like the SQL GREATEST: an older instant is a no-op.
+	if prev, ok := f.absence[key]; ok && prev.After(at.UTC()) {
+		return nil
+	}
+	f.absence[key] = at.UTC()
+	return nil
 }
 
 func (f *fakeStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
@@ -838,3 +881,92 @@ func (f *fakeStore) ActiveMaintenanceWindow(context.Context, int64, string, time
 func (f *fakeStore) SetAlertSuppressed(context.Context, int64, string) error {
 	return nil
 }
+
+// TestRecordCycleCountsRuleEvaluations pins the scanned -> evaluated ->
+// matched funnel. Three events are checked against one rule, so the
+// evaluation count is three while only the two transfers match: a monitor
+// with many rules and a busy contract are then distinguishable on the
+// endpoint, which is the whole reason the counter is separate from
+// sorobeacon_events_scanned_total.
+func TestRecordCycleCountsRuleEvaluations(t *testing.T) {
+	m := metrics.New()
+	rpc := &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
+		Events: []stellar.Event{
+			transferEvent("ev-1", 5990, "1"),
+			transferEvent("ev-2", 5991, "1"),
+			{
+				ID: "ev-3", ContractID: contractA, Ledger: 5992, Type: "contract",
+				LedgerClosedAt: time.Unix(1_700_000_000, 0).UTC(),
+				TopicJSON:      []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)},
+			},
+		},
+		LatestLedger: 6000,
+	}}}
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	p := newTestPoller(rpc, st, &fakeDispatcher{}).WithMetrics(m)
+
+	require.NoError(t, p.Poll(context.Background()))
+	// Run is the timing loop plus this recording step; call it directly so
+	// the assertion does not depend on sleeping.
+	p.recordCycle(true, 0)
+
+	body := scrapeMetrics(t, m)
+	assert.Contains(t, body, "sorobeacon_events_scanned_total 3")
+	assert.Contains(t, body, "sorobeacon_events_matched_total 2")
+	assert.Contains(t, body, "sorobeacon_rule_evaluations_total 3")
+}
+
+// scrapeMetrics renders the metrics endpoint into text.
+func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
+}
+
+// RecordChannelHealth satisfies the health half of notify.DispatchStore. The
+// poller tests assert on deliveries, not on channel health, so the outcome is
+// accepted and dropped.
+func (f *fakeStore) RecordChannelHealth(context.Context, int64, store.ChannelHealthUpdate) error {
+	return nil
+}
+
+// The escalation half of notify.DispatchStore. The poller tests attach no
+// escalation policy, so every monitor takes the flat fan-out and the
+// scheduling calls are inert.
+func (f *fakeStore) ListChannelsByIDs(_ context.Context, ids []int64) ([]store.Channel, error) {
+	wanted := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	var out []store.Channel
+	for _, ch := range f.channels {
+		if wanted[ch.ID] && ch.Enabled {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) GetEscalationPolicyForMonitor(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) GetEscalationPolicy(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) ScheduleEscalation(context.Context, int64, int64, json.RawMessage, int, time.Time) error {
+	return nil
+}
+
+func (f *fakeStore) DueEscalations(context.Context, time.Time, int) ([]store.EscalationRun, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) AdvanceEscalation(context.Context, int64, int, time.Time) error { return nil }
+
+func (f *fakeStore) CompleteEscalation(context.Context, int64) error { return nil }

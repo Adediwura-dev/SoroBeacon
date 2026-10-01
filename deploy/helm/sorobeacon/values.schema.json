@@ -192,6 +192,11 @@
           "minimum": 0,
           "description": "Ledger lag at which /readyz fails. 0 disables the check."
         },
+        "channelDisableAfterFailures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Consecutive permanent channel failures after which a channel is auto-disabled. 0 never auto-disables."
+        },
         "rateLimitRps": {
           "type": "number",
           "minimum": 0,

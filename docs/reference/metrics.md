@@ -34,6 +34,7 @@ host is shared.
 | `sorobeacon_seconds_since_last_poll` | gauge | — | between `0` and `POLL_INTERVAL` (≈5 by default) |
 | `sorobeacon_events_scanned_total` | counter | — | grows when watched contracts emit; `0` is fine on a quiet chain |
 | `sorobeacon_events_matched_total` | counter | — | grows when rules match, never above scanned |
+| `sorobeacon_rule_evaluations_total` | counter | — | one per event x enabled rule; rises with rules per monitor, not just traffic |
 | `sorobeacon_alerts_fired_total` | counter | — | grows when alerts are created; can lag matched (dedup and cooldown suppress) |
 | `sorobeacon_alert_deliveries_total` | counter | `channel`, `outcome` (`ok`\|`error`) | `outcome="error"` stays a small share per channel type |
 | `sorobeacon_http_request_duration_seconds` | histogram | `route`, `method`, `status` | request times at millisecond scale |
