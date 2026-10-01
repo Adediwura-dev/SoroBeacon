@@ -548,6 +548,29 @@ func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poll
 	}
 }
 
+// wiring holds the constructed components so tests can assert that config
+// values reach their destinations without starting servers or opening
+// databases.
+type wiring struct {
+	poller          *poller.Poller
+	apiSrv          *api.Server
+	webSrv          *web.Server
+	dispatcher      *notify.Dispatcher
+	httpAddr        string
+	readyzThreshold uint32
+	rateLimit       api.RateLimitConfig
+	maxBodyBytes    int64
+	silentAfter     time.Duration
+	reorgWindow     uint32
+	reorgDepth      uint32
+}
+
+// runBackfill implements `sorobeacon backfill`: an opt-in historical replay of
+
+type fakeStore struct {
+	store.Store
+}
+
 // runBackfill implements `sorobeacon backfill`: an opt-in historical replay of
 // one monitor's recent ledger history. It shares the server's config, store and
 // event source, so a replay reads exactly what live monitoring reads.

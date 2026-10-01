@@ -258,6 +258,11 @@ func (s *Server) WithSilentAfter(d time.Duration) *Server {
 	return s
 }
 
+// SilentAfter returns the configured silent-after duration. Exposed for tests.
+func (s *Server) SilentAfter() time.Duration {
+	return s.silentAfter
+}
+
 func (s *Server) monitorRow(m store.Monitor, tz string, now time.Time) monitorListRow {
 	row := monitorListRow{Monitor: m}
 	if m.LastMatchedAt == nil {

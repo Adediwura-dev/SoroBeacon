@@ -141,6 +141,11 @@ func (d *Dispatcher) WithDisableAfterFailures(n int) *Dispatcher {
 	return d
 }
 
+// DisableAfterFailures returns the configured threshold. Exposed for tests.
+func (d *Dispatcher) DisableAfterFailures() int {
+	return d.disableAfterFailures
+}
+
 // WithMetrics attaches delivery instrumentation.
 func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
 	d.metrics = m
