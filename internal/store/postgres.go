@@ -1050,11 +1050,16 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 
 // CreateDeadLetter records a delivery that exhausted its retry budget.
 func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO dead_letters (alert_id, channel_id, last_error, attempt_count, last_status)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+	// alert_created_at is read from the alert rather than passed in: the
+	// composite foreign key needs it, and taking it from the row means a
+	// caller cannot supply one that does not match. A missing alert selects
+	// no rows and comes back as ErrNotFound.
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO dead_letters (alert_id, alert_created_at, channel_id, last_error, attempt_count, last_status)
+		 SELECT a.id, a.created_at, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1
+		 RETURNING id, created_at`,
 		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
-	).Scan(&d.ID, &d.CreatedAt)
+	).Scan(&d.ID, &d.CreatedAt))
 }
 
 // GetDeadLetter returns one dead-letter record by id.

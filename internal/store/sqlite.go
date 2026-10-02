@@ -1151,10 +1151,13 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 // CreateDeadLetter records a delivery that exhausted its retry budget.
 func (s *SQLite) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	var created string
+	// alert_created_at is read from the alert rather than passed in, matching
+	// the Postgres statement, where the composite foreign key needs it.
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO dead_letters (alert_id, channel_id, last_error, attempt_count, last_status)
-		 VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
-		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
+		`INSERT INTO dead_letters (alert_id, alert_created_at, channel_id, last_error, attempt_count, last_status)
+		 SELECT a.id, a.created_at, ?, ?, ?, ? FROM alerts a WHERE a.id = ?
+		 RETURNING id, created_at`,
+		d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus, d.AlertID,
 	).Scan(&d.ID, &created)
 	if err != nil {
 		return mapSQLiteErr(err)

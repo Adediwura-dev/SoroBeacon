@@ -551,6 +551,10 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			} else if d.metrics != nil {
 				d.metrics.RecordDeadLetter()
 			}
+			// The attempt cap is the end of this delivery: without returning,
+			// the loop falls through to the backoff and keeps retrying past
+			// MaxAttempts, writing one dead letter per extra attempt.
+			return
 		}
 		if ctx.Err() != nil || cb.State() == StateOpen {
 			// Shutting down mid-delivery, or the breaker tripped: the channel
