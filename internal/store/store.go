@@ -867,6 +867,33 @@ type Alerts interface {
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
+// DeadLetter represents a permanently failed delivery attempt.
+type DeadLetter struct {
+	ID           int64     `json:"id"`
+	AlertID      int64     `json:"alert_id"`
+	ChannelID    int64     `json:"channel_id"`
+	LastError    string    `json:"last_error"`
+	AttemptCount int       `json:"attempt_count"`
+	LastStatus   int       `json:"last_status"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// DeadLetterFilter narrows ListDeadLetters.
+type DeadLetterFilter struct {
+	ChannelID int64
+	AlertID   int64
+	Limit     int
+	AfterID   int64
+}
+
+// DeadLetters persists permanently failed deliveries.
+type DeadLetters interface {
+	CreateDeadLetter(ctx context.Context, d *DeadLetter) error
+	GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error)
+	ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error)
+	DeleteDeadLetter(ctx context.Context, id int64) error
+}
+
 // MaintenanceWindows persists alert-silencing windows and marks suppressed
 // alerts. ActiveMaintenanceWindow is the one check on the delivery path.
 type MaintenanceWindows interface {
@@ -1109,6 +1136,7 @@ type Store interface {
 	Channels
 	Alerts
 	MaintenanceWindows
+	DeadLetters
 	Inhibitions
 	Ingest
 	Absence

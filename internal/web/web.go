@@ -212,7 +212,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "deadletters"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -325,6 +325,9 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	r.Get("/alerts/{id}", s.alertDetail)
+
+	r.Get("/dead-letters", s.listDeadLetters)
+	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
 
 	r.Get("/maintenance", s.maintenance)
 	r.Post("/maintenance", s.createMaintenance)
