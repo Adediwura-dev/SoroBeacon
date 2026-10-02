@@ -14,8 +14,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // PoolSettings tunes the pgx connection pool, and the read routing the
@@ -713,7 +715,12 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 // ListChannels serves the dashboard listing and the notifier's startup
 // validation, so it honours the cross-tenant system scope like ListMonitors.
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE TRUE`
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		args = append(args, ws)
+		q += ` AND workspace_id = $1`
+	}
 	if enabledOnly {
 		q += ` AND enabled`
 	}
@@ -1030,7 +1037,7 @@ func alertSort(s string) string {
 // replica exists to make. A caller that cannot tolerate it — the rules engine
 // rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q, args := buildAlertQuery(f)
+	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -1042,7 +1049,7 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 // REPLICA_DATABASE_URL says. It exists for readers that must see this
 // process's own writes — see PrimaryReader.
 func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q, args := buildAlertQuery(f)
+	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -1053,7 +1060,7 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 // buildAlertQuery builds the ListAlerts statement and its arguments. Both
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
-func buildAlertQuery(f AlertFilter) (string, []any) {
+func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason
 		 FROM alerts WHERE TRUE`
 	args := []any{}

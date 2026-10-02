@@ -53,11 +53,18 @@ const (
 type tokenEntry struct {
 	digest [sha256.Size]byte
 	role   Role
+	// workspace is the tenant this token grants access to. It is the whole
+	// point of a Binding: the credential names the workspace, so a request
+	// never can.
+	workspace workspace.ID
 }
 
 type sessionInfo struct {
 	expires time.Time
 	role    Role
+	// workspace is inherited from the token that signed in. After sign-in
+	// there is nothing else that could say which tenant a request is for.
+	workspace workspace.ID
 }
 
 type Authenticator struct {
@@ -66,6 +73,11 @@ type Authenticator struct {
 	// crypto/subtle.ConstantTimeCompare returns immediately on a length
 	// mismatch, which would otherwise leak each configured token's length.
 	tokens []tokenEntry
+
+	// scoped resolves database-backed tokens (TokenPrefix). It is optional:
+	// without it only static tokens and sessions authenticate, which is how
+	// a deployment that never created an API token keeps working.
+	scoped *Manager
 
 	tt       time.Duration
 	mu       sync.Mutex
@@ -143,8 +155,9 @@ func NewBound(bindings []Binding, ttl time.Duration) *Authenticator {
 			}
 		}
 		a.tokens = append(a.tokens, tokenEntry{
-			digest: sha256.Sum256([]byte(t)),
-			role:   role,
+			digest:    sha256.Sum256([]byte(t)),
+			role:      role,
+			workspace: b.Workspace,
 		})
 	}
 	return a
@@ -185,23 +198,45 @@ func (a *Authenticator) Verify(candidate string) bool {
 }
 
 func (a *Authenticator) verifyToken(candidate string) (Role, bool) {
-	if !a.Enabled() {
-		return RoleAdmin, false
+	entry, ok := a.lookupStatic(candidate)
+	if !ok {
+		if !a.Enabled() {
+			return RoleAdmin, false
+		}
+		return RoleUnknown, false
 	}
+	return entry.role, true
+}
+
+// lookupStatic resolves a candidate against the configured tokens, returning
+// the entry it matched so the caller gets the workspace as well as the role.
+//
+// A candidate carrying TokenPrefix is refused outright, before the table is
+// consulted: that prefix belongs to database-backed tokens, which are revoked
+// by deleting a row. Letting one match here would mean a revoked or unknown
+// scoped token could be revived by also configuring it as API_TOKEN, and the
+// revocation an operator performed would silently stop meaning anything.
+func (a *Authenticator) lookupStatic(candidate string) (tokenEntry, bool) {
+	if !a.Enabled() || strings.HasPrefix(candidate, TokenPrefix) {
+		return tokenEntry{}, false
+	}
+	// Every configured token is compared — the loop accumulates the result
+	// instead of returning early — so the time taken does not reveal how many
+	// tokens exist or which one matched.
 	got := sha256.Sum256([]byte(candidate))
-	matchedRole := RoleViewer
+	matched := tokenEntry{role: RoleViewer, workspace: workspace.Default}
 	match := 0
 	for _, entry := range a.tokens {
 		m := subtle.ConstantTimeCompare(got[:], entry.digest[:])
 		if m == 1 {
-			matchedRole = entry.role
+			matched = entry
 		}
 		match |= m
 	}
 	if match == 1 {
-		return matchedRole, true
+		return matched, true
 	}
-	return RoleUnknown, false
+	return tokenEntry{}, false
 }
 
 // Bearer extracts the token from an Authorization header value. The scheme
@@ -235,15 +270,24 @@ func Bearer(header string) (string, bool) {
 // only be killed by a restart — and a browser is the worst place to hold a
 // least-privilege secret.
 func (a *Authenticator) Login(token string) (string, bool) {
-	role, ok := a.verifyToken(token)
+	entry, ok := a.lookupStatic(token)
 	if !ok {
 		return "", false
 	}
-	return a.NewSessionWithRole(role), true
+	return a.newSessionFor(entry.role, entry.workspace), true
 }
 
-// NewSessionWithRole mints a session id associated with a specific role.
+// NewSessionWithRole mints a session id associated with a specific role. The
+// session belongs to the default workspace; Login is the path that carries a
+// token's own workspace into the session.
 func (a *Authenticator) NewSessionWithRole(role Role) string {
+	return a.newSessionFor(role, workspace.Default)
+}
+
+func (a *Authenticator) newSessionFor(role Role, ws workspace.ID) string {
+	if ws == "" {
+		ws = workspace.Default
+	}
 	buf := make([]byte, sessionIDBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return ""
@@ -253,8 +297,9 @@ func (a *Authenticator) NewSessionWithRole(role Role) string {
 	defer a.mu.Unlock()
 	a.sweepLocked(a.now())
 	a.sessions[id] = sessionInfo{
-		expires: a.now().Add(a.tt),
-		role:    role,
+		expires:   a.now().Add(a.tt),
+		role:      role,
+		workspace: ws,
 	}
 	return id
 }
@@ -321,6 +366,89 @@ func SessionID(r *http.Request) string {
 		return ""
 	}
 	return c.Value
+}
+
+// getSession returns a live session's record. It is getSessionRole plus the
+// workspace, which Principal needs and HasSession does not.
+func (a *Authenticator) getSession(id string) (sessionInfo, bool) {
+	if a == nil || id == "" {
+		return sessionInfo{}, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	info, ok := a.sessions[id]
+	if !ok {
+		return sessionInfo{}, false
+	}
+	if !a.now().Before(info.expires) {
+		delete(a.sessions, id)
+		return sessionInfo{}, false
+	}
+	return info, true
+}
+
+// WithTokens attaches the database-backed token manager, which is what makes
+// scoped tokens (TokenPrefix) authenticate. Without it only static tokens and
+// dashboard sessions do, which is the behaviour of a deployment that has never
+// minted an API token.
+func (a *Authenticator) WithTokens(m *Manager) *Authenticator {
+	if a == nil {
+		return a
+	}
+	a.scoped = m
+	return a
+}
+
+// Principal resolves a request to its caller. It is the one place that turns a
+// credential into a tenant, and it reads the credential alone — not a header,
+// not a query parameter, not the host — because a client that could name its
+// own workspace could read someone else's.
+//
+// The three credentials, in the order they are tried:
+//
+//   - A bearer token carrying TokenPrefix is a database-backed token: the
+//     manager resolves it to a restricted principal whose scopes are the whole
+//     grant. It is never compared against the static table, so revoking the row
+//     revokes the credential.
+//   - Any other bearer token is matched against the configured static tokens,
+//     and yields an unrestricted principal in that token's workspace.
+//   - Failing both, a live dashboard session cookie yields an unrestricted
+//     principal in the workspace of the token that signed in. The dashboard's
+//     own same-origin requests (the CSV export link, for one) cannot attach a
+//     header, which is why the cookie is a credential here at all.
+//
+// With no tokens configured the service is open, as it has always been, and
+// every request acts on the default workspace.
+func (a *Authenticator) Principal(r *http.Request) (*Principal, bool) {
+	if a == nil || r == nil {
+		return nil, false
+	}
+	if !a.Enabled() {
+		return &Principal{Workspace: workspace.Default}, true
+	}
+	if raw, ok := Bearer(r.Header.Get("Authorization")); ok {
+		if strings.HasPrefix(raw, TokenPrefix) {
+			if a.scoped == nil {
+				return nil, false
+			}
+			p, err := a.scoped.Authenticate(r.Context(), raw)
+			if err != nil {
+				return nil, false
+			}
+			return p, true
+		}
+		if entry, ok := a.lookupStatic(raw); ok {
+			return &Principal{Workspace: entry.workspace}, true
+		}
+		// A bearer header that named a credential we do not know is a failed
+		// attempt, not an anonymous request: falling through to the cookie
+		// would let a stale token ride a live browser session.
+		return nil, false
+	}
+	if info, ok := a.getSession(SessionID(r)); ok {
+		return &Principal{Workspace: info.workspace}, true
+	}
+	return nil, false
 }
 
 // Workspace resolves the workspace a request's credential belongs to. It is

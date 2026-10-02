@@ -14,7 +14,6 @@ import (
 
 	sqlite "modernc.org/sqlite"
 
-	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -896,7 +895,12 @@ func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 // ListChannels serves the dashboard listing and the notifier's startup
 // validation, so it honours the cross-tenant system scope like ListMonitors.
 func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout FROM channels WHERE 1 = 1`
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
 	if enabledOnly {
 		q += ` AND enabled = 1`
 	}
@@ -1021,7 +1025,7 @@ func (s *SQLite) ListMonitorsForChannel(ctx context.Context, channelID int64) ([
 		if err != nil {
 			return nil, err
 		}
-		m.ChannelIDs, err = s.monitorChannelIDs(ctx, m.ID)
+		m.ChannelIDs, err = s.monitorChannelIDs(ctx, m.ID, workspaceID(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -2283,13 +2287,17 @@ func (s *SQLite) DeleteSavedSearch(ctx context.Context, id int64) error {
 // SetDefaultSearch clears any existing default and sets the requested row in
 // one transaction, so the partial unique index never sees two defaults.
 func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
+	ws := workspaceID(ctx)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
-	if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+	// Both statements are scoped: clearing another tenant's default would
+	// silently change what their sidebar opens on.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE saved_searches SET is_default = 0 WHERE is_default = 1 AND workspace_id = ?`, ws); err != nil {
 		return mapSQLiteErr(err)
 	}
 	res, err := tx.ExecContext(ctx,

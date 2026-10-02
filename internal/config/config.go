@@ -108,6 +108,10 @@ type Config struct {
 	// team's data. Load rejects an entry whose id is not a valid workspace id
 	// and a token that appears twice for two different workspaces.
 	WorkspaceTokens []WorkspaceToken
+	// OIDC is the parsed OIDC_* block. Enabled() is false with OIDC_ISSUER
+	// unset, which leaves single sign-on off and the dashboard on its static
+	// token exactly as before.
+	OIDC OIDC
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
@@ -239,7 +243,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	net, err := ParseNetwork(func(key string) string {
+	nets, err := ParseNetworks(func(key string) string {
 		return lookupConfigValue(key, fileValues)
 	})
 	if err != nil {
@@ -252,6 +256,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		Network:            net,
+		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
 		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
@@ -331,6 +336,20 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
+
+	bound, err := parseWorkspaceTokens(lookupConfigValue("WORKSPACE_TOKENS", fileValues))
+	if err != nil {
+		return cfg, err
+	}
+	cfg.WorkspaceTokens = bound
+
+	oidc, err := parseOIDC(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
+	if err != nil {
+		return cfg, err
+	}
+	cfg.OIDC = oidc
 
 	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
