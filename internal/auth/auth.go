@@ -79,26 +79,15 @@ type Authenticator struct {
 	// a deployment that never created an API token keeps working.
 	scoped *Manager
 
+	// oidc is the single-sign-on provider, when one is configured. Nil leaves
+	// the dashboard on its token form, which is every deployment that has not
+	// set OIDC_ISSUER.
+	oidc *OIDCProvider
+
 	tt       time.Duration
 	mu       sync.Mutex
 	sessions map[string]sessionInfo
 	now      func() time.Time
-}
-
-// credential is one accepted token and the workspace it belongs to. The
-// workspace rides with the digest so a check can both authenticate and route
-// without a second comparison.
-type credential struct {
-	ws     workspace.ID
-	digest [sha256.Size]byte
-}
-
-// session is one live dashboard sign-in. It remembers the workspace the token
-// that minted it belonged to, so the browser cannot widen its own scope after
-// sign-in: the cookie is only ever as powerful as the credential behind it.
-type session struct {
-	expires time.Time
-	ws      workspace.ID
 }
 
 // New builds an Authenticator over the configured tokens. A ttl <= 0 uses
@@ -183,7 +172,10 @@ func (a *Authenticator) SessionTTL() time.Duration {
 // dashboard must not be open to whoever finds the port while that is being
 // arranged.
 func (a *Authenticator) Enabled() bool {
-	return a != nil && len(a.tokens) > 0
+	// Either credential source closes the door. An SSO-only deployment has no
+	// static token and is still protected, so reporting disabled would leave
+	// every page open to whoever finds the port.
+	return a != nil && (len(a.tokens) > 0 || a.oidc.Enabled())
 }
 
 // Verify reports whether candidate matches any configured token.
@@ -217,7 +209,7 @@ func (a *Authenticator) verifyToken(candidate string) (Role, bool) {
 // scoped token could be revived by also configuring it as API_TOKEN, and the
 // revocation an operator performed would silently stop meaning anything.
 func (a *Authenticator) lookupStatic(candidate string) (tokenEntry, bool) {
-	if !a.Enabled() || strings.HasPrefix(candidate, TokenPrefix) {
+	if !a.HasStaticTokens() || strings.HasPrefix(candidate, TokenPrefix) {
 		return tokenEntry{}, false
 	}
 	// Every configured token is compared — the loop accumulates the result
@@ -304,10 +296,12 @@ func (a *Authenticator) newSessionFor(role Role, ws workspace.ID) string {
 	return id
 }
 
-// NewSession mints a session id. It exists for the login handler; callers
-// that already hold a live session should use HasSession instead.
-func (a *Authenticator) NewSession() string {
-	return a.NewSessionWithRole(RoleAdmin)
+// NewSession mints a session id in the named workspace. It exists for the
+// login handler; callers that already hold a live session should use
+// HasSession instead. The workspace is explicit because a session is a tenancy
+// decision: there is no later point at which one could be inferred.
+func (a *Authenticator) NewSession(ws workspace.ID) string {
+	return a.newSessionFor(RoleAdmin, ws)
 }
 
 // HasSession reports whether id names a live, unexpired session. Sessions
@@ -399,6 +393,64 @@ func (a *Authenticator) WithTokens(m *Manager) *Authenticator {
 	return a
 }
 
+// WithOIDC attaches the single-sign-on provider. Nil is the no-SSO case and
+// leaves the sign-in page offering the token form alone.
+func (a *Authenticator) WithOIDC(p *OIDCProvider) *Authenticator {
+	if a == nil {
+		return a
+	}
+	a.oidc = p
+	return a
+}
+
+// OIDC returns the configured provider, which may be nil. Callers test it with
+// Enabled() rather than against nil, so a dashboard that has no SSO and one
+// that was never given an authenticator take the same path.
+func (a *Authenticator) OIDC() *OIDCProvider {
+	if a == nil {
+		return nil
+	}
+	return a.oidc
+}
+
+// HasStaticTokens reports whether a credential can be typed into the sign-in
+// form. It is deliberately not Enabled(): with only SSO configured the
+// dashboard is still protected, and offering a token box that nothing can
+// satisfy would read as a broken page.
+func (a *Authenticator) HasStaticTokens() bool {
+	return a != nil && len(a.tokens) > 0
+}
+
+// SessionWorkspace resolves a session cookie to the workspace it signed in to.
+// It is the dashboard's whole authentication check: a live session is the
+// credential, and the workspace it carries is the tenant every page then reads.
+func (a *Authenticator) SessionWorkspace(id string) (workspace.ID, bool) {
+	if a == nil {
+		return "", false
+	}
+	if !a.Enabled() {
+		// Nothing configured: the dashboard is open, as it has always been,
+		// and serves the single workspace everything already lives in.
+		return workspace.Default, true
+	}
+	info, ok := a.getSession(id)
+	if !ok {
+		return "", false
+	}
+	return info.workspace, true
+}
+
+// LoginOIDC mints a dashboard session for an identity the provider verified.
+// The session is unrestricted, like one minted from a static token: a cookie
+// carries no scope list, and the workspace comes from the identity's mapping
+// rather than from anything the browser sent.
+func (a *Authenticator) LoginOIDC(id *Identity) string {
+	if a == nil || id == nil {
+		return ""
+	}
+	return a.newSessionFor(RoleAdmin, id.Workspace)
+}
+
 // Principal resolves a request to its caller. It is the one place that turns a
 // credential into a tenant, and it reads the credential alone — not a header,
 // not a query parameter, not the host — because a client that could name its
@@ -420,9 +472,11 @@ func (a *Authenticator) WithTokens(m *Manager) *Authenticator {
 // With no tokens configured the service is open, as it has always been, and
 // every request acts on the default workspace.
 func (a *Authenticator) Principal(r *http.Request) (*Principal, bool) {
-	if a == nil || r == nil {
+	if r == nil {
 		return nil, false
 	}
+	// A nil authenticator is a server built without WithAuth, which is the
+	// same "nothing configured" case as an empty token list.
 	if !a.Enabled() {
 		return &Principal{Workspace: workspace.Default}, true
 	}

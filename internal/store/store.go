@@ -125,6 +125,11 @@ func (s Severity) MeetsThreshold(min Severity) bool {
 	return s.Rank() >= min.Rank()
 }
 
+// ErrChannelInUse is returned when a channel cannot be deleted because an
+// escalation policy step still references it. The API maps it to 409 so the
+// operator can detach it first rather than be left with a dangling reference.
+var ErrChannelInUse = errors.New("channel is referenced by an escalation policy")
+
 // Monitor watches one or more Soroban contracts.
 type Monitor struct {
 	ID          int64     `json:"id"`
@@ -203,6 +208,31 @@ type Channel struct {
 	MinSeverity Severity      `json:"min_severity"`
 	CreatedAt   time.Time     `json:"created_at"`
 	Timeout     time.Duration `json:"timeout"`
+
+	// The fields below are delivery health, derived from outcomes rather than
+	// configured (see RecordChannelHealth and migration 0025). They answer
+	// "is this channel still working?", which delivery_attempts could only
+	// answer one alert at a time.
+	//
+	// ConsecutiveFailures counts failed deliveries since the last success.
+	ConsecutiveFailures int64 `json:"consecutive_failures"`
+	// ConsecutivePermanentFailures counts permanent failures (401/403/404)
+	// since the last success, and is what auto-disable triggers on. A
+	// transient failure neither increments nor clears it, so a revoked
+	// credential is not hidden by an unrelated 5xx in the middle.
+	ConsecutivePermanentFailures int64 `json:"consecutive_permanent_failures"`
+	// LastError is the most recent failure message. It never holds channel
+	// config: the notifiers redact URLs and tokens before building it.
+	LastError string `json:"last_error,omitempty"`
+	// LastErrorAt is when LastError was recorded, nil if there has been no
+	// failure since the last success.
+	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
+	// LastSuccessAt is the last successful delivery, nil until the first one.
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	// DisabledAt is set when health tracking turned the channel off, and only
+	// then. It is what makes the dashboard say "auto-disabled" rather than
+	// "disabled", and it is cleared by an explicit re-enable.
+	DisabledAt *time.Time `json:"disabled_at,omitempty"`
 }
 
 // TimeoutDuration returns the channel's timeout, falling back to
@@ -230,6 +260,51 @@ func (c Channel) MarshalJSON() ([]byte, error) {
 		Alias:   Alias(c),
 		Timeout: c.TimeoutSeconds(),
 	})
+}
+
+// AutoDisabled reports whether health tracking, rather than an operator,
+// turned this channel off. Such a channel is kept out of dispatch by
+// enabled=false and comes back only through an explicit re-enable.
+func (c Channel) AutoDisabled() bool { return c.DisabledAt != nil }
+
+// HealthStatus is the coarse state the dashboard shows: "auto_disabled" when
+// health tracking turned the channel off, "disabled" when an operator did,
+// "failing" while deliveries are failing but the channel is still on, and
+// "ok" otherwise.
+func (c Channel) HealthStatus() string {
+	switch {
+	case c.DisabledAt != nil:
+		return "auto_disabled"
+	case !c.Enabled:
+		return "disabled"
+	case c.ConsecutiveFailures > 0:
+		return "failing"
+	default:
+		return "ok"
+	}
+}
+
+// ChannelHealthUpdate is one delivery outcome folded into a channel's health
+// counters. The store applies it as a single UPDATE that both increments and
+// (when the threshold is reached) disables, so several poller instances
+// dispatching at once can neither lose a count nor disable twice.
+type ChannelHealthUpdate struct {
+	// Success clears the counters and the last error. It never re-enables a
+	// channel: putting one back in rotation is an operator's decision, taken
+	// through the channel update path.
+	Success bool
+	// Permanent marks a failure the channel will not recover from on its own
+	// (401/403/404). Only permanent failures move a channel toward
+	// auto-disable; a 5xx or a timeout is the provider having a bad day.
+	Permanent bool
+	// Error is the failure message recorded as last_error. It must already be
+	// free of credentials — notifiers build their errors that way.
+	Error string
+	// DisableAfter is the number of consecutive permanent failures at which
+	// the channel is auto-disabled. Zero (the default) never auto-disables.
+	DisableAfter int
+	// At is when the outcome happened. Zero means now.
+	At time.Time
 }
 
 // UnmarshalJSON deserializes a channel, parsing Timeout from integer seconds
@@ -350,6 +425,10 @@ type Alert struct {
 	// internal/backfill) rather than live ingestion. It is persisted so an
 	// operator can tell a replayed match from a real-time one.
 	Backfilled bool `json:"backfilled"`
+	// AcknowledgedAt is when an operator acknowledged the alert. Nil means it
+	// has not been acknowledged, so an escalation attached to it keeps
+	// running. Acknowledging stops escalation.
+	AcknowledgedAt *time.Time `json:"acknowledged_at"`
 }
 
 // Maintenance window scopes. A window suppresses matching alerts for its
@@ -432,6 +511,21 @@ type DeliveryAttempt struct {
 	AttemptedAt     time.Time `json:"attempted_at"`
 }
 
+// AbsenceState is the last time a rule saw the event it is waiting for.
+// Absence-of-event rules are driven by a periodic sweep rather than by event
+// arrival, so the sweep needs one of these per (rule, awaited pattern); there
+// is no event to compare against, only a clock.
+//
+// LastSeen is the wall-clock instant the process saw the awaited event, or —
+// for a rule that has never seen it — the instant the rule was first observed
+// by a sweep. Either way it is persisted, so a restart resumes measuring
+// silence instead of resetting the clock.
+type AbsenceState struct {
+	RuleID    int64     `json:"rule_id"`
+	EventName string    `json:"event_name"`
+	LastSeen  time.Time `json:"last_seen_at"`
+}
+
 // IngestState is the poller's checkpoint: the last fully processed ledger
 // and, mid-page, the last getEvents cursor.
 type IngestState struct {
@@ -493,6 +587,41 @@ type Ledgers interface {
 	// atomic. The network filter is what stops one chain's reorg orphaning
 	// another chain's alerts.
 	RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error)
+}
+
+// EscalationStep is one step of an escalation policy: after Delay elapses it
+// notifies ChannelIDs. Delay is relative to the alert for the first step and
+// to the previous step thereafter, so a zero delay fires immediately.
+type EscalationStep struct {
+	// Position is the step's 0-based place in the policy.
+	Position int `json:"position"`
+	// DelaySeconds is how long to wait before this step fires.
+	DelaySeconds int64 `json:"delay_seconds"`
+	// ChannelIDs are the channels this step notifies.
+	ChannelIDs []int64 `json:"channel_ids"`
+}
+
+// EscalationPolicy is the ordered escalation attached to one monitor. A
+// monitor has at most one policy; a monitor without one keeps the flat
+// channel fan-out it has always had.
+type EscalationPolicy struct {
+	ID        int64            `json:"id"`
+	MonitorID int64            `json:"monitor_id"`
+	Steps     []EscalationStep `json:"steps"`
+	CreatedAt time.Time        `json:"created_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
+}
+
+// EscalationRun is one pending escalation step the scheduler should fire:
+// the alert it belongs to, the step index, and when it is due. Snapshot is
+// the notification payload captured when the escalation started, so a step
+// delivered after a restart does not have to be rebuilt from scratch.
+type EscalationRun struct {
+	AlertID   int64           `json:"alert_id"`
+	PolicyID  int64           `json:"policy_id"`
+	NextStep  int             `json:"next_step"`
+	NextDueAt time.Time       `json:"next_due_at"`
+	Snapshot  json.RawMessage `json:"-"`
 }
 
 // AlertFilter narrows ListAlerts. Zero values mean "no constraint".
@@ -766,6 +895,14 @@ type Channels interface {
 	ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error)
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error)
+	// RecordChannelHealth folds one delivery outcome into a channel's health
+	// counters, auto-disabling it once DisableAfter consecutive permanent
+	// failures have accumulated. Unknown channel ids are ignored rather than
+	// an error: a channel deleted mid-dispatch is a race, not a bug.
+	RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error
+	// ListChannelsByIDs returns the enabled channels among ids, ordered by id,
+	// so an escalation step can notify its channel set in one query.
+	ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error)
 }
 
 // Alerts persists alerts and delivery attempts.
@@ -824,6 +961,21 @@ type MaintenanceWindows interface {
 type Ingest interface {
 	GetIngestState(ctx context.Context, network string) (IngestState, error)
 	SetIngestState(ctx context.Context, network string, s IngestState) error
+}
+
+// Absence persists the last-seen clocks that absence-of-event rules measure
+// silence against.
+type Absence interface {
+	// ListAbsenceState returns every stored clock. The sweep reads them all
+	// in one query: the table holds at most one row per absence rule, and a
+	// per-rule lookup would mean a query per rule on every tick.
+	ListAbsenceState(ctx context.Context) ([]AbsenceState, error)
+	// RecordAbsenceSeen advances the clock for (ruleID, eventName) to at.
+	// It never moves the clock backwards: a replayed or out-of-order event
+	// must not make a rule look fresher than it is, and the sweep's initial
+	// baseline write must not undo a real observation. Writing an older
+	// instant is therefore a no-op rather than an error.
+	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
 }
 
 // Backfills persists historical replay progress, so an interrupted backfill
@@ -965,6 +1117,16 @@ type TemplateParameter struct {
 	Default     string `json:"default,omitempty"`
 }
 
+// templateChannelIDs normalises a template's channel list for storage. A nil
+// slice would be written as SQL NULL (Postgres) or JSON null (SQLite), and
+// channel_ids is NOT NULL: an empty list means "no channels", not "unknown".
+func templateChannelIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
+}
+
 // MonitorTemplates persists monitor templates.
 type MonitorTemplates interface {
 	CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error
@@ -987,6 +1149,59 @@ type BackupChannel struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// Escalations persists monitor escalation policies and the per-alert
+// scheduling state that keeps a tiered notification going across restarts.
+type Escalations interface {
+	// GetEscalationPolicyForMonitor returns the policy attached to a monitor,
+	// or ErrNotFound when the monitor has none (and therefore fans out flat).
+	GetEscalationPolicyForMonitor(ctx context.Context, monitorID int64) (*EscalationPolicy, error)
+	// GetEscalationPolicy returns a policy by its own id, used by the
+	// scheduler to load the steps for a due escalation.
+	GetEscalationPolicy(ctx context.Context, policyID int64) (*EscalationPolicy, error)
+	// SetEscalationPolicy replaces the monitor's policy with steps in one
+	// transaction, so the old policy can never be observed half-deleted.
+	SetEscalationPolicy(ctx context.Context, monitorID int64, steps []EscalationStep) (*EscalationPolicy, error)
+	DeleteEscalationPolicy(ctx context.Context, monitorID int64) error
+	// ScheduleEscalation records the next due step for an alert. Re-scheduling
+	// the same alert replaces the pending schedule rather than duplicating it.
+	ScheduleEscalation(ctx context.Context, alertID, policyID int64, snapshot json.RawMessage, nextStep int, nextDue time.Time) error
+	// DueEscalations returns unacknowledged, unfinished escalations whose next
+	// step is due at or before now, oldest due first.
+	DueEscalations(ctx context.Context, now time.Time, limit int) ([]EscalationRun, error)
+	// AdvanceEscalation moves a pending escalation to its next step.
+	AdvanceEscalation(ctx context.Context, alertID int64, nextStep int, nextDue time.Time) error
+	// CompleteEscalation clears a pending escalation once all steps have fired.
+	CompleteEscalation(ctx context.Context, alertID int64) error
+	// AcknowledgeAlert stamps an alert acknowledged and stops its escalation.
+	AcknowledgeAlert(ctx context.Context, alertID int64) error
+}
+
+// Workspaces persists the tenant list. EnsureWorkspace is idempotent so
+// startup can assert every configured workspace exists without caring whether
+// a previous start already created it.
+type Workspaces interface {
+	EnsureWorkspace(ctx context.Context, id workspace.ID) error
+	// AssignLegacyNetwork labels rows the network migration left unlabelled.
+	// It runs once at startup in the instance's cross-tenant scope, and its
+	// predicate is the empty network rather than a tenant, so it is idempotent.
+	AssignLegacyNetwork(ctx context.Context, network string) (int64, error)
+}
+
+// APITokens persists the scoped, database-backed API tokens. It is exactly
+// auth.TokenStore — declared here too so store.Store carries it, and asserted
+// against that interface in tokens.go so the two cannot drift.
+//
+// Every method scopes itself to ctx's workspace except TokenByHash, which runs
+// before tenancy is known: the row it finds is what decides the workspace, so
+// a caller cannot name its own.
+type APITokens interface {
+	CreateAPIToken(ctx context.Context, t *auth.Token) error
+	TokenByHash(ctx context.Context, hash string) (token *auth.Token, found bool, err error)
+	ListAPITokens(ctx context.Context) ([]auth.Token, error)
+	RevokeAPIToken(ctx context.Context, id int64) error
+	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -1005,12 +1220,16 @@ type Store interface {
 	MaintenanceWindows
 	Inhibitions
 	Ingest
+	Absence
 	Backfills
 	Ledgers
 	SavedSearches
 	MonitorTemplates
 	Audits
 	DigestQueue
+	Workspaces
+	APITokens
+	Escalations
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists

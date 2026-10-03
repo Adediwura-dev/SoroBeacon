@@ -28,6 +28,7 @@ const (
 	pollAgeName           = "sorobeacon_seconds_since_last_poll"
 	eventsScannedName     = "sorobeacon_events_scanned_total"
 	eventsMatchedName     = "sorobeacon_events_matched_total"
+	ruleEvaluationsName   = "sorobeacon_rule_evaluations_total"
 	alertsFiredName       = "sorobeacon_alerts_fired_total"
 	deliveriesName        = "sorobeacon_alert_deliveries_total"
 	priorityContractsName = "sorobeacon_poll_priority_contracts"
@@ -78,6 +79,26 @@ func TestRecordEventsCountsScannedAndMatched(t *testing.T) {
 
 	assert.Equal(t, float64(9), m.sampleValue(t, eventsScannedName, nil))
 	assert.Equal(t, float64(3), m.sampleValue(t, eventsMatchedName, nil))
+}
+
+// Rule evaluations are counted separately from events so a monitor with many
+// rules is distinguishable from a busy contract: the same three events give a
+// different evaluation count depending on how many rules they are checked
+// against.
+func TestRecordRuleEvaluationsCountsEvaluations(t *testing.T) {
+	m := New()
+
+	m.RecordEvents(3, 1)
+	m.RecordRuleEvaluations(9)
+
+	assert.Equal(t, float64(3), m.sampleValue(t, eventsScannedName, nil))
+	assert.Equal(t, float64(9), m.sampleValue(t, ruleEvaluationsName, nil))
+}
+
+func TestRecordRuleEvaluationsIsNilSafe(t *testing.T) {
+	var m *Metrics
+
+	assert.NotPanics(t, func() { m.RecordRuleEvaluations(5) })
 }
 
 func TestRecordAlertCountsAlerts(t *testing.T) {
@@ -295,11 +316,34 @@ func (m *Metrics) sampleHistogram(t *testing.T, name string, labels map[string]s
 // hasLabels reports whether sample carries exactly the wanted label pairs.
 // Labels are compared as a set because prometheus does not promise an order.
 func hasLabels(sample *dto.Metric, want map[string]string) bool {
-	if len(sample.GetLabel()) != len(want) {
-		return false
-	}
 	for _, pair := range sample.GetLabel() {
+		if _, asked := want[pair.GetName()]; !asked {
+			// Every ingest metric carries the network label, and on a
+			// single-network instance its value is the empty string. A test
+			// that does not name it is asking about that instance, so an
+			// empty network is not a distinguishing label. Any other
+			// unasked-for label still fails: it would mean the metric gained
+			// a dimension the test has not been reviewed for.
+			if pair.GetName() == networkLabel && pair.GetValue() == "" {
+				continue
+			}
+			return false
+		}
 		if want[pair.GetName()] != pair.GetValue() {
+			return false
+		}
+	}
+	// Every label the caller named has to be present, so a typo in a test is
+	// still a failure rather than a match against the first sample.
+	for name := range want {
+		found := false
+		for _, pair := range sample.GetLabel() {
+			if pair.GetName() == name {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}

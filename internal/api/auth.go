@@ -10,7 +10,10 @@ import (
 
 // AuthMiddleware requires a credential on every /api/v1 route once a token
 // is configured through API_TOKEN.
-func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
+func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) http.Handler {
+	if log == nil {
+		log = slog.Default()
+	}
 	if !a.Enabled() {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -20,7 +23,11 @@ func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !a.Authenticated(r) {
+			// One resolution serves both questions: whether the request is
+			// authenticated at all, and which tenant and scopes it carries.
+			// Asking twice would let the two answers disagree.
+			principal, ok := a.Principal(r)
+			if !ok {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="sorobeacon"`)
 				writeErr(w, r, http.StatusUnauthorized, "unauthorized")
 				return

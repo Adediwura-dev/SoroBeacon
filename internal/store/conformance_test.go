@@ -49,6 +49,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
+	t.Run("ListChannelsByIDs", func(t *testing.T) { testListChannelsByIDs(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
 	t.Run("ChannelTimeout", func(t *testing.T) { testChannelTimeout(t, newStore) })
 	t.Run("MonitorLastMatchedAt", func(t *testing.T) { testMonitorLastMatchedAt(t, newStore) })
@@ -61,11 +62,14 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("DeleteExpiredAlertsKeepsRecentAndCascades", func(t *testing.T) { testDeleteExpiredAlertsCascade(t, newStore) })
 	t.Run("DeleteExpiredAlertsBatches", func(t *testing.T) { testDeleteExpiredAlertsBatches(t, newStore) })
 	t.Run("IngestStateRoundTrip", func(t *testing.T) { testIngestState(t, newStore) })
+	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
+	t.Run("SavedSearchesCRUDAndSingleDefault", func(t *testing.T) { testSavedSearches(t, newStore) })
+	t.Run("MonitorTemplatesCRUD", func(t *testing.T) { testMonitorTemplates(t, newStore) })
 	t.Run("NetworkOnMonitorsAndAlerts", func(t *testing.T) { testNetworkOnMonitorsAndAlerts(t, newStore) })
 	t.Run("PerNetworkIngestAndReorgWindow", func(t *testing.T) { testPerNetworkIngestAndReorgWindow(t, newStore) })
 	t.Run("AssignLegacyNetwork", func(t *testing.T) { testAssignLegacyNetwork(t, newStore) })
@@ -73,8 +77,22 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
 	t.Run("ChannelConfigDecryptFailureNamesChannel", func(t *testing.T) { testChannelConfigDecryptFailure(t, newStore) })
+	t.Run("ChannelHealthCountsByKind", func(t *testing.T) { testChannelHealthCountsByKind(t, newStore) })
+	t.Run("ChannelHealthSuccessResets", func(t *testing.T) { testChannelHealthSuccessResets(t, newStore) })
+	t.Run("ChannelHealthAutoDisablesOnPermanentFailures", func(t *testing.T) { testChannelHealthAutoDisablesOnPermanentFailures(t, newStore) })
+	t.Run("ChannelHealthWithoutThresholdNeverDisables", func(t *testing.T) { testChannelHealthWithoutThresholdNeverDisables(t, newStore) })
+	t.Run("ChannelHealthTransientFailuresNeverDisable", func(t *testing.T) { testChannelHealthTransientFailuresNeverDisable(t, newStore) })
+	t.Run("ChannelHealthTransientDoesNotMaskPermanentStreak", func(t *testing.T) { testChannelHealthTransientDoesNotMaskPermanentStreak(t, newStore) })
+	t.Run("UpdateChannelReenableClearsHealth", func(t *testing.T) { testUpdateChannelReenableClearsHealth(t, newStore) })
+	t.Run("UpdateChannelRenameKeepsHealth", func(t *testing.T) { testUpdateChannelRenameKeepsHealth(t, newStore) })
+	t.Run("ChannelHealthUnknownChannelIgnored", func(t *testing.T) { testChannelHealthUnknownChannelIsIgnored(t, newStore) })
 	t.Run("AuditLogAppendOnlyFiltersAndNoSecrets", func(t *testing.T) { testAuditLog(t, newStore) })
 	t.Run("ChannelDigestSettingsAndQueue", func(t *testing.T) { testChannelDigest(t, newStore) })
+	// The tenancy suite. These are the assertions the workspace boundary rests
+	// on, so they run against both backends like everything else.
+	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
+	t.Run("DeleteByIDAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
+	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending
@@ -1326,6 +1344,178 @@ func testDuplicateMonitor(t *testing.T, newStore conformanceFactory) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+// testSavedSearches covers the named alert filters: CRUD, the name ordering
+// the sidebar relies on, the structured filter round-trip, and the "at most one
+// default" rule. Postgres enforces that rule with a partial unique index and
+// SQLite with a filtered one plus a single clear-then-set transaction; both
+// must leave exactly the same rows behind.
+func testSavedSearches(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	zeta := &SavedSearch{
+		Name:   "zeta treasury",
+		Filter: SavedSearchFilter{ContractID: "CAAA", Sort: "created_at_desc"},
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, zeta))
+	assert.NotZero(t, zeta.ID)
+	assert.False(t, zeta.CreatedAt.IsZero())
+	assert.False(t, zeta.IsDefault, "a search is not the default unless it asks to be")
+
+	alpha := &SavedSearch{
+		Name:      "alpha defaults",
+		Filter:    SavedSearchFilter{MonitorID: 7, RuleID: 9},
+		IsDefault: true,
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, alpha))
+
+	list, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha defaults", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta treasury", list[1].Name)
+
+	got, err := st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha defaults", got.Name)
+	assert.True(t, got.IsDefault)
+	assert.EqualValues(t, 7, got.Filter.MonitorID)
+	assert.EqualValues(t, 9, got.Filter.RuleID)
+
+	got, err = st.GetSavedSearch(ctx, zeta.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "CAAA", got.Filter.ContractID)
+	assert.Equal(t, "created_at_desc", got.Filter.Sort)
+
+	// Creating a second default must clear the first, not fail on the unique
+	// index and not leave two defaults behind.
+	beta := &SavedSearch{Name: "beta", IsDefault: true}
+	require.NoError(t, st.CreateSavedSearch(ctx, beta))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault, "a new default clears the previous one")
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Moving the default back is the same operation from the other side.
+	require.NoError(t, st.SetDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Clearing leaves no default at all.
+	require.NoError(t, st.ClearDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+
+	// Unknown ids are ErrNotFound, never a silent success: a stale bookmark
+	// or a deleted search must be reported to the caller.
+	assert.ErrorIs(t, st.SetDefaultSearch(ctx, 999999), ErrNotFound)
+	assert.ErrorIs(t, st.ClearDefaultSearch(ctx, 999999), ErrNotFound)
+	_, err = st.GetSavedSearch(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteSavedSearch(ctx, beta.ID))
+	_, err = st.GetSavedSearch(ctx, beta.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteSavedSearch(ctx, beta.ID), ErrNotFound)
+}
+
+// testMonitorTemplates covers template CRUD. Instantiation copies a template
+// rather than referencing it, so this only pins storage: every field, including
+// the rules and their params, must survive a write and a read on both backends.
+func testMonitorTemplates(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	tmpl := &MonitorTemplate{
+		Name:        "zeta usdc",
+		Description: "watch a USDC contract",
+		Rules: []MonitorTemplateRule{
+			{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`)},
+			{Type: "value_threshold", Params: json.RawMessage(`{"comparison":"gt","threshold":1000}`)},
+		},
+		ChannelIDs: []int64{3, 5},
+		Parameters: []TemplateParameter{
+			{Name: "contract_id", Description: "the contract to watch", Required: true},
+			{Name: "threshold", Default: "1000"},
+		},
+	}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, tmpl))
+	assert.NotZero(t, tmpl.ID)
+	assert.False(t, tmpl.CreatedAt.IsZero())
+
+	// A template with no channels attached is legal: the operator picks them
+	// when instantiating. The ids are an explicit empty slice because the API
+	// layer normalises an absent channel_ids to one before calling the store.
+	plain := &MonitorTemplate{Name: "alpha basic", ChannelIDs: []int64{}}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, plain))
+
+	got, err := st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc", got.Name)
+	assert.Equal(t, "watch a USDC contract", got.Description)
+	require.Len(t, got.Rules, 2)
+	assert.Equal(t, "event_emitted", got.Rules[0].Type)
+	assert.JSONEq(t, `{"event_name":"transfer"}`, string(got.Rules[0].Params))
+	assert.Equal(t, "value_threshold", got.Rules[1].Type)
+	assert.JSONEq(t, `{"comparison":"gt","threshold":1000}`, string(got.Rules[1].Params))
+	assert.Equal(t, []int64{3, 5}, got.ChannelIDs)
+	require.Len(t, got.Parameters, 2)
+	assert.Equal(t, "contract_id", got.Parameters[0].Name)
+	assert.Equal(t, "the contract to watch", got.Parameters[0].Description)
+	assert.True(t, got.Parameters[0].Required)
+	assert.Equal(t, "1000", got.Parameters[1].Default)
+
+	got, err = st.GetMonitorTemplate(ctx, plain.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.ChannelIDs, "no attached channels reads as an empty slice, not an error")
+	assert.Empty(t, got.Rules)
+
+	list, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha basic", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta usdc", list[1].Name)
+	assert.Equal(t, []int64{3, 5}, list[1].ChannelIDs)
+
+	tmpl.Name = "zeta usdc v2"
+	tmpl.Description = "renamed"
+	tmpl.ChannelIDs = []int64{5}
+	tmpl.Rules = tmpl.Rules[:1]
+	require.NoError(t, st.UpdateMonitorTemplate(ctx, tmpl))
+	got, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc v2", got.Name)
+	assert.Equal(t, "renamed", got.Description)
+	assert.Equal(t, []int64{5}, got.ChannelIDs)
+	require.Len(t, got.Rules, 1)
+	assert.Equal(t, tmpl.CreatedAt, got.CreatedAt, "updating must not restamp created_at")
+
+	ghost := &MonitorTemplate{ID: 999999, Name: "ghost"}
+	assert.ErrorIs(t, st.UpdateMonitorTemplate(ctx, ghost), ErrNotFound)
+	_, err = st.GetMonitorTemplate(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteMonitorTemplate(ctx, tmpl.ID))
+	_, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteMonitorTemplate(ctx, tmpl.ID), ErrNotFound)
+}
+
 // testLedgerHashesAndRetraction pins the reorg-detection state across both
 // backends: hashes upsert and prune by ledger, and retraction marks exactly
 // the alerts at or after the divergence without deleting them.
@@ -1714,4 +1904,101 @@ func testChannelConfigDecryptFailure(t *testing.T, newStore conformanceFactory) 
 	_, err = st.ListChannels(ctx, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pager")
+}
+
+// testAbsenceState covers the clock absence-of-event rules measure silence
+// against. It is a conformance test rather than a Postgres one because the
+// monotonic upsert is written differently per backend — GREATEST on Postgres,
+// MAX on SQLite — and the two must not disagree about which write wins.
+func testAbsenceState(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "absence_of_event",
+		Params: json.RawMessage(`{"event_name":"heartbeat","window":"30m"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+
+	// No clock exists until a sweep arms one.
+	states, err := st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	armed := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed))
+
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.Equal(t, r.ID, states[0].RuleID)
+	assert.Equal(t, "heartbeat", states[0].EventName)
+	assert.True(t, states[0].LastSeen.Equal(armed), "got %s, want %s", states[0].LastSeen, armed)
+
+	// The clock is monotonic: a replayed or out-of-order observation is a
+	// no-op rather than a way to make a rule look fresher than it is.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed.Add(-time.Hour)))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(armed), "an older instant must not move the clock back")
+
+	later := armed.Add(5 * time.Minute)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", later))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(later), "a newer observation advances the clock")
+
+	// Awaiting a different event starts a second clock instead of reusing the
+	// old one: this is what stops an edit from measuring one event's silence
+	// from another's last appearance.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "ping", later))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Len(t, states, 2, "one row per (rule, awaited event)")
+
+	// Deleting the rule takes its clocks with it.
+	require.NoError(t, st.DeleteMonitor(ctx, m.ID))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+}
+
+// testListChannelsByIDs covers the escalation reader: a step resolves its
+// channel set in one query, and a channel disabled after the policy was
+// written is skipped rather than erroring. It is a conformance test because
+// the two backends write the id list differently — = ANY($1) on Postgres, an
+// expanded IN list on SQLite — and because a column list that has drifted
+// from scanChannel shows up here rather than in a Postgres-only test.
+func testListChannelsByIDs(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	on := &Channel{Name: "on", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true}
+	off := &Channel{Name: "off", Type: "slack", Config: json.RawMessage(`{}`), Enabled: false}
+	other := &Channel{Name: "other", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, on))
+	require.NoError(t, st.CreateChannel(ctx, off))
+	require.NoError(t, st.CreateChannel(ctx, other))
+
+	got, err := st.ListChannelsByIDs(ctx, []int64{on.ID, off.ID})
+	require.NoError(t, err)
+	require.Len(t, got, 1, "a disabled channel is skipped, not an error")
+	assert.Equal(t, on.ID, got[0].ID)
+	assert.Equal(t, "on", got[0].Name)
+	assert.NotZero(t, got[0].TimeoutDuration(), "the row is scanned whole, not just its id")
+
+	// A repeated id is de-duplicated rather than delivering twice.
+	got, err = st.ListChannelsByIDs(ctx, []int64{on.ID, on.ID})
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+
+	got, err = st.ListChannelsByIDs(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	got, err = st.ListChannelsByIDs(ctx, []int64{999999})
+	require.NoError(t, err)
+	assert.Empty(t, got, "an unknown id is not an error")
 }

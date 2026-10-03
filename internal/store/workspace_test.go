@@ -353,6 +353,11 @@ var unscopedStoreMethods = map[string]string{
 	"EnsureWorkspace":         "takes the workspace as an argument",
 	"AssignLegacyNetwork":     "the one-time startup upgrade labels rows the migration left unlabelled in every workspace; its predicate is the empty network, not a tenant",
 	"TokenByHash":             "authenticating: the token's own row is where its workspace comes from, so the read cannot be scoped to a tenant the caller does not have yet",
+	"ListChannelsByIDs":       "the dispatcher resolves an escalation step's channels for a policy it already loaded through the monitor",
+	"RecordChannelHealth":     "the dispatcher folds a delivery outcome into a channel it already resolved, in the poller's cross-tenant context",
+	"MarkAlertInhibited":      "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
+	"SetAlertSuppressed":      "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
+	"RuleFiredWithin":         "the inhibition check asks about one rule the dispatcher already resolved; rule_id implies the tenant",
 }
 
 // scannedFiles are the store sources that hold queries against tenant tables.

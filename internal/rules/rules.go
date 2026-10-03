@@ -30,6 +30,10 @@ const (
 	TypeTopicRegex         = "topic_regex"
 	TypeAddressWatchlist   = "address_watchlist"
 	TypeTopicPosition      = "topic_position"
+	// TypeAbsenceOfEvent is driven by the poller's sweep rather than by
+	// event arrival, so it is registered as an AbsenceEvaluator, not an
+	// evaluator.
+	TypeAbsenceOfEvent = "absence_of_event"
 )
 
 // RuleEvaluator decides whether one decoded event matches one rule.
@@ -85,8 +89,16 @@ type EventNamer interface {
 }
 
 // Registry maps rule type names to evaluators.
+//
+// There are two kinds of rule, and a type belongs to exactly one of them: one
+// evaluated per arriving event (an event that matches fires the rule), and one
+// evaluated on a timer (an event that matches merely re-arms it). Keeping them
+// in one Registry means callers that only care about "is this type known?" —
+// the API validating params, the dashboard listing types — do not have to know
+// the difference; only the poller does, via Absence.
 type Registry struct {
 	evaluators map[string]RuleEvaluator
+	absences   map[string]AbsenceEvaluator
 	// telemetry is optional tracing; a nil Registry.telemetry (tests construct
 	// registries directly) just means no spans.
 	telemetry *telemetry.Provider
@@ -103,7 +115,10 @@ func (r *Registry) WithTelemetry(t *telemetry.Provider) *Registry {
 
 // NewRegistry returns a Registry with the built-in rule types registered.
 func NewRegistry() *Registry {
-	r := &Registry{evaluators: map[string]RuleEvaluator{}}
+	r := &Registry{
+		evaluators: map[string]RuleEvaluator{},
+		absences:   map[string]AbsenceEvaluator{},
+	}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
 	r.Register(TypeContractAllowlist, &ContractAllowlist{})
@@ -114,9 +129,14 @@ func NewRegistry() *Registry {
 	r.Register(TypeSelfTransfer, SelfTransfer{})
 	r.Register(TypeTimeWindow, TimeWindow{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
+	// The composite is registered last because it resolves child types
+	// through this registry; passing r to itself lets it see every leaf above
+	// and any type registered on this registry later.
+	r.Register(TypeComposite, NewComposite(r))
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	r.Register(TypeTopicPosition, TopicPosition{})
+	r.RegisterAbsence(TypeAbsenceOfEvent, Absence{})
 	return r
 }
 
@@ -125,10 +145,28 @@ func (r *Registry) Register(name string, e RuleEvaluator) {
 	r.evaluators[name] = e
 }
 
-// Types returns the registered rule type names.
+// RegisterAbsence adds (or replaces) an absence rule type. Registering the
+// same name here and in Register is a wiring mistake: the poller looks a rule
+// up as an absence first, so the evaluator would never run.
+func (r *Registry) RegisterAbsence(name string, e AbsenceEvaluator) {
+	r.absences[name] = e
+}
+
+// Absence returns the absence evaluator for ruleType, if it is registered as
+// one. The poller asks per rule: anything not here is evaluated per event.
+func (r *Registry) Absence(ruleType string) (AbsenceEvaluator, bool) {
+	e, ok := r.absences[ruleType]
+	return e, ok
+}
+
+// Types returns every registered rule type, absence types included, so the
+// dashboard's rule-type picker and any "known type" check see one list.
 func (r *Registry) Types() []string {
-	out := make([]string, 0, len(r.evaluators))
+	out := make([]string, 0, len(r.evaluators)+len(r.absences))
 	for name := range r.evaluators {
+		out = append(out, name)
+	}
+	for name := range r.absences {
 		out = append(out, name)
 	}
 	return out
@@ -172,6 +210,13 @@ func (r *Registry) startEvalSpan(ctx context.Context, ruleType string, ev *stell
 func (r *Registry) evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	e, ok := r.evaluators[ruleType]
 	if !ok {
+		// An absence rule type answers false rather than erroring: it is a
+		// known type that no single event can satisfy, and a caller that
+		// evaluates every rule of a monitor (the poller does) must not log
+		// those as broken. The poller's sweep is what fires them.
+		if _, isAbsence := r.absences[ruleType]; isAbsence {
+			return false, nil
+		}
 		return false, fmt.Errorf("unknown rule type %q", ruleType)
 	}
 	return e.Evaluate(ctx, ev, params)
@@ -211,6 +256,13 @@ func (r *Registry) EventNames(ruleType string, params json.RawMessage) ([]string
 func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 	e, ok := r.evaluators[ruleType]
 	if !ok {
+		if a, isAbsence := r.absences[ruleType]; isAbsence {
+			if err := a.Validate(params); err != nil {
+				return err
+			}
+			_, err := ParseCooldown(params)
+			return err
+		}
 		return fmt.Errorf("unknown rule type %q (registered: %v)", ruleType, r.Types())
 	}
 	if err := e.Validate(params); err != nil {

@@ -80,8 +80,9 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 
 | Variable        | Default                                | Description                                  |
 |-----------------|----------------------------------------|----------------------------------------------|
-| `SOURCE_MODE`   | `rpc`                                  | `rpc` (standalone) or `sorotrail` (upstream) |
+| `SOURCE_MODE`   | `rpc`                                  | `rpc` (standalone), `sorotrail` (upstream), or `horizon` (Horizon server) |
 | `SOROTRAIL_URL` | —                                      | SoroTrail indexer base URL (upstream mode)   |
+| `HORIZON_URL`   | —                                      | Horizon server base URL (horizon mode)       |
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `RPC_URLS`      | _(none — `RPC_URL` is used)_           | Ordered, comma-separated endpoints to fail over between; takes priority over `RPC_URL` |
@@ -106,6 +107,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `RATE_LIMIT_RPS` | `0` (off)                             | Per-client API requests per second           |
 | `RATE_LIMIT_BURST` | `ceil(RPS)` when enabled            | Per-client token-bucket size                 |
 | `RATE_LIMIT_TRUST_FORWARDED` | `false`                  | Key clients by `X-Forwarded-For` (proxy only) |
+| `CHANNEL_DISABLE_AFTER_FAILURES` | `0` (never)         | Consecutive permanent channel failures before auto-disable |
 
 ### Networks
 
@@ -136,6 +138,24 @@ as the single-endpoint case; never set both.
   SoroTrail stores events durably past the RPC's ~1-7 day retention window,
   so upstream monitoring covers history the RPC has already dropped — and
   several SoroBeacon instances can share one indexer.
+- **`horizon`** — SoroBeacon reads contract events from a Horizon server's
+  REST API by fetching transactions for watched contracts and extracting
+  events from their `result_meta_xdr`. Horizon typically retains full history
+  (months to years depending on deployment), enabling deep historical backfill
+  without an intermediate indexer. This mode is useful when you operate your
+  own Horizon instance or have access to one with sufficient retention.
+
+**Differences between modes:**
+
+| Aspect | `rpc` | `sorotrail` | `horizon` |
+|--------|-------|-------------|-----------|
+| Latency | ~5s (poll interval) | ~1-5s (indexer poll) | ~10-30s (transaction scan) |
+| History retention | ~1-7 days | Unbounded (indexer stores all) | Unbounded (Horizon retention) |
+| Ordering guarantees | Ledger order per contract | Ledger order per contract | Ledger order per contract |
+| Server-side filtering | Yes (getEvents filters) | Yes (indexer filters) | No (client filters by contract) |
+| Spec-aware decoding | Yes (via RPC getLedgerEntries) | Yes (indexer provides decoded) | No (falls back to default decoding) |
+| Rate limiting | RPC 429 backoff | Indexer 429 backoff | Horizon 429 backoff |
+| Best for | Near-real-time, low latency | Multi-tenant, long history | Self-hosted Horizon, deep backfill |
 
 The ingest loop knows only an `EventSource` interface; adding a backend is
 implementing two methods. See
@@ -146,6 +166,10 @@ implementing two methods. See
 
 `/metrics` serves Prometheus instrumentation: poll outcomes and duration,
 poll lag behind the chain tip, seconds since the last poll, the
+events-scanned → rule-evaluations → events-matched → alerts-fired funnel,
+deliveries by channel and outcome, and HTTP request duration by route
+pattern. The [metrics reference](docs/reference/metrics.md) lists every
+metric with its labels, meaning and cardinality rules.
 events-scanned → events-matched → alerts-fired funnel, deliveries by
 channel and outcome, and HTTP request duration by route pattern.
 `/api/v1/livez` and `/api/v1/readyz` are orchestration probes (liveness
@@ -189,9 +213,69 @@ channel's `config` JSON in the database. They are never logged and never
 returned by the API. Set `CONFIG_ENCRYPTION_KEY` to encrypt them at rest;
 see the [configuration guide](docs/getting-started/configuration.md#encrypting-channel-config-at-rest).
 
+Every delivery folds its outcome into the channel, so a channel that has
+stopped working says so instead of going quiet — `GET /api/v1/channels`
+carries the consecutive failure count, the last error and the last success,
+and an auto-disabled channel is flagged on the dashboard with the error that
+parked it. Failures are split into permanent (`401`/`403`/`404`, a revoked
+token) and transient (`5xx`, timeouts), because only the permanent kind can
+tell you a channel will never recover on its own. Set
+`CHANNEL_DISABLE_AFTER_FAILURES` to park a channel automatically after that
+many permanent failures; it is **off by default**, and re-enabling is an
+explicit `PATCH {"enabled": true}`. See the
+[channel health reference](docs/configuration.md#channel-health).
+
 > ⚠️ With `API_TOKEN` unset the API and dashboard are **unauthenticated**.
 > Set it to require `Authorization: Bearer <token>` on `/api/v1` and a
 > sign-in on the dashboard, or keep the listener on a trusted network.
+
+## Deployment
+
+### Several instances (high availability)
+
+Every instance serves the API and the dashboard; exactly one of them polls.
+Instances compete for a Postgres session-level advisory lock
+(`pg_try_advisory_lock`, key `0x534F4245434F4E`), and the holder runs the ingest
+loop and the retention pruner. There is no extra table, no migration and no
+coordinator process to run — a second instance is just a second instance:
+
+```sh
+# Two replicas of the same deployment, one poller between them.
+docker compose up -d --scale sorobeacon=2
+```
+
+- **One poller, always.** Without the lease, two replicas ingest the same
+  events and race the same checkpoint, so every alert is delivered twice and
+  each instance believes the other's progress is its own.
+- **Failover is bounded by the lease interval (3s)** — the follower's next
+  attempt to take the lock. A leader that exits gracefully releases the lock on
+  the way out; a leader that is killed frees it when its database session
+  disappears. There is no long fixed timer in either path.
+- **A demoted leader stops polling.** Its poller context is cancelled and the
+  lock is not given up until the poller has returned. A leader that loses its
+  database connection notices on the next renewal and stops, rather than
+  polling alongside the new leader — that overlap is the split-brain case that
+  duplicates alerts.
+- **The lease uses one dedicated connection per instance**, outside the
+  `DATABASE_MAX_CONNS` pool, because an advisory lock lives on the session that
+  took it and a pooled connection cannot be pinned for that.
+- **A follower is healthy.** `GET /api/v1/health` reports `leader`,
+  `leader_election` and `leader_since` so an operator can see which replica
+  polls, and the overview page says the same. A follower answers every other
+  endpoint normally and never fails readiness for not polling.
+- **PgBouncer needs session pooling.** Leader election holds a session-level
+  lock, so `DATABASE_URL` must reach Postgres directly or through a
+  session-pooled PgBouncer; in transaction pooling mode the lock cannot be
+  held. Followers then never promote, and no instance polls.
+
+### SQLite: a single node, no election
+
+A `sqlite://` `DATABASE_URL` is single-node by construction: one file on one
+machine, and no advisory locks to take. SoroBeacon runs the poller
+unconditionally and `GET /api/v1/health` reports `"leader": true` with
+`"leader_election": false`. Do not point several instances at one SQLite file —
+use Postgres when you want more than one. See
+[capacity and scaling](docs/operations/scaling.md).
 
 ## HTTP API
 
@@ -218,7 +302,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Five rule types ship:
+The built-in rule types:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -264,6 +348,8 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   "params": {
     "event": "transfer",
     "from": "GDW6...SENDER",	"min_amount": "1000000000"
+    "from": "GDW6...SENDER",
+    "min_amount": "1000000000"
   }
 }'
 ```
@@ -311,6 +397,29 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 
 See [docs/rules/frequency-threshold.md](docs/rules/frequency-threshold.md) for
 the re-arm semantics.
+
+**`composite`** — combine child rules with `and`, `or` or `not`, so "a large
+transfer **and** the recipient is on my watchlist" is one rule instead of two
+monitors and a human doing the correlation. Children are ordinary rules
+validated recursively through the registry: an unknown child type or a
+malformed grandchild is rejected at create time with the path to the problem
+(`rules[1].params`), nesting is capped at five levels, and evaluation
+short-circuits. `not` takes exactly one child:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "composite",
+  "params": {
+    "op": "and",
+    "rules": [
+      {"type": "token_event", "params": {"event": "transfer", "min_amount": "1000000"}},
+      {"type": "event_emitted", "params": {"topic_equals": {"1": "GDW6...SENDER"}}}
+    ]
+  }
+}'
+```
+
+See [docs/rules/composite.md](docs/rules/composite.md).
 
 **`topic_regex`** — match a regular expression against a decoded topic, at a
 given position or any topic when `position` is omitted. Real contracts emit
@@ -368,6 +477,25 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 See [docs/rules/topic-position.md](docs/rules/topic-position.md).
+
+**`absence_of_event`** — the inverse of `event_emitted`: fire when the event
+*stops* arriving. `window` is how long silence is tolerated. It is the one
+rule type driven by a timer rather than by an arriving event, so it is what
+catches a contract that has gone quiet. Each silence alerts once, not once
+per poll, and the clock lives in the database, so a restart cannot swallow a
+real outage:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "absence_of_event",
+  "params": {
+    "event_name": "heartbeat",
+    "window": "30m"
+  }
+}'
+```
+
+See [docs/rules/absence-of-event.md](docs/rules/absence-of-event.md).
 
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
@@ -566,6 +694,7 @@ internal/store      Postgres (pgx) + embedded golang-migrate migrations
 internal/rules      RuleEvaluator interface + the built-in rule types
 internal/notify     Notifier interface + the built-in channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
+internal/lease      Postgres advisory-lock leader election for the poller
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
 internal/apiclient  HTTP client for the API, shared by the CLI
@@ -575,6 +704,17 @@ internal/apiclient  HTTP client for the API, shared by the CLI
 running instance only through `internal/apiclient`, so the CLI and the API
 cannot drift apart.
 
+cmd/sorobeacon      wiring + graceful shutdown
+internal/config     env config
+internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
+internal/store      Postgres (pgx) and SQLite backends + embedded
+                    golang-migrate migrations (parallel sets)
+internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
+                    token_event, frequency_threshold
+internal/notify     Notifier interface + 7 channels + retrying dispatcher
+internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
+internal/api        chi JSON API
+internal/web        html/template + htmx dashboard
 ```
 
 ### Adding a notification channel
@@ -626,4 +766,3 @@ Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/cha
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
-

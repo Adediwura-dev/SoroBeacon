@@ -28,6 +28,7 @@
 * [Rule cooldown](rules/cooldown.md)
 * [self_transfer](rules/self-transfer.md)
 * [time_window](rules/time-window.md)
+* [absence_of_event](rules/absence-of-event.md)
 
 ## 📣 Channel reference
 
@@ -56,6 +57,7 @@
 * [Upgrading a running deployment](operations/upgrading.md)
 * [Capacity and scaling](operations/scaling.md)
 * [Poll priority, reorgs, retention and archiving](operations/retention-and-reorg.md)
+* [Diagnosing failed alert deliveries](operations/delivery-failures.md)
 
 ## 🛠️ Reference
 

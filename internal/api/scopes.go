@@ -73,6 +73,42 @@ var routeScopes = map[string][]auth.Scope{
 	"POST /tokens":             {auth.ScopeTokensWrite},
 	"GET /tokens":              {auth.ScopeTokensRead},
 	"POST /tokens/{id}/revoke": {auth.ScopeTokensWrite},
+
+	// Routes main added after the scope table was first written. Each one is
+	// mapped to the resource it reads or writes, never to a new scope: the
+	// vocabulary an operator grants from stays the short, reviewable list.
+	"GET /alerts/export": {auth.ScopeAlertsRead},
+	"GET /alerts/stream": {auth.ScopeAlertsRead},
+	// Acknowledging stops an escalation, which changes what gets delivered.
+	"POST /alerts/{id}/acknowledge": {auth.ScopeAlertsWrite},
+	// The audit log records monitor, rule and channel edits, so reading it is
+	// reading those resources' history.
+	"GET /audit": {auth.ScopeMonitorsRead},
+	// Ingest writes alerts: it is the push counterpart of the poller.
+	"POST /ingest": {auth.ScopeAlertsWrite},
+	// Inhibitions and maintenance windows decide whether an alert is
+	// delivered, so they are alert writes rather than monitor edits.
+	"POST /inhibitions":                         {auth.ScopeAlertsWrite},
+	"GET /inhibitions":                          {auth.ScopeAlertsRead},
+	"DELETE /inhibitions/{sourceID}/{targetID}": {auth.ScopeAlertsWrite},
+	"GET /maintenance-windows":                  {auth.ScopeAlertsRead},
+	"POST /maintenance-windows":                 {auth.ScopeAlertsWrite},
+	"GET /maintenance-windows/{id}":             {auth.ScopeAlertsRead},
+	"PATCH /maintenance-windows/{id}":           {auth.ScopeAlertsWrite},
+	"DELETE /maintenance-windows/{id}":          {auth.ScopeAlertsWrite},
+	// An escalation policy belongs to a monitor and decides which channels it
+	// reaches, so editing one asks for both writes.
+	"GET /monitors/{id}/escalation":    {auth.ScopeMonitorsRead},
+	"PUT /monitors/{id}/escalation":    {auth.ScopeMonitorsWrite, auth.ScopeChannelsWrite},
+	"DELETE /monitors/{id}/escalation": {auth.ScopeMonitorsWrite},
+	// A dry run evaluates a candidate rule against stored alerts and persists
+	// nothing, so it reads both and writes neither.
+	"POST /monitors/{id}/rules/dry-run": {auth.ScopeMonitorsRead, auth.ScopeAlertsRead},
+	"GET /monitors/{id}/stats":          {auth.ScopeStatsRead},
+	// The poller's position and the rule-type list are instance facts, not a
+	// tenant's data: any valid credential may read them.
+	"GET /poller":     {auth.ScopeNone},
+	"GET /rule-types": {auth.ScopeNone},
 }
 
 // requiredScopes resolves the permissions a request needs. ok false means the

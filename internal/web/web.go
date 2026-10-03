@@ -27,6 +27,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -45,6 +46,12 @@ type PositionReader interface {
 // always showed.
 type NetworkStatusReader interface {
 	Statuses(ctx context.Context) []poller.NetworkStatus
+}
+
+// LeaderReader reports this instance's leader-election status, shown on the
+// overview page so an operator can tell which replica is polling.
+type LeaderReader interface {
+	Status() lease.Status
 }
 
 //go:embed templates/*.html
@@ -66,6 +73,7 @@ type Server struct {
 	// monitor has to say which chain it means.
 	networkNames []string
 	networkState NetworkStatusReader
+	leader       LeaderReader
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
@@ -75,6 +83,9 @@ type Server struct {
 	a     *auth.Authenticator
 	auth  *auth.Authenticator
 	roles *auth.RoleEnforcer
+	// tokenMgr mints and lists scoped API tokens for the dashboard's token
+	// page. Nil disables the page rather than showing one that cannot mint.
+	tokenMgr *auth.Manager
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -92,6 +103,7 @@ var templateFuncs = template.FuncMap{
 	"decodedEvent":  decodedEvent,
 	"truncateID":    truncateID,
 	"relTime":       relTime,
+	"relTimePtr":    relTimePtr,
 	"severityClass": severityClass,
 }
 
@@ -123,6 +135,16 @@ func formatTime(t time.Time, tz string) template.HTML {
 //
 // Rounding: seconds under a minute, minutes under an hour, hours under a
 // day, then whole days.
+// relTimePtr is relTime for the nullable timestamps channel health carries.
+// html/template does not dereference a pointer for you, so a nil-safe wrapper
+// keeps the channels table readable.
+func relTimePtr(t *time.Time, now ...time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return relTime(*t, now...)
+}
+
 func relTime(t time.Time, now ...time.Time) string {
 	ref := time.Now()
 	if len(now) > 0 && !now[0].IsZero() {
@@ -206,7 +228,10 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches"} {
+	// Every page the dashboard can render. A page missing from this list is a
+	// nil template at request time, which is a panic rather than a 500, so the
+	// list and the templates directory have to agree.
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -264,6 +289,14 @@ func (s *Server) networkChoice(raw string) string {
 	return s.defaultNetwork()
 }
 
+// WithLeadership attaches the leader-election status shown on the overview
+// page. Not wiring it leaves the page exactly as it was before leader
+// election existed.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
+	return s
+}
+
 // WithSilentAfter sets how long since last_matched_at before a monitor is
 // marked silent. Ignored when d <= 0 so callers can skip wiring.
 func (s *Server) WithSilentAfter(d time.Duration) *Server {
@@ -271,6 +304,11 @@ func (s *Server) WithSilentAfter(d time.Duration) *Server {
 		s.silentAfter = d
 	}
 	return s
+}
+
+// SilentAfter returns the configured silent-after duration. Exposed for tests.
+func (s *Server) SilentAfter() time.Duration {
+	return s.silentAfter
 }
 
 func (s *Server) monitorRow(m store.Monitor, tz string, now time.Time) monitorListRow {
@@ -336,6 +374,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels", s.createChannel)
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
+	r.Post("/channels/{id}/toggle", s.toggleChannel)
 
 	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
 
@@ -665,6 +704,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	// would hide which chain an operator needs to look at.
 	if s.networkState != nil && len(s.networkNames) > 1 {
 		data["NetworkStatuses"] = s.networkState.Statuses(r.Context())
+	}
+	if s.leader != nil {
+		data["Leadership"] = s.leader.Status()
 	}
 	s.render(w, r, "index", data)
 }
@@ -1199,12 +1241,42 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:   time.Now(),
 		})
 	}
+	// Record the outcome like the API's test endpoint does, so a channel that
+	// has just been fixed stops being reported as broken the moment the
+	// operator proves it works. A bookkeeping failure is logged, not shown:
+	// the send is what the operator asked about.
+	if err := s.store.RecordChannelHealth(r.Context(), ch.ID, notify.TestHealthUpdate(err, time.Now())); err != nil {
+		s.log.Error("record channel health", "channel_id", ch.ID, "err", err)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err != nil {
 		fmt.Fprintf(w, "❌ %s", template.HTMLEscapeString(err.Error()))
 		return
 	}
 	fmt.Fprint(w, "✅ sent")
+}
+
+// toggleChannel flips a channel's enabled flag. Turning one back on goes
+// through the same store write the API uses, so a channel that auto-disable
+// parked comes back with its failure count cleared instead of re-disabling on
+// the next failure.
+func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch.Enabled = !ch.Enabled
+	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
 // maintenanceRow is a window plus its computed status for the listing.
@@ -1476,7 +1548,12 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		"HasFilters": selected != 0 || selectedRule != 0 || f.ContractID != "" ||
 			severity != "" || search != "" || !f.From.IsZero() || !f.To.IsZero(),
 		"ExportHref": alertExportHref(f),
-		"Empty":      emptyKind(monitors, channels, alerts),
+		// The network filter and the per-row network column only appear on a
+		// multi-network instance; with one chain there is nothing to choose
+		// between and the page looks exactly as it did.
+		"Networks": s.networkNames,
+		"Network":  f.Network,
+		"Empty":    emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
@@ -1534,6 +1611,11 @@ func alertFilterQuery(f store.AlertFilter) string {
 	}
 	if f.Sort != "" && f.Sort != "created_at_desc" {
 		v.Set("sort", f.Sort)
+	}
+	// The network has to survive paging too: an Older link that dropped it
+	// would widen the page to every chain halfway through a result set.
+	if f.Network != "" {
+		v.Set("network", f.Network)
 	}
 	// The bounds go out as instants, not as the calendar dates the form
 	// collected: re-deriving the exclusive end from a date would add the day
