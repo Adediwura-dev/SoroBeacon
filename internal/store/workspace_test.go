@@ -341,6 +341,7 @@ var unscopedStoreMethods = map[string]string{
 	"ListRules":               "the poller loads rules for a monitor it already resolved",
 	"ListChannelsForMonitor":  "the dispatcher delivers for a monitor it already resolved",
 	"RecordDeliveryAttempt":   "the dispatcher writes for an alert it already resolved",
+	"CreateDeadLetter":        "the dispatcher records a permanently failed delivery for an alert it already resolved; the row takes its tenant from that alert",
 	"CreateAlert":             "derives the workspace from the monitor it inserts into",
 	"ExpiredAlerts":           "retention sweeps every workspace",
 	"GetIngestState":          "the ledger cursor is per instance, not per tenant",

@@ -184,6 +184,34 @@ func (f *fakeStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAt
 	return nil
 }
 
+func (f *fakeStore) CreateDeadLetter(_ context.Context, _ *store.DeadLetter) error {
+	return nil
+}
+
+func (f *fakeStore) GetDeadLetter(_ context.Context, _ int64) (*store.DeadLetter, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) ListDeadLetters(_ context.Context, _ store.DeadLetterFilter) ([]store.DeadLetter, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) DeleteDeadLetter(_ context.Context, _ int64) error {
+	return nil
+}
+
+func (f *fakeStore) GetAlert(_ context.Context, _ int64) (*store.Alert, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) GetChannel(_ context.Context, _ int64) (*store.Channel, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) ListDeliveryAttempts(_ context.Context, _ int64, _ string) ([]store.DeliveryAttempt, error) {
+	return nil, nil
+}
+
 // ListChannels satisfies the digest half of the dispatcher's store
 // interface; the poller tests never exercise digest flushing.
 func (f *fakeStore) ListChannels(_ context.Context, enabledOnly bool) ([]store.Channel, error) {

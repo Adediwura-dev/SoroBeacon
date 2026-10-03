@@ -1226,6 +1226,88 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 	return pgx.CollectRows(rows, scanAlert)
 }
 
+// CreateDeadLetter records a delivery that exhausted its retry budget.
+func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
+	// alert_created_at is read from the alert rather than passed in: the
+	// composite foreign key needs it, and taking it from the row means a
+	// caller cannot supply one that does not match. A missing alert selects
+	// no rows and comes back as ErrNotFound.
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO dead_letters (alert_id, alert_created_at, channel_id, last_error, attempt_count, last_status)
+		 SELECT a.id, a.created_at, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1
+		 RETURNING id, created_at`,
+		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
+	).Scan(&d.ID, &d.CreatedAt))
+}
+
+// GetDeadLetter returns one dead-letter record by id.
+func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
+	var d DeadLetter
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		 FROM dead_letters WHERE id = $1`, id,
+	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &d, nil
+}
+
+// ListDeadLetters returns dead-letter records in id order, applying the
+// optional channel, alert, and pagination filters.
+func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.ChannelID != 0 {
+		q += ` AND channel_id = ` + arg(f.ChannelID)
+	}
+	if f.AlertID != 0 {
+		q += ` AND alert_id = ` + arg(f.AlertID)
+	}
+	if f.AfterID != 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	q += ` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
+		var d DeadLetter
+		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+		return d, err
+	})
+}
+
+// DeleteDeadLetter removes one record, which is what a successful redrive does.
+// It does not go through deleteByID: dead_letters carries no workspace_id of
+// its own, so the tenant predicate reaches it through the alert it belongs to.
+// A caller without a tenant (the dispatcher's own context) deletes by id alone.
+func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
+	q := `DELETE FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // buildAlertQuery builds the ListAlerts statement and its arguments. Both
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.

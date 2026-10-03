@@ -59,6 +59,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ListAlertsSearchFilterSort", func(t *testing.T) { testListAlertsSearchFilterSort(t, newStore) })
 	t.Run("ListAlertsTextSearch", func(t *testing.T) { testListAlertsTextSearch(t, newStore) })
 	t.Run("DeliveryAttempts", func(t *testing.T) { testDeliveryAttempts(t, newStore) })
+	t.Run("DeadLetters", func(t *testing.T) { testDeadLetters(t, newStore) })
 	t.Run("DeleteExpiredAlertsKeepsRecentAndCascades", func(t *testing.T) { testDeleteExpiredAlertsCascade(t, newStore) })
 	t.Run("DeleteExpiredAlertsBatches", func(t *testing.T) { testDeleteExpiredAlertsBatches(t, newStore) })
 	t.Run("IngestStateRoundTrip", func(t *testing.T) { testIngestState(t, newStore) })
@@ -2001,4 +2002,75 @@ func testListChannelsByIDs(t *testing.T, newStore conformanceFactory) {
 	got, err = st.ListChannelsByIDs(ctx, []int64{999999})
 	require.NoError(t, err)
 	assert.Empty(t, got, "an unknown id is not an error")
+}
+
+// testDeadLetters covers the dead-letter queue: a permanently failed delivery
+// is recorded, listed per channel and per alert, and removed once it has been
+// redriven. It is a conformance test because the Postgres table references
+// the partitioned alerts by (id, created_at) while SQLite references id alone,
+// and both insert paths read the timestamp off the alert row — a mismatch
+// there shows up as a foreign-key error only against a real database.
+func testDeadLetters(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+	chA := &Channel{Name: "a", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	chB := &Channel{Name: "b", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, chA))
+	require.NoError(t, st.CreateChannel(ctx, chB))
+	alert := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "ev-1"}
+	_, err := st.CreateAlert(ctx, alert)
+	require.NoError(t, err)
+
+	empty, err := st.ListDeadLetters(ctx, DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	first := &DeadLetter{AlertID: alert.ID, ChannelID: chA.ID, LastError: "status 401", AttemptCount: 3, LastStatus: 401}
+	require.NoError(t, st.CreateDeadLetter(ctx, first))
+	assert.NotZero(t, first.ID)
+	assert.False(t, first.CreatedAt.IsZero())
+
+	second := &DeadLetter{AlertID: alert.ID, ChannelID: chB.ID, LastError: "status 500", AttemptCount: 3, LastStatus: 500}
+	require.NoError(t, st.CreateDeadLetter(ctx, second))
+
+	got, err := st.GetDeadLetter(ctx, first.ID)
+	require.NoError(t, err)
+	assert.Equal(t, alert.ID, got.AlertID)
+	assert.Equal(t, chA.ID, got.ChannelID)
+	assert.Equal(t, "status 401", got.LastError)
+	assert.Equal(t, 3, got.AttemptCount)
+	assert.Equal(t, 401, got.LastStatus)
+
+	all, err := st.ListDeadLetters(ctx, DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Len(t, all, 2)
+
+	perChannel, err := st.ListDeadLetters(ctx, DeadLetterFilter{ChannelID: chB.ID})
+	require.NoError(t, err)
+	require.Len(t, perChannel, 1, "the channel filter is what the dashboard pages on")
+	assert.Equal(t, chB.ID, perChannel[0].ChannelID)
+
+	perAlert, err := st.ListDeadLetters(ctx, DeadLetterFilter{AlertID: alert.ID})
+	require.NoError(t, err)
+	assert.Len(t, perAlert, 2)
+
+	// Redriving deletes the record, and deleting twice is ErrNotFound rather
+	// than a silent success.
+	require.NoError(t, st.DeleteDeadLetter(ctx, first.ID))
+	_, err = st.GetDeadLetter(ctx, first.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteDeadLetter(ctx, first.ID), ErrNotFound)
+
+	_, err = st.GetDeadLetter(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	// A dead letter for an alert that does not exist is refused: the row would
+	// otherwise point at nothing and never be cleaned up by the cascade.
+	orphan := &DeadLetter{AlertID: 999999, ChannelID: chA.ID, AttemptCount: 1}
+	assert.Error(t, st.CreateDeadLetter(ctx, orphan))
 }

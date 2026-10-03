@@ -231,7 +231,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 	// Every page the dashboard can render. A page missing from this list is a
 	// nil template at request time, which is a panic rather than a 500, so the
 	// list and the templates directory have to agree.
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -394,6 +394,9 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	r.Get("/alerts/{id}", s.alertDetail)
+
+	r.Get("/dead-letters", s.listDeadLetters)
+	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
 
 	r.Get("/maintenance", s.maintenance)
 	r.Post("/maintenance", s.createMaintenance)

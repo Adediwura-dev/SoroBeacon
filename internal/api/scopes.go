@@ -109,6 +109,11 @@ var routeScopes = map[string][]auth.Scope{
 	// tenant's data: any valid credential may read them.
 	"GET /poller":     {auth.ScopeNone},
 	"GET /rule-types": {auth.ScopeNone},
+	// A dead letter is a delivery that exhausted its retries, so reading the
+	// queue reads alerts, and redriving one sends a notification: that is an
+	// alert write, not a channel edit.
+	"GET /dead-letters":               {auth.ScopeAlertsRead},
+	"POST /dead-letters/{id}/redrive": {auth.ScopeAlertsWrite},
 }
 
 // requiredScopes resolves the permissions a request needs. ok false means the

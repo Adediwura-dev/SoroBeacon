@@ -59,6 +59,7 @@ type Metrics struct {
 	storeReads     *prometheus.CounterVec
 	storeFallbacks prometheus.Counter
 	replicaEnabled prometheus.Gauge
+	deadLetters    prometheus.Gauge
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -176,12 +177,17 @@ func New() *Metrics {
 			Name: "sorobeacon_store_replica_enabled",
 			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
 		}),
+
+		deadLetters: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_dead_letters_total",
+			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled)
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters)
 	return m
 }
 
@@ -379,6 +385,32 @@ func (m *Metrics) SetReplicaEnabled(enabled bool) {
 		return
 	}
 	m.replicaEnabled.Set(0)
+}
+
+// SetDeadLetters sets the current total number of dead letters.
+func (m *Metrics) SetDeadLetters(count int) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Set(float64(count))
+}
+
+// RecordDeadLetter increments the number of dead letters awaiting review.
+func (m *Metrics) RecordDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Inc()
+}
+
+// ClearDeadLetter decrements the number of dead letters after a successful
+// redrive. Prometheus gauges clamp naturally at the store's authoritative
+// value when the next SetDeadLetters refresh runs.
+func (m *Metrics) ClearDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Dec()
 }
 
 // RecordThrottle counts one throttled delivery per channel type.

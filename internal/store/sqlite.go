@@ -1367,6 +1367,110 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	return &a, nil
 }
 
+// CreateDeadLetter records a delivery that exhausted its retry budget.
+func (s *SQLite) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
+	var created string
+	// alert_created_at is read from the alert rather than passed in, matching
+	// the Postgres statement, where the composite foreign key needs it.
+	err := s.db.QueryRowContext(ctx,
+		`INSERT INTO dead_letters (alert_id, alert_created_at, channel_id, last_error, attempt_count, last_status)
+		 SELECT a.id, a.created_at, ?, ?, ?, ? FROM alerts a WHERE a.id = ?
+		 RETURNING id, created_at`,
+		d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus, d.AlertID,
+	).Scan(&d.ID, &created)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	d.CreatedAt, err = parseSQLiteTime(created)
+	return err
+}
+
+// GetDeadLetter returns one dead-letter record by id.
+func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
+	var d DeadLetter
+	var created string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		 FROM dead_letters WHERE id = ?`, id,
+	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	d.CreatedAt, err = parseSQLiteTime(created)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// ListDeadLetters returns dead-letter records in id order, applying the
+// optional channel, alert, and pagination filters.
+func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE 1 = 1`
+	args := []any{}
+	if f.ChannelID != 0 {
+		q += ` AND channel_id = ?`
+		args = append(args, f.ChannelID)
+	}
+	if f.AlertID != 0 {
+		q += ` AND alert_id = ?`
+		args = append(args, f.AlertID)
+	}
+	if f.AfterID != 0 {
+		q += ` AND id > ?`
+		args = append(args, f.AfterID)
+	}
+	q += ` ORDER BY id ASC LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DeadLetter
+	for rows.Next() {
+		var d DeadLetter
+		var created string
+		if err := rows.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created); err != nil {
+			return nil, err
+		}
+		d.CreatedAt, err = parseSQLiteTime(created)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeleteDeadLetter removes a dead-letter record after a successful redrive.
+// DeleteDeadLetter removes one record, which is what a successful redrive does.
+// It does not go through deleteByID: dead_letters carries no workspace_id of
+// its own, so the tenant predicate reaches it through the alert it belongs to.
+// A caller without a tenant (the dispatcher's own context) deletes by id alone.
+func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
+	q := `DELETE FROM dead_letters WHERE id = ?`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network FROM alerts WHERE 1 = 1`
 	args := []any{}
