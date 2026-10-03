@@ -1336,6 +1336,9 @@ func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
 	if f.ContractID != "" {
 		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
 	}
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
 	if pattern := AlertSearchPattern(f.Query); pattern != "" {
 		// One bound pattern, both columns. The payload is cast to text so the
 		// search reaches contract_id, event_name and every other field a rule
@@ -1607,8 +1610,21 @@ func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWi
 	return nil
 }
 
+// DeleteMaintenanceWindow removes one window. It does not go through
+// deleteByID: that helper scopes its delete to the caller's workspace, and
+// maintenance_windows carries no workspace_id. A window's scope is global,
+// monitor or contract — it is instance-level under this model, the same way
+// its listing and its creation are, so the delete matches them rather than
+// inventing a tenancy the rest of the feature does not have.
 func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
-	return p.deleteByID(ctx, "maintenance_windows", id)
+	tag, err := p.pool.Exec(ctx, `DELETE FROM maintenance_windows WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ActiveMaintenanceWindow is the delivery path's single indexed lookup: a

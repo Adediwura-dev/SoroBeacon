@@ -1816,8 +1816,22 @@ func (s *SQLite) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWind
 	return nil
 }
 
+// DeleteMaintenanceWindow removes one window. It does not go through
+// deleteByID, for the reason given on the Postgres method: maintenance windows
+// are instance-level under this model, so the delete is not workspace-scoped.
 func (s *SQLite) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
-	return s.deleteByID(ctx, "maintenance_windows", id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM maintenance_windows WHERE id = ?`, id)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ActiveMaintenanceWindow is the delivery path's single indexed lookup: a
